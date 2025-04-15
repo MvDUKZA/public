@@ -1,13 +1,16 @@
 # Import the GroupPolicy module
-Import-Module GroupPolicy
+if (-not (Get-Module -ListAvailable GroupPolicy)) {
+    Write-Error "GroupPolicy module not found. Install RSAT tools: https://learn.microsoft.com/en-us/windows-server/remote/remote-server-administration-tools"
+    exit 1
+}
+Import-Module GroupPolicy -ErrorAction Stop
 
 #-----------------------------#
 # CONFIGURATION SECTION
 #-----------------------------#
-
 $csvPath = "C:\Path\To\Your\file.csv"
 $gpoName = "Win11 VDI Policy"
-$context = "Computer"
+$context = "Computer"  # Computer or User
 $dryRun = $true
 
 # Logging setup
@@ -18,97 +21,122 @@ New-Item -ItemType Directory -Path $logDir -Force | Out-Null
 #-----------------------------#
 # FUNCTION
 #-----------------------------#
-
 function Write-Log {
     param (
         [string]$Message,
         [string]$Level = "INFO"
     )
     $line = "[{0}] [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level.ToUpper(), $Message
-    Write-Host $line
+    Write-Host $line -ForegroundColor $(if ($Level -eq "ERROR") { "Red" } elseif ($Level -eq "WARN") { "Yellow" } else { "White" })
     Add-Content -Path $logFile -Value $line
 }
 
 #-----------------------------#
 # SCRIPT START
 #-----------------------------#
-
 Write-Log "Starting GPO registry import"
 Write-Log "GPO: $gpoName | Context: $context | Dry Run: $dryRun"
 Write-Log "CSV path: $csvPath"
 
-# Load and validate CSV
+# Validate CSV exists
 if (-Not (Test-Path $csvPath)) {
     Write-Log "CSV file not found: $csvPath" -Level "ERROR"
     exit 1
 }
 
-$registryItems = Import-Csv -Path $csvPath
+# Validate CSV structure
+$requiredColumns = @('Key', 'Type', 'Name', 'Value')
+try {
+    $registryItems = Import-Csv -Path $csvPath -ErrorAction Stop
+    $csvColumns = ($registryItems | Get-Member -MemberType NoteProperty).Name
+    $missingColumns = $requiredColumns | Where-Object { $_ -notin $csvColumns }
+    if ($missingColumns) {
+        Write-Log "CSV missing required columns: $($missingColumns -join ', ')" -Level "ERROR"
+        exit 1
+    }
+}
+catch {
+    Write-Log "Failed to import CSV: $_" -Level "ERROR"
+    exit 1
+}
 
+# Validate GPO exists
 try {
     $gpo = Get-GPO -Name $gpoName -ErrorAction Stop
-} catch {
+}
+catch {
     Write-Log "GPO '$gpoName' not found" -Level "ERROR"
     exit 1
 }
 
+# Process registry items
+$hiveMap = @{
+    "HKLM" = "HKLM"
+    "HKEY_LOCAL_MACHINE" = "HKLM"
+    "HKCU" = "HKCU"
+    "HKEY_CURRENT_USER" = "HKCU"
+}
+
 foreach ($item in $registryItems) {
-    $rootKey, $subKey = $item.Key -split "\\", 2
-    $type = $item.Type.Trim()
-    $name = $item.Name
-    $rawValue = $item.Value
-
-    $hiveMap = @{
-        "HKLM" = "HKLM"
-        "HKEY_LOCAL_MACHINE" = "HKLM"
-        "HKCU" = "HKCU"
-        "HKEY_CURRENT_USER" = "HKCU"
-    }
-
-    if (-not $hiveMap.ContainsKey($rootKey)) {
-        Write-Log "Unsupported registry hive in key: $($item.Key)" -Level "WARN"
-        continue
-    }
-
-    $hive = $hiveMap[$rootKey]
-    $value = $null
-
     try {
-        switch ($type) {
-            "DWord"       { $value = [int]$rawValue }
-            "QWord"       { $value = [long]$rawValue }
-            "Binary"      { $value = $rawValue -split '-' | ForEach-Object { [byte]("0x$_") } }
-            "MultiString" { $value = $rawValue -split '\|\|' }
-            "String"      { $value = [string]$rawValue }
-            "ExpandString"{ $value = [string]$rawValue }
-            default {
-                Write-Log "Unsupported registry type: $type" -Level "WARN"
-                continue
-            }
+        # Split registry key
+        $rootKey, $subKey = $item.Key -split "\\", 2
+        if (-not $subKey) {
+            Write-Log "Invalid registry key format (missing subkey): $($item.Key)" -Level "WARN"
+            continue
         }
-    } catch {
-        Write-Log "Type conversion failed for $($item.Key)\$name" -Level "ERROR"
-        continue
-    }
 
-    Write-Log ("{0}: {1}\{2} = {3} ({4})" -f ($dryRun ? "DRY-RUN" : "SET"), "$hive\$subKey", $name, $value, $type)
+        # Validate hive
+        if (-not $hiveMap.ContainsKey($rootKey)) {
+            Write-Log "Unsupported registry hive: $rootKey" -Level "WARN"
+            continue
+        }
+        $hive = $hiveMap[$rootKey]
 
-    if (-not $dryRun) {
-        try {
+        # Validate type
+        $type = $item.Type.Trim()
+        $validTypes = @('DWord', 'QWord', 'Binary', 'MultiString', 'String', 'ExpandString')
+        if ($type -notin $validTypes) {
+            Write-Log "Unsupported registry type: $type" -Level "WARN"
+            continue
+        }
+
+        # Convert value
+        $value = switch ($type) {
+            "DWord"       { [int]$item.Value }
+            "QWord"       { [long]$item.Value }
+            "Binary"      { $item.Value -split '-' | ForEach-Object { [byte]"0x$_" } }
+            "MultiString" { $item.Value -split '\|\|' }
+            default       { $item.Value }
+        }
+
+        # Build path and log
+        $fullPath = "$hive\$subKey"
+        $logMessage = "{0}: {1} | {2} = {3} ({4})" -f (
+            $dryRun ? "DRY-RUN" : "APPLYING",
+            $fullPath,
+            $item.Name,
+            $item.Value,
+            $type
+        )
+        Write-Log $logMessage
+
+        # Apply if not dry run
+        if (-not $dryRun) {
             Set-GPPrefRegistryValue -Name $gpoName `
                 -Context $context `
-                -Key "$hive\$subKey" `
-                -ValueName $name `
+                -Key $fullPath `
+                -ValueName $item.Name `
                 -Type $type `
                 -Value $value `
-                -Action Update
-
-            Write-Log "Applied registry preference"
-        } catch {
-            Write-Log "Failed to apply registry item $($item.Key)\$name: $_" -Level "ERROR"
+                -Action Replace `
+                -ErrorAction Stop
         }
+    }
+    catch {
+        Write-Log "Failed to process item: $($item.Key)\$($item.Name) - $($_.Exception.Message)" -Level "ERROR"
     }
 }
 
-Write-Log "Finished processing registry items"
-Write-Host "`nLog saved to: $logFile"
+Write-Log "Processing completed. Check log for details."
+Write-Host "`nLog saved to: $logFile" -ForegroundColor Cyan
