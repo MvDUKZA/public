@@ -112,13 +112,8 @@ foreach ($item in $registryItems) {
 
         # Build path and log
         $fullPath = "$hive\$subKey"
-        $logMessage = "{0}: {1} | {2} = {3} ({4})" -f (
-            $dryRun ? "DRY-RUN" : "APPLYING",
-            $fullPath,
-            $item.Name,
-            $item.Value,
-            $type
-        )
+        $action = if ($dryRun) { "DRY-RUN" } else { "APPLYING" }
+        $logMessage = "{0}: {1} | {2} = {3} ({4})" -f $action, $fullPath, $item.Name, $item.Value, $type
         Write-Log $logMessage
 
         # Apply if not dry run
