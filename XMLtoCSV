@@ -1,0 +1,114 @@
+# Configure working directory
+$workFolder = "C:\Temp\Qualys"
+if (-not (Test-Path $workFolder)) { New-Item -Path $workFolder -ItemType Directory | Out-Null }
+
+# Input XML and Output CSV paths
+$xmlPath = "$workFolder\Qualys_Win11_CIS_Policy.xml"
+$csvPath = "$workFolder\Qualys_CIS_Win11_Controls.csv"
+
+try {
+    # Load XML content with error handling
+    [xml]$xml = Get-Content -Path $xmlPath -ErrorAction Stop
+}
+catch {
+    Write-Error "Failed to load XML file: $_"
+    exit 1
+}
+
+# Initialize results array
+$results = @()
+
+# Process each control
+foreach ($control in $xml.SelectNodes("//CONTROL")) {
+    # Base properties
+    $controlId = $control.CONTROL_ID
+    $type = $null
+    $key = $null
+    $name = $null
+    $value = $null
+    $manualReview = $false
+    $regPath = $null
+    $regName = $null
+    $regValue = $null
+
+    # Detect control type and extract values
+    switch -Wildcard ($control) {
+        { $_.REGISTRY_KEY } {
+            $type = "Registry"
+            $key = $control.REGISTRY_KEY.PATH
+            $name = $control.REGISTRY_KEY.NAME
+            $value = $control.REGISTRY_KEY.EXPECTED_VALUE
+            break
+        }
+        
+        { $_.FILE_CHECK } {
+            $type = "File"
+            $key = $control.FILE_CHECK.PATH
+            $name = $control.FILE_CHECK.FILENAME
+            $value = $control.FILE_CHECK.EXPECTED_VALUE
+            break
+        }
+
+        { $_.SERVICE_CHECK } {
+            $type = "Service"
+            $key = $control.SERVICE_CHECK.NAME
+            $name = "Status"
+            $value = $control.SERVICE_CHECK.EXPECTED_VALUE
+            break
+        }
+
+        { $_.COMMAND } {
+            $type = "Command"
+            $key = $control.COMMAND.PATH
+            $name = "Output"
+            $value = $control.COMMAND.EXPECTED_VALUE
+            break
+        }
+
+        default {
+            # Manual GPO controls
+            $type = "Manual"
+            $manualReview = $true
+            $textContent = @(
+                $control.RECOMMENDATION,
+                $control.STATEMENT,
+                $control.EVALUATION
+            ) -join " "
+
+            # Enhanced regex patterns for GPO extraction
+            if ($textContent -imatch '(HKEY_[A-Z_]+\\|HKLM\\|HKCU\\|HKEY_LOCAL_MACHINE\\|HKEY_CURRENT_USER\\).+?(?=\s|$)') {
+                $regPath = $matches[0].Trim()
+            }
+
+            if ($textContent -imatch 'Value Name[:\s]+([^\n\r]+)') {
+                $regName = $matches[1].Trim(' :')
+            }
+
+            if ($textContent -imatch 'Value(?: Type)?[:\s]+([^\n\r]+)') {
+                $regValue = $matches[1].Trim(' :')
+            }
+        }
+    }
+
+    # Add to results
+    $results += [PSCustomObject]@{
+        CONTROL_ID    = $controlId
+        TYPE          = $type
+        KEY           = $key
+        NAME          = $name
+        VALUE         = $value
+        MANUAL_REVIEW = $manualReview
+        REG_PATH      = $regPath
+        REG_NAME      = $regName
+        REG_VALUE     = $regValue
+    }
+}
+
+# Export results
+try {
+    $results | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8 -Force
+    Write-Host "Successfully exported $($results.Count) controls to: $csvPath" -ForegroundColor Green
+}
+catch {
+    Write-Error "Failed to export CSV: $_"
+}
