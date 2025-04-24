@@ -157,5 +157,10 @@ try {
 }
 catch {
     Write-Error "Script failed: $_"
-    exit 1
-}
+    exit # Interactive mode
+.\Export-QualysComplianceReport.ps1 -SavePath "C:\Reports\audit.pdf" -ExportFormat pdf
+
+# Non-interactive mode
+.\Export-QualysComplianceReport.ps1 -SavePath "C:\Reports\policy.xml" -ExportFormat xml -PolicyId "12345"
+
+
