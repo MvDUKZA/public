@@ -1,0 +1,54 @@
+function Parse-AuditFile {
+    param([string]$Content)
+
+    $pattern = "<custom_item>(.*?)</custom_item>"
+    $matches = [regex]::Matches($Content, $pattern, [System.Text.RegularExpressions.RegexOptions]::Singleline)
+
+    if ($matches.Count -eq 0) {
+        Write-Warning "No <custom_item> entries found in audit file."
+        return
+    }
+
+    foreach ($match in $matches) {
+        $item = $match.Groups[1].Value
+
+        $type = if ($item -match 'type\s*:\s*(.+?)\n') { $matches[1].Trim() } else { continue }
+        if ($type -eq "AUDIT_POWERSHELL") { continue }
+
+        $description = if ($item -match 'description\s*:\s*(.+?)\n') { $matches[1].Trim().Replace('"', '') } else { continue }
+        $index = 0
+        if ($description[0] -match '\d') {
+            $index = ($description -split '\s')[0]
+            $description = $description -replace "^$index\s*", ""
+        }
+
+        $solution = if ($item -match 'solution\s*:\s*(.+?)\n\s*reference') { $matches[1].Trim().Replace("`n", ' ') } else { "" }
+        $valueData = if ($item -match 'value_data\s*:\s*(.+?)\n') { $matches[1].Trim().Replace('"', '') } else { "" }
+        $valueType = if ($item -match 'value_type\s*:\s*(.+?)\n') { $matches[1].Trim().Replace('"', '') } else { "" }
+        $regKey = if ($item -match 'reg_key\s*:\s*(.+?)\n') { $matches[1].Trim().Replace('"', '') } else { "" }
+        $regItem = if ($item -match 'reg_item\s*:\s*(.+?)\n') { $matches[1].Trim().Replace('"', '') } else { "" }
+        $regOption = if ($item -match 'reg_option\s*:\s*(.+?)\n') { $matches[1].Trim().Replace('"', '') } else { "" }
+        $keyItem = if ($item -match 'key_item\s*:\s*(.+?)\n') { $matches[1].Trim().Replace('"', '') } else { "" }
+        $auditPolicySubcategory = if ($item -match 'audit_policy_subcategory\s*:\s*(.+?)\n') { $matches[1].Trim().Replace('"', '') } else { "" }
+        $rightType = if ($item -match 'right_type\s*:\s*(.+?)\n') { $matches[1].Trim().Replace('"', '') } else { "" }
+
+        if ($keyItem) { $regItem = $keyItem }
+
+        $global:dataDict[$type] += [PSCustomObject]@{
+            Checklist = 1
+            Type = $type
+            Index = $index
+            Description = $description
+            Solution = $solution
+            "Reg Key" = $regKey
+            "Reg Item" = $regItem
+            "Reg Option" = $regOption
+            "Audit Policy Subcategory" = $auditPolicySubcategory
+            "Right type" = $rightType
+            "Value Data" = $valueData
+            "Value Type" = $valueType
+        }
+    }
+
+    Write-Host "Parsed $($matches.Count) <custom_item> entries."
+}
