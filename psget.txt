@@ -1,0 +1,2 @@
+Save-Module -Name PowerShellGet -Path "$env:USERPROFILE\Documents\PowerShell\Modules"
+Import-Module "$env:USERPROFILE\Documents\PowerShell\Modules\PowerShellGet\*\PowerShellGet.psd1"
