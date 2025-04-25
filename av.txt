@@ -1,0 +1,88 @@
+#install the modules
+Install-Module Az.Accounts, Az.DesktopVirtualization, Microsoft.Graph.Authentication, Microsoft.Graph.DeviceManagement
+
+# Import required modules
+Import-Module Az.Accounts
+Import-Module Az.DesktopVirtualization
+Import-Module Microsoft.Graph.Authentication
+Import-Module Microsoft.Graph.DeviceManagement
+
+# Prompt for credentials
+$cred = Get-Credential -Message "Enter your Azure AD credentials"
+
+# Connect to Azure
+Connect-AzAccount -Credential $cred
+
+# Connect to Microsoft Graph with required scopes
+Connect-MgGraph -Scopes "DeviceManagementManagedDevices.ReadWrite.All", "User.Read.All" -Credential $cred -ErrorAction Stop
+
+# Get user input
+$userUpn = Read-Host -Prompt "Enter the user's UPN to assign"
+$resourceGroup = Read-Host -Prompt "Enter the resource group name of the AVD host pool"
+$hostPoolName = Read-Host -Prompt "Enter the AVD host pool name"
+$sessionHostName = Read-Host -Prompt "Enter the session host name (e.g., HostPool1/AVD-VM-01.domain.com)"
+
+# Assign user to AVD session host
+try {
+    Update-AzWvdSessionHost -ResourceGroupName $resourceGroup `
+                            -HostPoolName $hostPoolName `
+                            -Name $sessionHostName `
+                            -AssignedUser $userUpn -ErrorAction Stop
+    Write-Host "Successfully assigned user to AVD session host" -ForegroundColor Green
+}
+catch {
+    Write-Error "Failed to assign user to AVD session host: $_"
+    exit
+}
+
+# Extract VM name from session host name
+try {
+    $vmName = ($sessionHostName -split '/')[1] -split '\.' | Select-Object -First 1
+    Write-Host "Extracted VM name: $vmName" -ForegroundColor Cyan
+}
+catch {
+    Write-Error "Failed to parse VM name from session host name: $_"
+    exit
+}
+
+# Get managed device from Intune
+try {
+    $managedDevice = Get-MgDeviceManagementManagedDevice -Filter "DeviceName eq '$vmName'" -ErrorAction Stop
+    
+    if (-not $managedDevice) {
+        Write-Error "No Intune device found with name $vmName"
+        exit
+    }
+    
+    Write-Host "Found Intune device: $($managedDevice.DeviceName)" -ForegroundColor Cyan
+}
+catch {
+    Write-Error "Failed to retrieve Intune device: $_"
+    exit
+}
+
+# Get user ID from Microsoft Graph
+try {
+    $user = Get-MgUser -UserId $userUpn -ErrorAction Stop
+    Write-Host "Found user ID: $($user.Id)" -ForegroundColor Cyan
+}
+catch {
+    Write-Error "Failed to retrieve user information: $_"
+    exit
+}
+
+# Assign user as principal in Intune
+try {
+    Invoke-MgAssignUserDeviceManagementManagedDevice `
+        -ManagedDeviceId $managedDevice.Id `
+        -UserIds @($user.Id) -ErrorAction Stop
+    
+    Write-Host "Successfully assigned user as principal on Intune device" -ForegroundColor Green
+}
+catch {
+    Write-Error "Failed to assign principal user in Intune: $_"
+}
+
+# Disconnect connections
+Disconnect-MgGraph | Out-Null
+Disconnect-AzAccount | Out-Null
