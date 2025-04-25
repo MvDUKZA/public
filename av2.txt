@@ -1,0 +1,21 @@
+# Import required modules
+Import-Module Az.Accounts
+Import-Module Az.DesktopVirtualization
+Import-Module Microsoft.Graph.Authentication
+Import-Module Microsoft.Graph.DeviceManagement
+
+# Connect to Azure with device code flow
+Write-Host "Authenticating to Azure..." -ForegroundColor Cyan
+Connect-AzAccount -UseDeviceAuthentication
+
+# Connect to Microsoft Graph
+Write-Host "Authenticating to Microsoft Graph..." -ForegroundColor Cyan
+Connect-MgGraph -Scopes "DeviceManagementManagedDevices.ReadWrite.All", "User.Read.All" -UseDeviceAuthentication
+
+# Get user input
+$userUpn = Read-Host -Prompt "Enter the user's UPN to assign"
+$resourceGroup = Read-Host -Prompt "Enter the resource group name of the AVD host pool"
+$hostPoolName = Read-Host -Prompt "Enter the AVD host pool name"
+$sessionHostName = Read-Host -Prompt "Enter the session host name (e.g., HostPool1/AVD-VM-01.domain.com)"
+
+# ... rest of the original script remains unchanged ...
