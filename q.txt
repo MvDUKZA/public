@@ -6,78 +6,66 @@ $outputCsv = "C:\Temp\qualys_registry_gpp.csv"
 [xml]$xml = Get-Content $xmlPath
 $results = @()
 
-# Function to clean registry key paths
-function Clean-RegistryPath {
-    param([string]$rawPath)
-    $cleanPath = $rawPath -replace "NEWF_LOCAL_MACHINE", "HKEY_LOCAL_MACHINE" `
-                          -replace "HWAINPOSTEN", "HKEY_LOCAL_MACHINE" `
-                          -replace "[()]", "\" `
-                          -replace "\s{2,}", " " `
-                          -replace "\\+", "\"
-    return $cleanPath.Trim()
-}
+# Loop through each control
+$controls = $xml.SelectNodes("//CONTROL")
 
-# Process CONTROL sections (from top.jpg example)
-foreach ($control in $xml.SelectNodes("//CONTROL")) {
+foreach ($control in $controls) {
     $controlId = $control.ID.'#text'
-    
+
     foreach ($tech in $control.SelectNodes(".//TECHNOLOGY")) {
         $techName = $tech.NAME.'#text'
-        
-        foreach ($dp in $tech.SelectNodes(".//DP")) {
-            $kVal = $dp.K
-            $vVal = $dp.V.'#cdata-section'
-            
-            # Skip non-registry entries
-            if ($kVal -notmatch "^HKEY_") { continue }
 
-            $regKey = Clean-RegistryPath $kVal
-            $valueName = ($regKey -split "\\")[-1]
-            $regKey = ($regKey -split "\\")[0..($regKey.Split("\").Length-2)] -join "\"
+        foreach ($ctrlNode in $tech.SelectNodes(".//CTRL")) {
+            foreach ($dpNode in $ctrlNode.SelectNodes(".//DP")) {
+                $kVal = $dpNode.K
+                $vVal = $dpNode.V
+                $desc = $dpNode.InnerText
 
-            # Determine value type
-            $valueType = if ($vVal -match '^\d+$') { "DWord" } else { "String" }
-            
-            $results += [pscustomobject]@{
-                "Control ID"     = $controlId
-                "Technology"     = $techName
-                "Registry Key"   = $regKey
-                "Value Name"     = $valueName
-                "Expected Value" = $vVal
-                "Value Type"     = $valueType
+                # Attempt to detect registry keys
+                if ($desc -match "HKEY_") {
+                    $regKey = $null
+                    $valueName = $null
+                    $expectedValue = $null
+                    $valueType = "DWord"  # Default for GPP
+
+                    # Extract registry key from description
+                    if ($desc -match "HKEY_[A-Z_\\]+\\([a-zA-Z0-9]+)?") {
+                        $regKey = ($desc -split "registry key location|key")[1] -replace "[:\[\]]", "" -replace "\s{2,}", " "
+                        $regKey = ($regKey -split "value|must|that|if|from")[0].Trim()
+                    }
+
+                    if ($regKey -and $regKey -match "\\(.+?)$") {
+                        $valueName = ($regKey -split "\\")[-1].Trim()
+                    }
+
+                    # Try V element for expected value
+                    $expectedValue = $vVal.'#cdata-section' -replace "[^\x20-\x7E]", ""
+
+                    # Determine value type (basic logic)
+                    if ($expectedValue -match "^[0-9]+$") {
+                        $valueType = "DWord"
+                    } elseif ($expectedValue) {
+                        $valueType = "String"
+                    }
+
+                    if ($regKey -and $valueName -and $expectedValue) {
+                        $results += [pscustomobject]@{
+                            "Control ID"     = $controlId
+                            "Technology"     = $techName
+                            "K Value"        = $kVal
+                            "Registry Key"   = $regKey
+                            "Value Name"     = $valueName
+                            "Expected Value" = $expectedValue
+                            "Value Type"     = $valueType
+                        }
+                    }
+                }
             }
         }
     }
 }
 
-# Process GP sections (from bottom.jpg example)
-foreach ($gp in $xml.SelectNodes("//GP")) {
-    foreach ($kNode in $gp.SelectNodes(".//K")) {
-        $desc = $kNode.InnerText
-        
-        # Extract registry path from description
-        if ($desc -match "(HKEY_[^\s]+|NEWF_LOCAL_MACHINE[^\s]+|HWAINPOSTEN[^\s]+)") {
-            $rawPath = $matches[0]
-            $regKey = Clean-RegistryPath $rawPath
-            $valueName = ($regKey -split "\\")[-1]
-            $regKey = ($regKey -split "\\")[0..($regKey.Split("\").Length-2)] -join "\"
-
-            # Extract expected value (0 or 1 from description)
-            $expectedValue = if ($desc -match "value of (\d)") { $matches[1] } else { "N/A" }
-
-            $results += [pscustomobject]@{
-                "Control ID"     = "From GP Section"
-                "Technology"     = "N/A"
-                "Registry Key"   = $regKey
-                "Value Name"     = $valueName
-                "Expected Value" = $expectedValue
-                "Value Type"     = "DWord"
-            }
-        }
-    }
-}
-
-# Export results
+# Export for GPP import
 if ($results.Count -gt 0) {
     $results | Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
     Write-Host "✅ Exported $($results.Count) registry entries for GPP to: $outputCsv"
