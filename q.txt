@@ -21,44 +21,48 @@ foreach ($control in $controls) {
                 $vVal = $dpNode.V
                 $desc = $dpNode.InnerText
 
-                # Attempt to detect registry keys
-                if ($desc -match "HKEY_") {
-                    $regKey = $null
-                    $valueName = $null
-                    $expectedValue = $null
-                    $valueType = "DWord"  # Default for GPP
+                # Initialize variables
+                $regKey = $null
+                $valueName = $null
+                $expectedValue = $null
+                $valueType = "DWord"
 
-                    # Extract registry key from description
-                    if ($desc -match "HKEY_[A-Z_\\]+\\([a-zA-Z0-9]+)?") {
-                        $regKey = ($desc -split "registry key location|key")[1] -replace "[:\[\]]", "" -replace "\s{2,}", " "
-                        $regKey = ($regKey -split "value|must|that|if|from")[0].Trim()
+                # Priority 1: Extract from K element if valid
+                if ($kVal -match '^HKEY_') {
+                    $regKey = $kVal.Trim()
+                }
+                # Priority 2: Extract from description
+                else {
+                    if ($desc -match '(HKEY_[A-Z_\\]+(\\[a-zA-Z0-9\s\(\)]+)+)') {
+                        $regKey = $matches[1].Trim() -replace '\s+', ''
                     }
+                }
 
-                    if ($regKey -and $regKey -match "\\(.+?)$") {
-                        $valueName = ($regKey -split "\\")[-1].Trim()
-                    }
+                # Skip if no valid registry key found
+                if (-not $regKey) { continue }
 
-                    # Try V element for expected value
-                    $expectedValue = $vVal.'#cdata-section' -replace "[^\x20-\x7E]", ""
+                # Split key and value name
+                $regKeyParts = $regKey -split '\\'
+                $valueName = $regKeyParts[-1]
+                $regKey = $regKeyParts[0..($regKeyParts.Length-2)] -join '\'
 
-                    # Determine value type (basic logic)
-                    if ($expectedValue -match "^[0-9]+$") {
-                        $valueType = "DWord"
-                    } elseif ($expectedValue) {
-                        $valueType = "String"
-                    }
+                # Get expected value
+                $expectedValue = if ($vVal.'#cdata-section') { 
+                    ($vVal.'#cdata-section' -replace "[^\x20-\x7E]", "").Trim() 
+                } else { 
+                    $vVal.'#text' 
+                }
 
-                    if ($regKey -and $valueName -and $expectedValue) {
-                        $results += [pscustomobject]@{
-                            "Control ID"     = $controlId
-                            "Technology"     = $techName
-                            "K Value"        = $kVal
-                            "Registry Key"   = $regKey
-                            "Value Name"     = $valueName
-                            "Expected Value" = $expectedValue
-                            "Value Type"     = $valueType
-                        }
-                    }
+                # Determine value type
+                $valueType = if ($expectedValue -match '^\d+$') { "DWord" } else { "String" }
+
+                $results += [pscustomobject]@{
+                    "Control ID"     = $controlId
+                    "Technology"     = $techName
+                    "Registry Key"   = $regKey
+                    "Value Name"     = $valueName
+                    "Expected Value" = $expectedValue
+                    "Value Type"     = $valueType
                 }
             }
         }
@@ -68,7 +72,7 @@ foreach ($control in $controls) {
 # Export for GPP import
 if ($results.Count -gt 0) {
     $results | Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
-    Write-Host "✅ Exported $($results.Count) registry entries for GPP to: $outputCsv"
+    Write-Host "Exported $($results.Count) registry entries for GPP to: $outputCsv"
 } else {
     Write-Warning "No registry entries found."
 }
