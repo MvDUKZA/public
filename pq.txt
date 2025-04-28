@@ -2,13 +2,22 @@
 $inputCsv = "C:\temp\qualys_export.csv"
 $outputCsv = "C:\temp\qualys_registry_extraction.csv"
 
-# Import CSV
+# Import CSV safely
+if (-Not (Test-Path $inputCsv)) {
+    Write-Error "Input CSV not found at $inputCsv"
+    exit
+}
+
 $data = Import-Csv -Path $inputCsv
 
-# Prepare output array
-$output = @()
+# Prepare a faster output list
+$output = [System.Collections.Generic.List[PSObject]]::new()
 
 foreach ($row in $data) {
+    if (-not $row.'Control ID' -or -not $row.'Control Name' -or -not $row.'Extended Evidence') {
+        continue  # skip incomplete rows
+    }
+
     $controlID = $row.'Control ID'
     $reference = $row.'Control Name'
     $status = $row.Status
@@ -17,50 +26,49 @@ foreach ($row in $data) {
 
     $valueType = ""
     $condition = ""
+    $expectedValue = ""
 
     # Find Type from Posture Evidence
     if ($postureEvidence -match "Type:\s*(.+?)\s*(?:$|\n|Setting)") {
-        $valueType = $matches[1].Trim()
+        $typeMatch = $matches[1].Trim()
+        $valueType = $typeMatch
     }
 
-    # Find Match Condition (Equals, Greater Than, Between, etc.)
+    # Find Match Condition from Posture Evidence
     if ($postureEvidence -match "Posture:\s*(.+?)\s*(?:$|\n|Type:)") {
-        $condition = $matches[1].Trim()
+        $postureMatch = $matches[1].Trim()
+        $condition = $postureMatch
     }
 
     # Find Expected Value from Posture Evidence
-    $expectedValue = ""
     if ($status -ne "Passed") {
         if ($postureEvidence -match "Expected Value\(s\):\s*(.+?)\s*(?:$|\n|Actual|Setting)") {
-            $expectedValue = $matches[1].Trim()
+            $expectedMatch = $matches[1].Trim()
+            $expectedValue = $expectedMatch
         }
     }
 
     # Special Handling for BETWEEN
-    $minValue = ""
-    $maxValue = ""
-    if ($condition -match "between" -and $expectedValue -match "(\d+)\s*and\s*(\d+)") {
+    if ($condition -match "between" -and $expectedValue -match "([\d.,]+)\s*and\s*([\d.,]+)") {
         $minValue = $matches[1]
         $maxValue = $matches[2]
         $expectedValue = "$minValue to $maxValue"
     }
 
-    # Now Split Extended Evidence into multiple Registry entries
+    # Now split Extended Evidence into multiple Registry entries
     if ($extendedEvidence) {
-        # Match Registry key, name and value blocks, including multi-line values
+        # More careful multi-line matching
         $regex = "Registry key:\s*(.+?)\s*Registry name:\s*(.+?)\s*Value:\s*((?:.|\r?\n)+?)(?=Registry key:|\Z)"
 
-        $matches = [regex]::Matches($extendedEvidence, $regex, 'Singleline')
+        $registryMatches = [regex]::Matches($extendedEvidence, $regex, 'Singleline')
 
-        foreach ($match in $matches) {
+        foreach ($match in $registryMatches) {
             $registryKey = $match.Groups[1].Value.Trim()
             $registryName = $match.Groups[2].Value.Trim()
             $actualValue = $match.Groups[3].Value.Trim()
 
-            # Normalize multi-line actual value (replace newlines with commas)
-            $actualValue = $actualValue -replace "`r`n", ","
-            $actualValue = $actualValue -replace "`n", ","
-            $actualValue = $actualValue -replace "`r", ","
+            # Normalize multi-line actual value (replace all line breaks with commas)
+            $actualValue = $actualValue -replace "[\r\n]+", ","
             $actualValue = $actualValue.Trim()
 
             # Handle missing actual value
@@ -71,8 +79,8 @@ foreach ($row in $data) {
             # Decide which value to show depending on Pass/Fail
             $finalValue = if ($status -eq "Passed") { $actualValue } else { if ($expectedValue) { $expectedValue } else { "Missing" } }
 
-            # Build individual output object
-            $output += [PSCustomObject]@{
+            # Add the output
+            $output.Add([PSCustomObject]@{
                 "Control ID"    = $controlID
                 "Reference"     = $reference
                 "Registry Key"  = $registryKey
@@ -80,12 +88,12 @@ foreach ($row in $data) {
                 "Value"         = $finalValue
                 "Type"          = $valueType
                 "Condition"     = $condition
-            }
+            })
         }
     }
 }
 
-# Export the result
-$output | Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
+# Export the result - use UTF8 with BOM for clean Excel compatibility
+$output | Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8BOM
 
 Write-Output "Extraction complete. File saved to: $outputCsv"
