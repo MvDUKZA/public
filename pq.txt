@@ -1,0 +1,91 @@
+# Set input and output paths
+$inputCsv = "C:\temp\qualys_export.csv"
+$outputCsv = "C:\temp\qualys_registry_extraction.csv"
+
+# Import CSV
+$data = Import-Csv -Path $inputCsv
+
+# Prepare output array
+$output = @()
+
+foreach ($row in $data) {
+    $controlID = $row.'Control ID'
+    $reference = $row.'Control Name'
+    $status = $row.Status
+    $postureEvidence = $row.'Posture Evidence'
+    $extendedEvidence = $row.'Extended Evidence'
+
+    $valueType = ""
+    $condition = ""
+
+    # Find Type from Posture Evidence
+    if ($postureEvidence -match "Type:\s*(.+?)\s*(?:$|\n|Setting)") {
+        $valueType = $matches[1].Trim()
+    }
+
+    # Find Match Condition (Equals, Greater Than, Between, etc.)
+    if ($postureEvidence -match "Posture:\s*(.+?)\s*(?:$|\n|Type:)") {
+        $condition = $matches[1].Trim()
+    }
+
+    # Find Expected Value from Posture Evidence
+    $expectedValue = ""
+    if ($status -ne "Passed") {
+        if ($postureEvidence -match "Expected Value\(s\):\s*(.+?)\s*(?:$|\n|Actual|Setting)") {
+            $expectedValue = $matches[1].Trim()
+        }
+    }
+
+    # Special Handling for BETWEEN
+    $minValue = ""
+    $maxValue = ""
+    if ($condition -match "between" -and $expectedValue -match "(\d+)\s*and\s*(\d+)") {
+        $minValue = $matches[1]
+        $maxValue = $matches[2]
+        $expectedValue = "$minValue to $maxValue"
+    }
+
+    # Now Split Extended Evidence into multiple Registry entries
+    if ($extendedEvidence) {
+        # Match Registry key, name and value blocks, including multi-line values
+        $regex = "Registry key:\s*(.+?)\s*Registry name:\s*(.+?)\s*Value:\s*((?:.|\r?\n)+?)(?=Registry key:|\Z)"
+
+        $matches = [regex]::Matches($extendedEvidence, $regex, 'Singleline')
+
+        foreach ($match in $matches) {
+            $registryKey = $match.Groups[1].Value.Trim()
+            $registryName = $match.Groups[2].Value.Trim()
+            $actualValue = $match.Groups[3].Value.Trim()
+
+            # Normalize multi-line actual value (replace newlines with commas)
+            $actualValue = $actualValue -replace "`r`n", ","
+            $actualValue = $actualValue -replace "`n", ","
+            $actualValue = $actualValue -replace "`r", ","
+            $actualValue = $actualValue.Trim()
+
+            # Handle missing actual value
+            if ([string]::IsNullOrWhiteSpace($actualValue)) {
+                $actualValue = "Missing"
+            }
+
+            # Decide which value to show depending on Pass/Fail
+            $finalValue = if ($status -eq "Passed") { $actualValue } else { if ($expectedValue) { $expectedValue } else { "Missing" } }
+
+            # Build individual output object
+            $output += [PSCustomObject]@{
+                "Control ID"    = $controlID
+                "Reference"     = $reference
+                "Registry Key"  = $registryKey
+                "Registry Name" = $registryName
+                "Value"         = $finalValue
+                "Type"          = $valueType
+                "Condition"     = $condition
+            }
+        }
+    }
+}
+
+# Export the result
+$output | Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
+
+Write-Output "Extraction complete. File saved to: $outputCsv"
