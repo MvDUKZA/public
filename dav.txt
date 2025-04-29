@@ -1,0 +1,44 @@
+# Define log file path
+$LogFile = "C:\Logs\AVD_DeleteOptions_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+New-Item -ItemType Directory -Force -Path (Split-Path $LogFile) | Out-Null
+
+# Define logging function
+function Write-Log {
+    param([string]$Message)
+    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $logEntry = "$timestamp - $Message"
+    Write-Host $logEntry
+    Add-Content -Path $LogFile -Value $logEntry
+}
+
+# Parameters for range
+$ResourceGroupName = "RG-AVD"
+$StartIndex = 12
+$EndIndex = 80
+
+# Generate AVD name list
+$AVDNameList = $StartIndex..$EndIndex | ForEach-Object { "Personal1-$_" }
+
+foreach ($AVDName in $AVDNameList) {
+    Write-Log "Processing VM: $AVDName"
+
+    try {
+        $vmConfig = Get-AzVM -ResourceGroupName $ResourceGroupName -Name $AVDName -ErrorAction Stop
+
+        $vmConfig.StorageProfile.OsDisk.DeleteOption = 'Delete'
+
+        if ($vmConfig.StorageProfile.DataDisks) {
+            $vmConfig.StorageProfile.DataDisks | ForEach-Object { $_.DeleteOption = 'Delete' }
+        }
+
+        if ($vmConfig.NetworkProfile.NetworkInterfaces) {
+            $vmConfig.NetworkProfile.NetworkInterfaces | ForEach-Object { $_.DeleteOption = 'Delete' }
+        }
+
+        $vmConfig | Update-AzVM -ErrorAction Stop
+        Write-Log "Successfully updated delete options for VM: $AVDName"
+    }
+    catch {
+        Write-Log "ERROR processing VM $AVDName: $_"
+    }
+}
