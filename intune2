@@ -1,0 +1,89 @@
+# =====================
+# Script: Assign Intune Primary User
+# =====================
+
+# Parameters
+$deviceName = "YOUR-DEVICE-NAME-HERE"
+$userUPN = "user@domain.com"
+
+# Required scope
+$requiredScope = "DeviceManagementManagedDevices.ReadWrite.All"
+
+# Logging function
+function Write-Log {
+    param([string]$message)
+    Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - $message"
+}
+
+# Ensure Microsoft.Graph module is available
+if (-not (Get-Module -ListAvailable -Name Microsoft.Graph)) {
+    try {
+        Write-Log "Installing Microsoft.Graph module..."
+        Install-Module -Name Microsoft.Graph -Force -ErrorAction Stop
+        Write-Log "Microsoft.Graph module installed successfully."
+    } catch {
+        Write-Error "ERROR: Failed to install Microsoft.Graph module. $_"
+        exit 1
+    }
+}
+
+# Import module and connect
+try {
+    Import-Module Microsoft.Graph -ErrorAction Stop
+    Write-Log "Microsoft.Graph module imported successfully."
+
+    Write-Log "Connecting to Microsoft Graph with scope: $requiredScope"
+    Connect-MgGraph -Scopes $requiredScope -ErrorAction Stop
+    Write-Log "Connected to Microsoft Graph."
+} catch {
+    Write-Error "ERROR: Failed to connect to Microsoft Graph. $_"
+    exit 1
+}
+
+# Check if the scope was actually granted
+if (-not ((Get-MgContext).Scopes -contains $requiredScope)) {
+    Write-Error "ERROR: Required scope '$requiredScope' was not granted. Please ensure admin consent has been given."
+    Disconnect-MgGraph
+    exit 1
+}
+
+# Get the device by name
+try {
+    Write-Log "Searching for device named '$deviceName'..."
+    $device = Get-MgDeviceManagementManagedDevice -Filter "deviceName eq '$deviceName'" -ErrorAction Stop
+
+    if (-not $device) {
+        throw "Device '$deviceName' not found in Intune."
+    }
+
+    $deviceId = $device.Id
+    Write-Log "Found device ID: $deviceId"
+} catch {
+    Write-Error "ERROR: Could not retrieve device. $_"
+    Disconnect-MgGraph
+    exit 1
+}
+
+# Build the request
+$uri = "https://graph.microsoft.com/beta/deviceManagement/managedDevices/$deviceId/assignUserToDevice"
+
+$headers = @{
+    "Content-Type" = "application/json"
+}
+
+$body = @{
+    userPrincipalName = $userUPN
+} | ConvertTo-Json -Depth 2
+
+# Send the request
+try {
+    Write-Log "Assigning user '$userUPN' to device ID '$deviceId'..."
+    $response = Invoke-MgGraphRequest -Method POST -Uri $uri -Headers $headers -Body $body -ErrorAction Stop
+    Write-Log "SUCCESS: User '$userUPN' has been assigned to device '$deviceName'."
+} catch {
+    Write-Error "ERROR: Failed to assign user to device. $_"
+}
+
+# Disconnect
+Disconnect-MgGraph
+Write-Log "Disconnected from Microsoft Graph."
