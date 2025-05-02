@@ -1,0 +1,100 @@
+.\Export-EnvMgr-AllSettings.ps1 `
+  -ConfigFolderPath 'C:\EnvMgr\Repository' `
+  -OutputFolderPath 'C:\Exports\EnvMgrSettings'
+
+
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$ConfigFolderPath,
+
+    [Parameter(Mandatory = $false)]
+    [string]$OutputFolderPath = ".\ExportedSettings",
+
+    [Parameter(Mandatory = $false)]
+    [string]$LogFilePath = ".\ExportSettings.log"
+)
+
+function Write-Log {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet("INFO","WARN","ERROR")][string]$Level,
+        [Parameter(Mandatory = $true)][string]$Message
+    )
+    $timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+    $entry     = "$timestamp [$Level] $Message"
+    Write-Host $entry
+    Add-Content -Path $LogFilePath -Value $entry
+}
+
+# --- Prepare environment ---
+try {
+    Write-Log -Level INFO -Message "Starting export of EnvMgr settings."
+
+    if (-not (Test-Path -Path $ConfigFolderPath)) {
+        Write-Log -Level ERROR -Message "Config folder '$ConfigFolderPath' does not exist."
+        throw "Missing config folder."
+    }
+
+    if (-not (Test-Path -Path $OutputFolderPath)) {
+        Write-Log -Level INFO -Message "Output folder '$OutputFolderPath' not found — creating it."
+        New-Item -Path $OutputFolderPath -ItemType Directory -ErrorAction Stop | Out-Null
+    }
+}
+catch {
+    Write-Log -Level ERROR -Message "Initialization failed: $_"
+    exit 1
+}
+
+# --- Recursive XML node extractor ---
+function Get-XmlNodes {
+    param(
+        [Parameter(Mandatory = $true)][xml]$Node,
+        [string]$ParentPath = ""
+    )
+    foreach ($child in $Node.ChildNodes) {
+        if ($child.NodeType -ne 'Element') { continue }
+        $currentPath = if ($ParentPath) { "$ParentPath/$($child.Name)" } else { $child.Name }
+
+        # Collect attributes
+        $attrHash = @{}
+        foreach ($a in $child.Attributes) {
+            $attrHash[$a.Name] = $a.Value
+        }
+
+        [PSCustomObject]@{
+            FileName   = $Node.BaseURI.Split('/')[-1]
+            NodePath   = $currentPath
+            NodeName   = $child.Name
+            Attributes = ($attrHash | ConvertTo-Json -Compress)
+            Value      = $child.InnerText
+        }
+
+        # Recurse deeper
+        Get-XmlNodes -Node $child -ParentPath $currentPath
+    }
+}
+
+# --- Process each XML file ---
+Get-ChildItem -Path $ConfigFolderPath -Filter '*.xml' -Recurse | ForEach-Object {
+    $xmlFile = $_.FullName
+    $base    = $_.BaseName
+    $outCsv  = Join-Path $OutputFolderPath ("${base}_Settings.csv")
+
+    try {
+        Write-Log -Level INFO -Message "Loading XML file '$xmlFile'."
+        [xml]$doc = Get-Content -Path $xmlFile -ErrorAction Stop
+
+        Write-Log -Level INFO -Message "Extracting nodes from '$base'."
+        $allSettings = Get-XmlNodes -Node $doc
+
+        Write-Log -Level INFO -Message "Exporting to CSV '$outCsv'."
+        $allSettings | Export-Csv -Path $outCsv -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
+
+        Write-Log -Level INFO -Message "Finished exporting '$base'."
+    }
+    catch {
+        Write-Log -Level ERROR -Message "Error processing '$xmlFile': $_"
+    }
+}
+
+Write-Log -Level INFO -Message "All done."
