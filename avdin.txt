@@ -1,95 +1,180 @@
-# Parameters
-$csvPath = "C:\Scripts\user_device_mapping.csv"
-$logPath = "C:\Scripts\avd_intune_assignment.log"
-$graphScope = "DeviceManagementManagedDevices.ReadWrite.All"
+# Assign users to AVD session hosts and Intune devices
 
+# Configuration settings
+$CsvFilePath = "C:\Scripts\user_device_mapping.csv"
+$LogFilePath = "C:\Scripts\avd_intune_assignment.log"
+$RequiredGraphScopes = @(
+    "DeviceManagementManagedDevices.ReadWrite.All",
+    "User.Read.All"
+)
+
+# Logging function: writes timestamped entries
 function Write-Log {
-    param([string]$message)
-    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    Add-Content -Path $logPath -Value "$timestamp - $message"
-    Write-Output "$timestamp - $message"
+    param($message)
+    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    "$timestamp - $message" | Tee-Object -FilePath $LogFilePath -Append
 }
 
-# Connect to Azure
-try {
-    Connect-AzAccount -ErrorAction Stop
-    Write-Log "Connected to Azure."
-} catch {
-    Write-Error "Failed to connect to Azure: $_"
-    exit 1
+# Ensures a module is installed and imported
+function Ensure-Module {
+    param($moduleName)
+    if (-not (Get-Module -ListAvailable -Name $moduleName)) {
+        Write-Log "Installing PowerShell module: $moduleName"
+        Install-Module -Name $moduleName -Force -Scope CurrentUser -ErrorAction Stop
+    }
+    Import-Module -Name $moduleName -ErrorAction Stop
+    Write-Log "Module loaded: $moduleName"
 }
 
-# Connect to Graph
-try {
-    Import-Module Microsoft.Graph -ErrorAction Stop
-    Connect-MgGraph -Scopes $graphScope -ErrorAction Stop
-    Write-Log "Connected to Microsoft Graph with scope: $graphScope"
-} catch {
-    Write-Error "Failed to connect to Microsoft Graph: $_"
-    exit 1
-}
-
-# Load CSV
-if (-not (Test-Path $csvPath)) {
-    Write-Error "CSV file not found: $csvPath"
-    Disconnect-MgGraph
-    exit 1
-}
-
-$records = Import-Csv -Path $csvPath
-if (-not $records) {
-    Write-Error "CSV is empty."
-    Disconnect-MgGraph
-    exit 1
-}
-
-foreach ($row in $records) {
-    $userUPN = $row.UserUPN.Trim()
-    $deviceName = $row.VDIName.Trim()
-    $hostPool = $row.HostPoolName.Trim()
-    $resourceGroup = $row.ResourceGroupName.Trim()
-
-    Write-Log "Processing: $userUPN -> $deviceName [$hostPool / $resourceGroup]"
-
-    # ===== Azure AVD Assignment =====
+# Checks if a user has Intune service plan
+function Test-UserHasIntuneLicense {
+    param($userPrincipalName)
+    $intunePlanId = '8e9ff0ff-aa7a-4b20-83ad-eba658c935bf'
     try {
-        $fqdn = "$deviceName.domain.local"  # Adjust if your session hosts are not FQDN
-        $sessionHost = Get-AzWvdSessionHost -ResourceGroupName $resourceGroup -HostPoolName $hostPool `
-            | Where-Object { $_.Name -like "*$deviceName*" }
-
-        if (-not $sessionHost) {
-            throw "Session host '$deviceName' not found in host pool '$hostPool'."
+        $licenseDetails = Get-MgUserLicenseDetail -UserId $userPrincipalName -ErrorAction Stop
+        foreach ($plan in $licenseDetails.ServicePlans) {
+            if ($plan.ServicePlanId -eq $intunePlanId -and $plan.ProvisioningStatus -eq 'Success') {
+                return $true
+            }
         }
-
-        # Assign the user
-        Update-AzWvdSessionHost -ResourceGroupName $resourceGroup -HostPoolName $hostPool `
-            -Name $sessionHost.Name -AssignedUser $userUPN -ErrorAction Stop
-
-        Write-Log "SUCCESS: Assigned AVD session host '$deviceName' to user '$userUPN'."
+        return $false
     } catch {
-        Write-Log "ERROR: AVD assignment failed for '$userUPN' to '$deviceName'. $_"
-        continue
-    }
-
-    # ===== Intune Assignment =====
-    try {
-        $device = Get-MgDeviceManagementManagedDevice -Filter "deviceName eq '$deviceName'" -ErrorAction Stop
-        if (-not $device) { throw "Device '$deviceName' not found in Intune." }
-        if ($device.ManagementState -ne "mdm") { throw "Device '$deviceName' not MDM-managed." }
-
-        $deviceId = $device.Id
-        $uri = "https://graph.microsoft.com/beta/deviceManagement/managedDevices/$deviceId/assignUserToDevice"
-        $body = @{ userPrincipalName = $userUPN } | ConvertTo-Json -Depth 2
-        $headers = @{ "Content-Type" = "application/json" }
-
-        Invoke-MgGraphRequest -Method POST -Uri $uri -Headers $headers -Body $body -ErrorAction Stop
-        Write-Log "SUCCESS: Assigned Intune primary user '$userUPN' to '$deviceName'."
-    } catch {
-        $errorDetails = $_.Exception.Response.Content.ReadAsStringAsync().Result
-        Write-Log "ERROR: Intune assignment failed for '$userUPN' on '$deviceName'. $errorDetails"
-        continue
+        Write-Log "License check error for $userPrincipalName: $_"
+        return $false
     }
 }
 
+# Validates that a user exists, is enabled, is a member, and licensed
+function Test-UserEligibility {
+    param($userPrincipalName)
+    try {
+        $user = Get-MgUser -UserId $userPrincipalName -Property accountEnabled,userType -ErrorAction Stop
+        if (-not $user.AccountEnabled) {
+            Write-Log "User disabled: $userPrincipalName"
+            return $false
+        }
+        if ($user.UserType -ne 'Member') {
+            Write-Log "User not a member: $userPrincipalName"
+            return $false
+        }
+        if (-not (Test-UserHasIntuneLicense $userPrincipalName)) {
+            Write-Log "User lacks Intune license: $userPrincipalName"
+            return $false
+        }
+        return $true
+    } catch {
+        Write-Log "User validation error for $userPrincipalName: $_"
+        return $false
+    }
+}
+
+# Retrieves and validates an Intune-managed device by name using server-side filter
+function Test-DeviceEligibility {
+    param($deviceName)
+    try {
+        $filter = "deviceName eq '$deviceName' and operatingSystem eq 'Windows'"
+        $matching = Get-MgDeviceManagementManagedDevice -Filter $filter -ErrorAction Stop
+        $device = $matching |
+            Where-Object { $_.ManagementState -in @('mdm','coManaged') } |
+            Sort-Object LastSyncDateTime -Descending |
+            Select-Object -First 1
+        if (-not $device) {
+            Write-Log "Device not eligible: $deviceName"
+            return $null
+        }
+        if ($device.LastSyncDateTime -lt (Get-Date).AddDays(-30)) {
+            Write-Log "Device sync is stale (>30 days): $deviceName"
+        }
+        return $device
+    } catch {
+        Write-Log "Device validation error for $deviceName: $_"
+        return $null
+    }
+}
+
+# --- Main Script Execution ---
+# Ensure necessary modules
+Ensure-Module -moduleName Az.Accounts
+Ensure-Module -moduleName Az.DesktopVirtualization
+Ensure-Module -moduleName Microsoft.Graph
+Ensure-Module -moduleName Microsoft.Graph.DeviceManagement
+Ensure-Module -moduleName Microsoft.Graph.Users
+
+# Connect to Azure and Graph
+Connect-AzAccount -ErrorAction Stop
+Connect-MgGraph -Scopes $RequiredGraphScopes -ErrorAction Stop
+foreach ($scope in $RequiredGraphScopes) {
+    if ((Get-MgContext).Scopes -notcontains $scope) {
+        throw "Missing Graph API scope: $scope"
+    }
+}
+
+# Import CSV with error handling
+try {
+    $records = Import-Csv -Path $CsvFilePath -ErrorAction Stop
+} catch {
+    throw "Failed to import CSV ($CsvFilePath): $_"
+}
+# Validate CSV schema
+$requiredColumns = 'UserUPN','VDIName','HostPoolName','ResourceGroupName'
+$actualColumns   = ($records | Get-Member -MemberType NoteProperty).Name
+if (Compare-Object $requiredColumns $actualColumns) {
+    throw "CSV schema mismatch: required columns are $($requiredColumns -join ', ')"
+}
+
+# Process each CSV record
+foreach ($record in $records) {
+    $userPrincipalName   = $record.UserUPN.Trim()
+    $deviceName          = $record.VDIName.Trim()
+    $hostPoolName        = $record.HostPoolName.Trim()
+    $resourceGroupName   = $record.ResourceGroupName.Trim()
+
+    Write-Log "Processing assignment: $userPrincipalName -> $deviceName"
+
+    # User eligibility check
+    if (-not (Test-UserEligibility $userPrincipalName)) { continue }
+
+    # AVD session host assignment
+    try {
+        $sessionHost = Get-AzWvdSessionHost -ResourceGroupName $resourceGroupName -HostPoolName $hostPoolName -ErrorAction Stop |
+                       Where-Object { $_.Name -ieq $deviceName }
+        if (-not $sessionHost) { throw "Session host not found: $deviceName" }
+        Write-Log "Resolved AVD session host: $($sessionHost.Name)"
+
+        if ($sessionHost.AssignedUser -and $sessionHost.AssignedUser -ne $userPrincipalName) {
+            Write-Log "Skipping AVD: host already assigned to $($sessionHost.AssignedUser)"
+        } else {
+            Update-AzWvdSessionHost -ResourceGroupName $resourceGroupName -HostPoolName $hostPoolName `
+                -Name $sessionHost.Name -AssignedUser $userPrincipalName -ErrorAction Stop
+            Write-Log "Assigned AVD host $deviceName to user $userPrincipalName"
+        }
+    } catch {
+        Write-Log "AVD assignment error for $userPrincipalName -> $deviceName: $_"
+        continue
+    }
+
+    # Intune primary user assignment
+    $intuneDevice = Test-DeviceEligibility $deviceName
+    if (-not $intuneDevice) { continue }
+    try {
+        # Conflict check: skip if already assigned
+        $currentUser = $intuneDevice.UserPrincipalName
+        if ($currentUser -and $currentUser -ne $userPrincipalName) {
+            Write-Log "Skipping Intune: device already assigned to $currentUser"
+            continue
+        }
+        # Perform assignment
+        $assignUri = "https://graph.microsoft.com/beta/deviceManagement/managedDevices/$($intuneDevice.Id)/assignUserToDevice"
+        $payload   = @{ userPrincipalName = $userPrincipalName } | ConvertTo-Json -Depth 2
+        Invoke-MgGraphRequest -Method POST -Uri $assignUri -Headers @{ 'Content-Type' = 'application/json' } `
+            -Body $payload -ErrorAction Stop
+        Write-Log "Assigned Intune device $deviceName to user $userPrincipalName"
+    } catch {
+        $errorMsg = if ($_.Exception.Response) { try { $_.Exception.Response.Content.ReadAsStringAsync().Result } catch { $_.Exception.Message } } else { $_.Exception.Message }
+        Write-Log "Intune assignment error for $userPrincipalName -> $deviceName: $errorMsg"
+    }
+}
+
+# Disconnect and wrap up
 Disconnect-MgGraph
-Write-Log "Disconnected from Graph. Script complete."
+Write-Log "All assignments completed"
