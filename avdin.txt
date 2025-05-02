@@ -1,0 +1,95 @@
+# Configurable paths
+$csvPath = "C:\Scripts\user_device_mapping.csv"
+$logPath = "C:\Scripts\avd_intune_assignment.log"
+
+function Write-Log {
+    param([string]$message)
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $line = "$timestamp - $message"
+    Add-Content -Path $logPath -Value $line
+    Write-Output $line
+}
+
+# Connect to Azure
+try {
+    Connect-AzAccount -ErrorAction Stop
+    Write-Log "Connected to Azure."
+} catch {
+    Write-Error "Failed to connect to Azure: $_"
+    exit 1
+}
+
+# Connect to Microsoft Graph
+$graphScope = "DeviceManagementManagedDevices.ReadWrite.All"
+try {
+    Import-Module Microsoft.Graph -ErrorAction Stop
+    Connect-MgGraph -Scopes $graphScope -ErrorAction Stop
+    Write-Log "Connected to Microsoft Graph with scope: $graphScope"
+} catch {
+    Write-Error "Failed to connect to Microsoft Graph: $_"
+    exit 1
+}
+
+# Read CSV
+if (-not (Test-Path $csvPath)) {
+    Write-Error "CSV file not found: $csvPath"
+    exit 1
+}
+
+$records = Import-Csv -Path $csvPath
+if (-not $records) {
+    Write-Error "CSV file is empty: $csvPath"
+    exit 1
+}
+
+# Start processing
+foreach ($row in $records) {
+    $userUPN = $row.UserUPN.Trim()
+    $deviceName = $row.VDIName.Trim()
+    $hostPool = $row.HostPoolName.Trim()
+    $resourceGroup = $row.ResourceGroupName.Trim()
+
+    Write-Log "Processing: $userUPN -> $deviceName [$hostPool / $resourceGroup]"
+
+    # ===== AVD Assignment =====
+    try {
+        $appGroup = Get-AzWvdApplicationGroup -HostPoolName $hostPool -ResourceGroupName $resourceGroup |
+                    Where-Object {$_.ApplicationGroupType -eq "Desktop"}
+        if (-not $appGroup) { throw "Desktop Application Group not found in $hostPool." }
+
+        $user = Get-AzADUser -UserPrincipalName $userUPN
+        if (-not $user) { throw "User $userUPN not found in Azure AD." }
+
+        New-AzRoleAssignment -ObjectId $user.Id `
+                             -RoleDefinitionName "Desktop Virtualization User" `
+                             -Scope $appGroup.Id -ErrorAction Stop
+
+        Write-Log "SUCCESS: Assigned $userUPN to AVD app group '$($appGroup.Name)'."
+    } catch {
+        Write-Log "ERROR: Failed AVD assignment for $userUPN on $deviceName. $_"
+        continue
+    }
+
+    # ===== Intune Primary User Assignment =====
+    try {
+        $device = Get-MgDeviceManagementManagedDevice -Filter "deviceName eq '$deviceName'" -ErrorAction Stop
+        if (-not $device) { throw "Device '$deviceName' not found in Intune." }
+        if ($device.ManagementState -ne "mdm") { throw "Device '$deviceName' not MDM managed." }
+
+        $deviceId = $device.Id
+        $uri = "https://graph.microsoft.com/beta/deviceManagement/managedDevices/$deviceId/assignUserToDevice"
+        $body = @{ userPrincipalName = $userUPN } | ConvertTo-Json -Depth 2
+        $headers = @{ "Content-Type" = "application/json" }
+
+        Invoke-MgGraphRequest -Method POST -Uri $uri -Headers $headers -Body $body -ErrorAction Stop
+        Write-Log "SUCCESS: Assigned $userUPN as Intune primary user for $deviceName."
+    } catch {
+        $errorDetails = $_.Exception.Response.Content.ReadAsStringAsync().Result
+        Write-Log "ERROR: Intune assignment failed for $userUPN on $deviceName. $errorDetails"
+        continue
+    }
+}
+
+# Disconnect
+Disconnect-MgGraph
+Write-Log "Disconnected from Graph. Script complete."
