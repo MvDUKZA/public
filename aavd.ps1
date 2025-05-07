@@ -9,7 +9,7 @@ $RequiredGraphScopes= @(
 )
 
 # ----------------------------------------
-# Logging (unchanged from yours)
+# Logging
 # ----------------------------------------
 function Write-Log {
     param(
@@ -102,7 +102,7 @@ function Get-IntuneDevice {
 }
 
 # ----------------------------------------
-# Your original Set-PrimaryUser, fixed for PSCore escaping
+# Set primary user for Intune device
 # ----------------------------------------
 function Set-PrimaryUser {
     param(
@@ -185,7 +185,17 @@ function Process-Record {
             Write-Log "Intune device $vmName already owned by $($intuneDev.UserPrincipalName); skipping" 'WARN'
         }
         else {
-            Set-PrimaryUser -DeviceId $intuneDev.Id -UserId $upn
+            try {
+                $user = Get-MgUser -UserId $upn -ErrorAction Stop
+                if (-not $user.Id) {
+                    Write-Log "Failed to retrieve user ID for $upn" 'ERROR'
+                    return
+                }
+                Set-PrimaryUser -DeviceId $intuneDev.Id -UserId $user.Id
+            }
+            catch {
+                Write-Log "Failed to resolve user ID for $upn: $_" 'ERROR'
+            }
         }
     }
 }
