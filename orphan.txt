@@ -1,0 +1,12 @@
+$resourceGroupName = "YourResourceGroupName"
+$vmName = "YourVMName"
+
+# Look for common leftovers
+Get-AzResource -ResourceGroupName $resourceGroupName | Where-Object {
+    $_.Name -like "*$vmName*"
+}
+
+
+# Requires MSGraph module
+Connect-MgGraph -Scopes "Device.ReadWrite.All"
+Get-MgDevice | Where-Object { $_.DisplayName -eq "YourVMName" } | Remove-MgDevice
