@@ -1,0 +1,15 @@
+# Input: $upn
+try {
+    $user = Get-MgUser -Filter "userPrincipalName eq '$upn'" -ConsistencyLevel eventual -CountVariable count
+    $user = $user | Select-Object -First 1
+
+    if ($user -and $user.Id) {
+        Write-Log "Resolved user ID: $($user.Id) for $upn"
+    } else {
+        Write-Log "User with UPN $upn not found or missing ID" 'ERROR'
+        return
+    }
+} catch {
+    Write-Log "Error occurred while resolving user ID for $upn: $_" 'ERROR'
+    return
+}
