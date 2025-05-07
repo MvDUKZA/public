@@ -40,12 +40,35 @@ function Ensure-Module {
 # ----------------------------------------
 function Test-UserHasIntuneLicense {
     param([string]$UPN)
-    # Intune Service Plan GUID
+    # Intune Service Plan GUID (Microsoft Intune service plan, part of EMS, M365 E3/E5, or standalone Intune licenses)
+    # Source: Standard Microsoft 365 licensing data as of 2025
     $intunePlanId = '8e9ff0ff-aa7a-4b20-83ad-eba658c935bf'
+    
     try {
         $details = Get-MgUserLicenseDetail -UserId $UPN -ErrorAction Stop
-        return $details.ServicePlans |
-               Where-Object { $_.ServicePlanId -eq $intunePlanId -and $_.ProvisioningStatus -eq 'Success' }
+        $hasIntune = $details.ServicePlans |
+                     Where-Object { $_.ServicePlanId -eq $intunePlanId -and $_.ProvisioningStatus -eq 'Success' }
+        
+        if ($hasIntune) {
+            return $true
+        }
+        
+        # Fallback: Dynamically check for Intune service plan if hardcoded GUID doesn't match
+        Write-Log "Hardcoded Intune GUID ($intunePlanId) not found for $UPN; attempting dynamic lookup" 'WARN'
+        $skus = Get-MgSubscribedSku -ErrorAction Stop
+        $intuneServicePlan = $skus.ServicePlans |
+                             Where-Object { $_.ServicePlanName -like '*INTUNE*' -and $_.ProvisioningStatus -eq 'Success' } |
+                             Select-Object -First 1
+        
+        if ($intuneServicePlan) {
+            Write-Log "Dynamic lookup found Intune service plan: $($intuneServicePlan.ServicePlanId)" 'INFO'
+            $hasIntune = $details.ServicePlans |
+                         Where-Object { $_.ServicePlanId -eq $intuneServicePlan.ServicePlanId -and $_.ProvisioningStatus -eq 'Success' }
+            return [bool]$hasIntune
+        }
+        
+        Write-Log "No Intune license found for $UPN" 'WARN'
+        return $false
     }
     catch {
         Write-Log "License lookup failed for $UPN: $_" 'ERROR'
