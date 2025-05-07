@@ -1,0 +1,92 @@
+# This script pulls Defender scan events (ID 1001) from specified computers.
+$VDIList = "C:\temp\vdis.csv"
+$EventsFile = "C:\temp\events.csv"
+$LogFile = "C:\temp\events-log.txt"
+
+# Ensure output directory exists
+if (-not (Test-Path "C:\temp")) { New-Item -Path "C:\temp" -ItemType Directory }
+
+# Define time range (adjust dates as needed)
+$StartTime = Get-Date "2024-05-06 00:00:00"
+$EndTime = Get-Date "2024-05-06 23:59:59"  # Adjusted EndTime example
+
+function Write-Log {
+    param([string]$Message)
+    $logTime = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $logEntry = "$logTime - $Message"
+    Write-Host $logEntry
+    Add-Content -Path $LogFile -Value $logEntry
+}
+
+function Get-Events {
+    param([string]$Name)
+    Write-Log "Processing $Name"
+
+    $logName = "Microsoft-Windows-Windows Defender/Operational"
+    $ID = 1001
+
+    $filterHashtable = @{
+        LogName   = $logName
+        ID        = $ID
+        StartTime = $StartTime
+        EndTime   = $EndTime
+    }
+
+    try {
+        $events = Get-WinEvent -ComputerName $Name -FilterHashtable $filterHashtable -ErrorAction Stop | ForEach-Object {
+            $SelectorStrings = @(
+                'Event/EventData/Data[@Name="Message"]',
+                'Event/EventData/Data[@Name="scan ID"]',
+                'Event/EventData/Data[@Name="Scan Type"]',
+                'Event/EventData/Data[@Name="Scan Parameters"]',
+                'Event/EventData/Data[@Name="Scan Time Hours"]',
+                'Event/EventData/Data[@Name="Scan Time Minutes"]',
+                'Event/EventData/Data[@Name="Scan Time Seconds"]'
+                # Removed 'Scan Time' if not used
+            )
+
+            $PropertySelector = [System.Diagnostics.Eventing.Reader.EventLogPropertySelector]::new($SelectorStrings)
+            $messages, $scanid, $scantype, $scanparameters, $scantimehours, $scantimeminutes, $scantimeseconds = $_.GetPropertyValues($PropertySelector)
+
+            # Calculate total scan time
+            $ScanTimeTotal = ""
+            if ([int]::TryParse($scantimehours, [ref]$null) -and [int]::TryParse($scantimeminutes, [ref]$null) -and [int]::TryParse($scantimeseconds, [ref]$null)) {
+                $ScanTimeTotal = "{0:D2}:{1:D2}:{2:D2}" -f $scantimehours, $scantimeminutes, $scantimeseconds
+            }
+
+            [PSCustomObject]@{
+                ComputerName    = $Name
+                message         = $messages
+                scanid          = $scanid
+                scantype        = $scantype
+                scanparameters  = $scanparameters
+                ScanTimeHours   = $scantimehours
+                ScanTimeMinutes = $scantimeminutes
+                ScanTimeSeconds = $scantimeseconds
+                ScanTimeTotal   = $ScanTimeTotal
+                TimeCreated     = $_.TimeCreated
+            }
+        }
+
+        if ($events) {
+            $events | Export-Csv -Path $EventsFile -Append -NoTypeInformation
+            Write-Log "Exported $($events.Count) events from $Name"
+        } else {
+            Write-Log "No events found on $Name"
+        }
+    } catch {
+        Write-Log "Error on $Name: $_"
+    }
+}
+
+# Main execution
+try {
+    Write-Log "Starting script"
+    $VDIs = Import-Csv -Path $VDIList
+    foreach ($vdi in $VDIs) {
+        Get-Events -Name $vdi.Name
+    }
+    Write-Log "Script completed"
+} catch {
+    Write-Log "Critical error: $_"
+}
