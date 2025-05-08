@@ -22,54 +22,60 @@ exit
 @echo off
 setlocal enabledelayedexpansion
 
-:: ==== CONFIG ====
+:: ==== CONFIGURATION ====
 set SERVER=\\YourServer\Share
-set USER=DOMAIN\YourUser
+set USER=DOMAIN\User
 set PASSWORD=YourPassword
 set MOUNT_DRIVE=Z:
 
+:: ==== LOGGING ====
+set LOGFILE=X:\log.txt
+echo === Starting Process %date% %time% === > %LOGFILE%
+
 :: ==== MOUNT NETWORK SHARE ====
-echo Mapping network share...
-net use %MOUNT_DRIVE% %SERVER% /user:%USER% %PASSWORD%
+echo Mapping network share to %MOUNT_DRIVE%... >> %LOGFILE%
+net use %MOUNT_DRIVE% %SERVER% /user:%USER% %PASSWORD% >> %LOGFILE% 2>&1
 if errorlevel 1 (
-    echo ERROR: Could not map network drive.
+    echo ERROR: Could not map network drive. See log: %LOGFILE%
     exit /b 1
 )
 
-:: ==== CAPTURE MODE ====
+:: ==== HANDLE PARAMETER ====
 if /i "%1"=="capture" (
-    echo Capturing partitions...
+    echo Running CAPTURE process... >> %LOGFILE%
+    diskpart /s scripts\capture_disk.txt >> %LOGFILE% 2>&1
 
-    diskpart /s %MOUNT_DRIVE%\scripts\capture_disk.txt
+    echo Capturing System partition... >> %LOGFILE%
+    dism /Capture-Image /ImageFile:%MOUNT_DRIVE%\capture\System.wim /CaptureDir:S:\ /Name:"System" >> %LOGFILE% 2>&1
+    if errorlevel 1 echo ERROR: Failed to capture system partition >> %LOGFILE% & exit /b 1
 
-    dism /Capture-Image /ImageFile:%MOUNT_DRIVE%\capture\System.wim /CaptureDir:S:\ /Name:"System"
-    if errorlevel 1 echo ERROR: Failed to capture system partition & exit /b 1
+    echo Capturing OS partition... >> %LOGFILE%
+    dism /Capture-Image /ImageFile:%MOUNT_DRIVE%\capture\OS.wim /CaptureDir:W:\ /Name:"Windows" >> %LOGFILE% 2>&1
+    if errorlevel 1 echo ERROR: Failed to capture OS partition >> %LOGFILE% & exit /b 1
 
-    dism /Capture-Image /ImageFile:%MOUNT_DRIVE%\capture\OS.wim /CaptureDir:W:\ /Name:"Windows"
-    if errorlevel 1 echo ERROR: Failed to capture OS partition & exit /b 1
-
-    echo Capture complete.
+    echo Capture complete. >> %LOGFILE%
     exit /b 0
 )
 
-:: ==== RESTORE MODE ====
 if /i "%1"=="restore" (
-    echo Restoring image...
+    echo Running RESTORE process... >> %LOGFILE%
+    diskpart /s scripts\restore_disk.txt >> %LOGFILE% 2>&1
 
-    diskpart /s %MOUNT_DRIVE%\scripts\restore_disk.txt
+    echo Restoring System partition... >> %LOGFILE%
+    dism /Apply-Image /ImageFile:%MOUNT_DRIVE%\capture\System.wim /Index:1 /ApplyDir:S:\ >> %LOGFILE% 2>&1
+    if errorlevel 1 echo ERROR: Failed to apply system partition >> %LOGFILE% & exit /b 1
 
-    dism /Apply-Image /ImageFile:%MOUNT_DRIVE%\capture\System.wim /Index:1 /ApplyDir:S:\
-    if errorlevel 1 echo ERROR: Failed to apply System partition & exit /b 1
+    echo Restoring OS partition... >> %LOGFILE%
+    dism /Apply-Image /ImageFile:%MOUNT_DRIVE%\capture\OS.wim /Index:1 /ApplyDir:W:\ >> %LOGFILE% 2>&1
+    if errorlevel 1 echo ERROR: Failed to apply OS partition >> %LOGFILE% & exit /b 1
 
-    dism /Apply-Image /ImageFile:%MOUNT_DRIVE%\capture\OS.wim /Index:1 /ApplyDir:W:\
-    if errorlevel 1 echo ERROR: Failed to apply OS partition & exit /b 1
+    echo Running bcdboot... >> %LOGFILE%
+    bcdboot W:\Windows /s S: /f UEFI >> %LOGFILE% 2>&1
+    if errorlevel 1 echo ERROR: Failed to make bootable >> %LOGFILE% & exit /b 1
 
-    bcdboot W:\Windows /s S: /f UEFI
-    if errorlevel 1 echo ERROR: Failed to make bootable & exit /b 1
-
-    echo Restore complete.
+    echo Restore complete. >> %LOGFILE%
     exit /b 0
 )
 
-echo ERROR: Invalid argument. Use "capture" or "restore"
+echo ERROR: Invalid or missing parameter. Use "capture" or "restore". >> %LOGFILE%
 exit /b 1
