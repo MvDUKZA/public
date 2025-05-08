@@ -79,3 +79,53 @@ if /i "%1"=="restore" (
 
 echo ERROR: Invalid or missing parameter. Use "capture" or "restore". >> %LOGFILE%
 exit /b 1
+
+
+
+
+# === CONFIGURATION ===
+$arch = "amd64"
+$sourceScriptDir = "C:\WinPE"
+$projectRoot = "C:\WinPE_Custom"
+$mountDir = "$projectRoot\mount"
+$mediaDir = "$projectRoot\media"
+$isoPath = "C:\WinPE_Capture.iso"
+$adkPath = "C:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Windows Preinstallation Environment"
+
+# === CLEAN UP OLD WORKSPACE ===
+Write-Host "Cleaning previous WinPE build..."
+Remove-Item -Recurse -Force $projectRoot -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Path $projectRoot, $mountDir, $mediaDir | Out-Null
+
+# === CREATE BASE WINPE PROJECT ===
+$copypeCmd = Join-Path $adkPath "copype.cmd"
+& "$copypeCmd" $arch $projectRoot
+
+# === MOUNT BOOT.WIM ===
+$bootWim = "$mediaDir\sources\boot.wim"
+Write-Host "Mounting boot.wim..."
+dism /Mount-Wim /WimFile:$bootWim /index:1 /MountDir:$mountDir
+
+# === COPY SCRIPTS INTO MOUNTED IMAGE ===
+Write-Host "Injecting scripts from C:\WinPE..."
+Copy-Item "$sourceScriptDir\capture_restore.cmd" -Destination "$mountDir\" -Force
+
+$scriptDest = "$mountDir\scripts"
+New-Item -ItemType Directory -Path $scriptDest -Force | Out-Null
+Copy-Item "$sourceScriptDir\scripts\*" -Destination $scriptDest -Recurse -Force
+
+# === Ensure startnet.cmd only runs wpeinit ===
+$startNet = "$mountDir\Windows\System32\startnet.cmd"
+Set-Content $startNet 'wpeinit'
+
+# === UNMOUNT AND SAVE CHANGES ===
+Write-Host "Committing changes and unmounting image..."
+dism /Unmount-Wim /MountDir:$mountDir /Commit
+
+# === BUILD FINAL ISO ===
+$etfsboot = Join-Path "$adkPath\$arch" "Etfsboot.com"
+Write-Host "Creating ISO..."
+oscdimg -n -b"$etfsboot" "$mediaDir" "$isoPath"
+
+Write-Host "`n✅ ISO created at: $isoPath"
+
