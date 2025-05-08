@@ -1,0 +1,75 @@
+capture_disk.txt
+select disk 0
+select partition 3
+assign letter=S
+select partition 1
+assign letter=W
+exit
+
+restore_disk.txt
+select disk 0
+clean
+convert gpt
+create partition efi size=100
+format quick fs=fat32 label="System"
+assign letter=S
+create partition primary
+format quick fs=ntfs label="Windows"
+assign letter=W
+exit
+
+
+@echo off
+setlocal enabledelayedexpansion
+
+:: ==== CONFIG ====
+set SERVER=\\YourServer\Share
+set USER=DOMAIN\YourUser
+set PASSWORD=YourPassword
+set MOUNT_DRIVE=Z:
+
+:: ==== MOUNT NETWORK SHARE ====
+echo Mapping network share...
+net use %MOUNT_DRIVE% %SERVER% /user:%USER% %PASSWORD%
+if errorlevel 1 (
+    echo ERROR: Could not map network drive.
+    exit /b 1
+)
+
+:: ==== CAPTURE MODE ====
+if /i "%1"=="capture" (
+    echo Capturing partitions...
+
+    diskpart /s %MOUNT_DRIVE%\scripts\capture_disk.txt
+
+    dism /Capture-Image /ImageFile:%MOUNT_DRIVE%\capture\System.wim /CaptureDir:S:\ /Name:"System"
+    if errorlevel 1 echo ERROR: Failed to capture system partition & exit /b 1
+
+    dism /Capture-Image /ImageFile:%MOUNT_DRIVE%\capture\OS.wim /CaptureDir:W:\ /Name:"Windows"
+    if errorlevel 1 echo ERROR: Failed to capture OS partition & exit /b 1
+
+    echo Capture complete.
+    exit /b 0
+)
+
+:: ==== RESTORE MODE ====
+if /i "%1"=="restore" (
+    echo Restoring image...
+
+    diskpart /s %MOUNT_DRIVE%\scripts\restore_disk.txt
+
+    dism /Apply-Image /ImageFile:%MOUNT_DRIVE%\capture\System.wim /Index:1 /ApplyDir:S:\
+    if errorlevel 1 echo ERROR: Failed to apply System partition & exit /b 1
+
+    dism /Apply-Image /ImageFile:%MOUNT_DRIVE%\capture\OS.wim /Index:1 /ApplyDir:W:\
+    if errorlevel 1 echo ERROR: Failed to apply OS partition & exit /b 1
+
+    bcdboot W:\Windows /s S: /f UEFI
+    if errorlevel 1 echo ERROR: Failed to make bootable & exit /b 1
+
+    echo Restore complete.
+    exit /b 0
+)
+
+echo ERROR: Invalid argument. Use "capture" or "restore"
+exit /b 1
