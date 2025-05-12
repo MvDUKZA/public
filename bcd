@@ -1,0 +1,19 @@
+echo [8] Cleaning out old bootloader files...
+if exist S:\EFI\Microsoft\Boot (
+    echo   → Removing old Boot folder...
+    rmdir /S /Q S:\EFI\Microsoft\Boot
+)
+
+echo [9] Recreating UEFI bootloader...
+bcdboot O:\Windows /s S: /f UEFI
+if errorlevel 1 (
+  echo ERROR: bcdboot failed & exit /b 1
+)
+
+echo [10] Disabling boot menu (timeout=0)...
+bcdedit /store S:\EFI\Microsoft\Boot\BCD /timeout 0
+if errorlevel 1 (
+  echo ERROR: bcdedit timeout failed & exit /b 1
+)
+
+echo [11] Restore + clean bootloader complete.
