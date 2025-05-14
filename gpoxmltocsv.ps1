@@ -40,15 +40,18 @@ if ([string]::IsNullOrWhiteSpace($CsvPath)) {
     $CsvPath   = Join-Path -Path $directory -ChildPath "$baseName.csv"
 }
 
-# Load XML and strip namespaces for simpler XPath
+# Load XML and strip namespaces and prefixes
 try {
-    $rawXml   = Get-Content -Path $XmlPath -Raw -ErrorAction Stop
+    $rawXml = Get-Content -Path $XmlPath -Raw -ErrorAction Stop
     Write-Log -Level "INFO" -Message "Loaded raw XML"
 
-    # Remove all xmlns declarations to ignore namespaces
+    # Remove all namespace declarations (xmlns:*, xmlns)
     $cleanXml = $rawXml -replace 'xmlns(:\w+)?="[^"]+"',''
+    # Remove any namespace prefixes from element and attribute names (e.g., xsi:, rsop:)
+    $cleanXml = $cleanXml -replace '(</?)(\w+:)', '$1'
+
     [xml]$gpoReport = $cleanXml
-    Write-Log -Level "INFO" -Message "Stripped namespaces and parsed XML"
+    Write-Log -Level "INFO" -Message "Stripped namespaces/prefixes and parsed XML"
 }
 catch {
     Write-Log -Level "ERROR" -Message "Failed to load or parse XML: $_"
