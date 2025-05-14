@@ -27,67 +27,63 @@ function Write-Log {
     Write-Output "$timestamp [$Level] $Message"
 }
 
-# Check if XML file exists
+# Verify XML file exists
 if (-Not (Test-Path -Path $XmlPath -PathType Leaf)) {
     Write-Log -Level "ERROR" -Message "XML file not found: $XmlPath"
     exit 1
 }
 
-# Set default CsvPath if not provided
+# Determine CSV path
 if ([string]::IsNullOrWhiteSpace($CsvPath)) {
-    $baseName = [System.IO.Path]::GetFileNameWithoutExtension($XmlPath)
+    $baseName  = [System.IO.Path]::GetFileNameWithoutExtension($XmlPath)
     $directory = [System.IO.Path]::GetDirectoryName($XmlPath)
-    $CsvPath = Join-Path -Path $directory -ChildPath "$baseName.csv"
+    $CsvPath   = Join-Path -Path $directory -ChildPath "$baseName.csv"
 }
 
-# Load XML
+# Load XML and strip namespaces for simpler XPath
 try {
-    [xml]$gpoReport = Get-Content -Path $XmlPath -Raw -ErrorAction Stop
-    Write-Log -Level "INFO" -Message "Loaded XML file: $XmlPath"
+    $rawXml   = Get-Content -Path $XmlPath -Raw -ErrorAction Stop
+    Write-Log -Level "INFO" -Message "Loaded raw XML"
+
+    # Remove all xmlns declarations to ignore namespaces
+    $cleanXml = $rawXml -replace 'xmlns(:\w+)?="[^"]+"',''
+    [xml]$gpoReport = $cleanXml
+    Write-Log -Level "INFO" -Message "Stripped namespaces and parsed XML"
 }
 catch {
-    Write-Log -Level "ERROR" -Message "Failed to load XML file: $_"
+    Write-Log -Level "ERROR" -Message "Failed to load or parse XML: $_"
     exit 1
 }
 
-# Setup XML namespace manager
-$nsManager = New-Object System.Xml.XmlNamespaceManager($gpoReport.NameTable)
-$nsManager.AddNamespace("rsop", "http://www.microsoft.com/GroupPolicy/Rsop")
-
 $results = @()
 
-# Process scopes
-foreach ($scope in @("Computer", "User")) {
-    # Select the scope node using XPath with namespace
-    $parent = $gpoReport.SelectSingleNode("/rsop:RSOP/rsop:$scope", $nsManager)
+# Iterate Computer and User scopes
+foreach ($scope in 'Computer','User') {
+    $parent = $gpoReport.RSOP.$scope
     if ($null -eq $parent) {
         Write-Log -Level "WARN" -Message "Scope not found: $scope"
         continue
     }
-    
-    # Select ExtensionData/Extension nodes with namespace
-    $extensions = $parent.SelectNodes("rsop:ExtensionData/rsop:Extension", $nsManager)
+
+    $extensions = $parent.ExtensionData.Extension
     if ($null -eq $extensions -or $extensions.Count -eq 0) {
-        Write-Log -Level "WARN" -Message "No extensions found for scope: $scope"
+        Write-Log -Level "WARN" -Message "No extensions under scope: $scope"
         continue
     }
-    
+
     foreach ($ext in $extensions) {
-        $extName = $ext.GetAttribute("Name")
-        Write-Log -Level "INFO" -Message "Processing extension: $extName in scope: $scope"
-        
-        # Select all elements with Name and State/Value attributes within the extension, using namespace
-        $policyNodes = $ext.SelectNodes(".//rsop:*[@Name and (@State or @Value)]", $nsManager)
+        $extName = $ext.Name
+        Write-Log -Level "INFO" -Message "Processing extension: $extName ($scope)"
+
+        # Find any element with Name and State/Value attributes
+        $policyNodes = $ext.SelectNodes(".//*[@Name and (@State or @Value)]")
         foreach ($node in $policyNodes) {
-            $name = $node.GetAttribute("Name")
-            $state = $node.GetAttribute("State")
-            $value = $node.GetAttribute("Value")
             $results += [PSCustomObject]@{
-                Scope = $scope
+                Scope     = $scope
                 Extension = $extName
-                Setting = $name
-                State = $state
-                Value = $value
+                Setting   = $node.GetAttribute('Name')
+                State     = $node.GetAttribute('State')
+                Value     = $node.GetAttribute('Value')
             }
         }
     }
@@ -96,9 +92,9 @@ foreach ($scope in @("Computer", "User")) {
 # Export to CSV
 try {
     $results | Export-Csv -Path $CsvPath -NoTypeInformation -Encoding UTF8
-    Write-Log -Level "INFO" -Message "Exported results to CSV: $CsvPath"
+    Write-Log -Level "INFO" -Message "Exported CSV: $CsvPath"
 }
 catch {
-    Write-Log -Level "ERROR" -Message "Failed to export CSV: $_"
+    Write-Log -Level "ERROR" -Message "CSV export failed: $_"
     exit 1
 }
