@@ -40,15 +40,17 @@ if ([string]::IsNullOrWhiteSpace($CsvPath)) {
     $CsvPath   = Join-Path -Path $directory -ChildPath "$baseName.csv"
 }
 
-# Load XML and strip namespaces and prefixes
+# Load XML and strip namespaces/prefixes robustly
 try {
     $rawXml = Get-Content -Path $XmlPath -Raw -ErrorAction Stop
     Write-Log -Level "INFO" -Message "Loaded raw XML"
 
-    # Remove all namespace declarations (xmlns:*, xmlns)
+    # Remove all xmlns declarations (xmlns and xmlns:prefix)
     $cleanXml = $rawXml -replace 'xmlns(:\w+)?="[^"]+"',''
-    # Remove any namespace prefixes from element and attribute names (e.g., xsi:, rsop:)
-    $cleanXml = $cleanXml -replace '(</?)(\w+:)', '$1'
+    # Remove namespace prefixes in element names e.g., <rsop:Node> -> <Node>
+    $cleanXml = [regex]::Replace($cleanXml, '(</?)(\w+:)', '$1', 'IgnoreCase')
+    # Remove namespace prefixes in attribute names e.g., xsi:type -> type
+    $cleanXml = [regex]::Replace($cleanXml, '(\s)(\w+:)(?=\w+=)', '$1', 'IgnoreCase')
 
     [xml]$gpoReport = $cleanXml
     Write-Log -Level "INFO" -Message "Stripped namespaces/prefixes and parsed XML"
