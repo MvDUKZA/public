@@ -1,0 +1,3 @@
+$env:PSModulePath = ($env:PSModulePath -split ';' | ForEach-Object {
+    if ($_ -like "*OneDrive*") { "C:\Temp\PowerShellModules" } else { $_ }
+}) -join ';'
