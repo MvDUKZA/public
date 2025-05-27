@@ -1,0 +1,14 @@
+Software,Version,Reference URL,Vendor Supported on Win 11 24H2?
+Altiris Deployment Agent,1.0.0,https://techdocs.broadcom.com/us/en/symantec-security-software/endpoint-security-and-management/it-management-suite/ITMS/Platform-and-OS-Support/deployment-solution-os-support-matrix-v132632614-d780e59066.html,No
+Java 8 Update 451,8.0.4510.26,https://support.oracle.com/knowledge/Middleware/2511229_1.html,No
+Microsoft SQL Server 2012 Native Client,11.3.6540.0,https://learn.microsoft.com/en-us/answers/questions/819581/sql-server-native-client-for-windows-11-os,No
+Microsoft Visual C++ 2008 Redistributable,9.0.30729 (x64 & x86),https://learn.microsoft.com/en-us/lifecycle/faq/visual-c-faq,No
+Microsoft Visual C++ 2010 Redistributable,10.0.40219 (x64 & x86),https://learn.microsoft.com/en-us/lifecycle/faq/visual-c-faq,No
+Microsoft Visual C++ 2012 Redistributable,11.0.61030.0 (x64 & x86),https://learn.microsoft.com/en-us/lifecycle/faq/visual-c-faq,No
+Microsoft Visual C++ 2013 Redistributable,12.0.21005.1 (x64 & x86),https://learn.microsoft.com/en-us/lifecycle/faq/visual-c-faq,No
+VMware Horizon Agent,8.12.1.23507832 (2312.1),https://kb.omnissa.com/s/article/78714,No
+Ivanti Application Control Agent,2021.1 (10.7.17.0),https://forums.ivanti.com/s/article/User-Workspace-Management-Support-Statement-for-Windows-11?language=en_US,No
+Ivanti Application Control Configuration,2021.1 (10.7.82.0),https://forums.ivanti.com/s/article/User-Workspace-Management-Support-Statement-for-Windows-11?language=en_US,No
+Ivanti Deployment Agent (CCA),2021.1 (10.7.8.0),https://download.ivanti.com/downloads/Readme/Pages/EPM2021.1-SU1.html,No
+Ivanti Environment Manager Agent 2021.1 HF1,2021.1 (10.7.105.1),https://download.ivanti.com/downloads/Readme/Pages/EPM2021.1-SU1.html,No
+Ivanti Environment Manager Configuration 2021.1,10.7.225.0,https://download.ivanti.com/downloads/Readme/Pages/EPM2021.1-SU1.html,No
