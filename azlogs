@@ -1,27 +1,35 @@
-# Install only the Microsoft.Graph.AuditLogs module if not already installed
-# Install-Module Microsoft.Graph.AuditLogs -Scope CurrentUser -Force
+# Install the Microsoft.Graph.Reports module if not already installed
+# Install-Module Microsoft.Graph.Reports -Scope CurrentUser -Force
 
-# Connect to Microsoft Graph with minimal required permissions
+# Import the module
+Import-Module Microsoft.Graph.Reports
+
+# Connect to Microsoft Graph with the necessary permissions
 Connect-MgGraph -Scopes "AuditLog.Read.All"
 
-# Prompt for username
+# Prompt for the username
 $username = Read-Host "Enter the username (e.g., user@domain.com)"
 
-# Retrieve sign-in logs for the user (last 30 days, can adjust Top as needed)
+# Retrieve sign-in logs for the user
 $signIns = Get-MgAuditLogSignIn -Filter "userPrincipalName eq '$username'" -Top 50
 
-if ($signIns) {
-    foreach ($log in $signIns) {
-        if ($log.AppDisplayName -like "*Azure Virtual Desktop*" -or $log.AppDisplayName -like "*Windows Virtual Desktop*") {
-            Write-Host "Login Event for $username:"
-            Write-Host "Timestamp: $($log.CreatedDateTime)"
-            Write-Host "Application: $($log.AppDisplayName)"
-            Write-Host "Status: $($log.Status.ErrorCode) - $($log.Status.FailureReason)"
-            Write-Host "IP Address: $($log.IPAddress)"
-            Write-Host "Device: $($log.DeviceDetail.DisplayName)"
-            Write-Host "----------------------"
-        }
+# Filter for Azure Virtual Desktop sign-ins
+$avdSignIns = $signIns | Where-Object {
+    $_.AppDisplayName -like "*Azure Virtual Desktop*" -or
+    $_.AppDisplayName -like "*Windows Virtual Desktop*"
+}
+
+# Display the sign-in events
+if ($avdSignIns) {
+    foreach ($log in $avdSignIns) {
+        Write-Host "Login Event for $username:"
+        Write-Host "Timestamp: $($log.CreatedDateTime)"
+        Write-Host "Application: $($log.AppDisplayName)"
+        Write-Host "Status: $($log.Status.ErrorCode) - $($log.Status.FailureReason)"
+        Write-Host "IP Address: $($log.IPAddress)"
+        Write-Host "Device: $($log.DeviceDetail.DisplayName)"
+        Write-Host "----------------------"
     }
 } else {
-    Write-Host "No login records found for $username"
+    Write-Host "No Azure Virtual Desktop login records found for $username."
 }
