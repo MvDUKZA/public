@@ -1,4 +1,4 @@
-# # Install only the Microsoft.Graph.AuditLogs module if not already installed
+# Install only the Microsoft.Graph.AuditLogs module if not already installed
 # Install-Module Microsoft.Graph.AuditLogs -Scope CurrentUser -Force
 
 # Connect to Microsoft Graph with minimal required permissions
