@@ -1,0 +1,28 @@
+# Install the AzureAD or Microsoft.Graph module if not already installed
+# Install-Module AzureAD
+# Or use Microsoft.Graph
+# Install-Module Microsoft.Graph
+
+# Connect to AzureAD (or use Connect-MgGraph for Microsoft Graph)
+Connect-AzureAD
+
+# Prompt for username
+$username = Read-Host "Enter the username (e.g., user@domain.com)"
+
+# Get sign-in logs for the user for the last 30 days
+$logins = Get-AzureADAuditSignInLogs -Filter "userPrincipalName eq '$username'" `
+    | Where-Object { $_.ResourceDisplayName -like "*Azure Virtual Desktop*" }
+
+if ($logins) {
+    foreach ($log in $logins) {
+        Write-Host "Login Event for $username:"
+        Write-Host "Timestamp: $($log.CreatedDateTime)"
+        Write-Host "Application: $($log.AppDisplayName)"
+        Write-Host "Status: $($log.Status.ErrorCode) - $($log.Status.FailureReason)"
+        Write-Host "IP Address: $($log.IPAddress)"
+        Write-Host "Device: $($log.DeviceDetail.DisplayName)"
+        Write-Host "----------------------"
+    }
+} else {
+    Write-Host "No login records found for $username in Azure Virtual Desktop"
+}
