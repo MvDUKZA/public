@@ -6,28 +6,23 @@
     Bulk-assign dedicated VMware Horizon 8.12.1 desktops to users specified in a CSV file.
 
 .DESCRIPTION
-    Reads a CSV that maps Horizon desktop machines to Active Directory users and assigns
-    each machine accordingly using the Horizon View API. Only dedicated-assignment pools
-    are supported because floating pools do not persist a user -> VM binding.
+    Reads a CSV mapping file and assigns each Horizon desktop VM to a user. Only
+    dedicated‑assignment pools are supported as floating pools do not persist a user -> VM
+    binding.
 
-    The script depends only on official Omnissa / VMware PowerCLI modules. The
-    ActiveDirectory module is **not mandatory**; it is used only when the Domain column is
-    omitted and the user string lacks any domain qualifier. In that case, the script will
-    attempt one of the following fallbacks, in order:
-        1. If Get-ADDomain is available, use its DNSRoot property.
-        2. If the USERDNSDOMAIN environment variable is set, use that value.
-        3. Otherwise throw and instruct you to add a Domain column.
+    Dependencies are limited to the official Omnissa / VMware PowerCLI modules. The
+    ActiveDirectory module is optional and used only to discover the default domain when
+    neither a Domain column nor a domain qualifier in the User field are present.
 
 .PARAMETER CsvPath
-    Path to a CSV containing at least the columns MachineName and User. An optional Domain
-    column may be supplied when the User field is not fully qualified.
+    Path to the CSV file. Required columns: MachineName, User. Optional: Domain.
 
 .PARAMETER ConnectionServer
-    FQDN of a Horizon Connection Server. If omitted the script falls back to the
-    HVConnectionServer environment variable.
+    FQDN of a Horizon Connection Server. Falls back to the HVConnectionServer environment
+    variable when omitted.
 
 .PARAMETER Credential
-    PSCredential for authenticating to Horizon. If omitted you will be prompted.
+    PSCredential for Horizon authentication. You will be prompted if not supplied.
 
 .EXAMPLE
     PS C:\temp\scripts> .\Assign-HorizonDesktops.ps1 -CsvPath .\Assignments.csv -ConnectionServer view01.iprod.local -Verbose
@@ -35,13 +30,13 @@
 .NOTES
     Author   : Marinus van Deventer
     Created  : 30-May-2025
-    Version  : 2.2
+    Version  : 2.3
     Log File : C:\temp\scripts\logs\Assign-HorizonDesktop_yyyyMMdd_HHmmss.log
 
-    Change-log
-        2.2 - Removed mandatory dependency on ActiveDirectory module; added smart fallback for
-              domain resolution and updated #Requires list.
-        2.1 - Replaced non‑ASCII punctuation with ASCII equivalents.
+    Change‑log
+        2.3 - Fixed divide‑by‑zero when CSV has header only or is empty; safer progress calc.
+        2.2 - Removed mandatory ActiveDirectory dependency, added fallback domain logic.
+        2.1 - Replaced non‑ASCII punctuation.
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
@@ -85,12 +80,11 @@ function Write-Log {
 }
 
 function Resolve-DefaultDomain {
-    # Attempt to return a sensible default AD DNS root without requiring ActiveDirectory module
     if (Get-Command -Name Get-ADDomain -ErrorAction SilentlyContinue) {
         try { return (Get-ADDomain).DNSRoot } catch { }
     }
     if ($env:USERDNSDOMAIN) { return $env:USERDNSDOMAIN }
-    throw 'Unable to determine default domain. Add a Domain column to the CSV or fully qualify the User field.'
+    throw 'Unable to determine default domain. Add a Domain column or fully qualify the User field.'
 }
 
 function Get-HvUserObject {
@@ -138,33 +132,38 @@ try {
     #endregion
 
     #region Horizon connection
-    if (-not $Credential) {
-        $Credential = Get-Credential -Message "Credentials for $ConnectionServer"
-    }
+    if (-not $Credential) { $Credential = Get-Credential -Message "Credentials for $ConnectionServer" }
     Write-Log "Connecting to $ConnectionServer..."
     $hvServer = Connect-HVServer -Server $ConnectionServer -Credential $Credential
     #endregion
 
     #region CSV import
     Write-Log "Reading assignments from $CsvPath..."
-    $csv = Import-Csv -Path $CsvPath | ForEach-Object {
+    $csvRaw = Import-Csv -Path $CsvPath
+    if (-not $csvRaw) { throw 'CSV is empty or contains only a header row.' }
+
+    $csv = $csvRaw | ForEach-Object {
         $_ | Select-Object @{N='MachineName';E={($_.MachineName -as [string]).Trim()}},
                              @{N='User';E={($_.User -as [string]).Trim()}},
                              @{N='Domain';E={($_.Domain -as [string]).Trim()}}
     }
 
-    if ($csv.Count -eq 0) { throw 'CSV is empty.' }
     foreach ($required in 'MachineName','User') {
-        if (-not ($csv[0].psobject.Properties.Name -contains $required)) { throw "CSV missing required column: $required" }
+        if (-not ($csv[0].psobject.Properties.Name -contains $required)) {
+            throw "CSV missing required column: $required"
+        }
     }
     #endregion
 
     #region Assignment loop
-    $index = 0; $total = $csv.Count; $results = @()
+    $index = 0; $total = ($csv | Measure-Object).Count; $results = @()
 
     foreach ($row in $csv) {
         $index++
-        Write-Progress -Activity 'Assigning desktops' -Status "Processing $index of $total" -PercentComplete (($index / $total) * 100)
+        if ($total -gt 0) {
+            $percent = [math]::Round(($index / $total) * 100, 0)
+            Write-Progress -Activity 'Assigning desktops' -Status "Processing $index of $total" -PercentComplete $percent
+        }
 
         if ([string]::IsNullOrWhiteSpace($row.MachineName) -or [string]::IsNullOrWhiteSpace($row.User)) {
             Write-Warning "Incomplete row detected (index $index). Skipping."
@@ -201,7 +200,7 @@ try {
         }
     }
 
-    Write-Progress -Activity 'Assigning desktops' -Completed -Status 'Done'
+    if ($total -gt 0) { Write-Progress -Activity 'Assigning desktops' -Completed -Status 'Done' }
     Write-Log 'Assignment process finished.'
     $results | Sort-Object Status, Machine | Format-Table -AutoSize
     #endregion
@@ -210,3 +209,6 @@ finally {
     if ($hvServer) { Disconnect-HVServer -Server $hvServer -Confirm:$false }
     Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
 }
+
+# Signed-off-by: Marinus van Deventer
+# End of script
