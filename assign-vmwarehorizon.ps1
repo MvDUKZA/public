@@ -8,11 +8,9 @@
     Path to the CSV input file containing assignments.
 .PARAMETER LogFile
     Path to the log file.
-.EXAMPLE
-    .\Assign-HorizonUsers.ps1 -AssignmentListPath "C:\temp\scripts\Assignments.csv"
 .NOTES
     Author: Marinus van Deventer
-    Version: 1.0
+    Version: 1.1
     Requires: VMware.VimAutomation.HorizonView, VMware.Hv.Helper
     Date: 2025-05-30
 #>
@@ -28,7 +26,6 @@ param (
     [string]$LogFile
 )
 
-# Set dynamic default log file path if not specified
 if (-not $LogFile) {
     $LogFile = "C:\temp\scripts\logs\HorizonAssignment_{0}.log" -f (Get-Date -Format 'yyyyMMdd_HHmmss')
 }
@@ -47,18 +44,43 @@ function Write-Log {
 }
 #endregion
 
-#region Module Validation and Import
-$requiredModules = @("VMware.VimAutomation.HorizonView", "VMware.Hv.Helper")
+#region Module Check and Installation
+$requiredModules = @(
+    @{ Name = "VMware.VimAutomation.HorizonView"; Source = "VMware.PowerCLI" },
+    @{ Name = "VMware.Hv.Helper"; Source = "VMware.Hv.Helper" }
+)
+
 foreach ($module in $requiredModules) {
-    if (-not (Get-Module -ListAvailable -Name $module)) {
-        Write-Log "ERROR: Required module '$module' not found. Install via PowerCLI or VMware PowerShell Gallery."
-        throw "Module '$module' is missing. Script cannot continue."
+    if (-not (Get-Module -ListAvailable -Name $module.Name)) {
+        Write-Log "Module '$($module.Name)' not found. Attempting installation..."
+        try {
+            # Install VMware.PowerCLI for core modules
+            if ($module.Source -eq "VMware.PowerCLI") {
+                Install-Module -Name VMware.PowerCLI -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+                Write-Log "Installed VMware.PowerCLI module, which includes $($module.Name)"
+            }
+            elseif ($module.Source -eq "VMware.Hv.Helper") {
+                # VMware.Hv.Helper might not be on PowerShell Gallery; try PSGallery or prompt user
+                try {
+                    Install-Module -Name VMware.Hv.Helper -Scope CurrentUser -Force -ErrorAction Stop
+                    Write-Log "Installed VMware.Hv.Helper module."
+                } catch {
+                    Write-Log "WARNING: VMware.Hv.Helper is not available on PSGallery. Install it manually from GitHub."
+                    Write-Log "URL: https://github.com/vmware/PowerCLI-Example-Scripts/tree/master/Modules/VMware.Hv.Helper"
+                    throw
+                }
+            }
+        } catch {
+            Write-Log "ERROR: Failed to install module '$($module.Name)'. $_"
+            throw
+        }
     }
+
     try {
-        Import-Module $module -ErrorAction Stop
-        Write-Log "Imported module: $module"
+        Import-Module $module.Name -ErrorAction Stop
+        Write-Log "Imported module: $($module.Name)"
     } catch {
-        Write-Log "ERROR: Failed to import module '$module'. $_"
+        Write-Log "ERROR: Failed to import module '$($module.Name)'. $_"
         throw
     }
 }
@@ -95,7 +117,6 @@ foreach ($assignment in $assignments) {
     $userUPN = $assignment.UserUPN
     $machineName = $assignment.MachineName
 
-    # Validate assignment entry
     if (-not $server -or -not $userUPN -or -not $machineName) {
         Write-Log "WARNING: Incomplete assignment entry found. Skipping: $($assignment | Out-String)"
         continue
@@ -112,7 +133,6 @@ foreach ($assignment in $assignments) {
     }
 
     try {
-        # Retrieve machine and user objects
         $machine = Get-HVMachine -Name $machineName -ErrorAction Stop
         if (-not $machine) {
             Write-Log "ERROR: Machine '$machineName' not found on $server."
@@ -125,7 +145,6 @@ foreach ($assignment in $assignments) {
             continue
         }
 
-        # Assign user to machine using VMware HV Helper
         $services = $hvServer.ExtensionData
         $machineService = $services.Machine
         $assignmentSpec = New-Object VMware.Hv.MachineAssignmentSpec
