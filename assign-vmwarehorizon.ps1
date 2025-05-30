@@ -7,33 +7,30 @@
 
 .DESCRIPTION
     Reads a CSV mapping (MachineName, User[, Domain]) and assigns each Horizon desktop VM
-    to the specified user. Only dedicated‑assignment pools are supported. The script uses
-    the raw Horizon View API classes exposed by the PowerCLI module. In Horizon 8.12 the
-    namespaces were renamed from **VMware.Hv.*** to **Omnissa.Horizon.***. If those API
-    proxy classes are not present, the script can dynamically import the community module
-    **Omnissa.Horizon.Helper** which generates them at runtime.
+    to the specified user. Supports only dedicated-assignment pools.
 
-.PARAMETER CsvPath
-    Path to the CSV file. Required columns: MachineName, User. Optional: Domain.
+    Starting with Horizon 2312 the internal .NET proxy classes were renamed from
+    **VMware.Hv.*** to **Omnissa.Horizon.***. Horizon 8.12.1 still uses the old
+    VMware.Hv namespace. We therefore first look for *VMware.Hv.QueryServiceService* and
+    fall back to the Omnissa namespace if running a newer build. When neither proxy type
+    exists, we attempt to import **Omnissa.Horizon.Helper** which can generate them.
 
-.PARAMETER ConnectionServer
-    FQDN of a Horizon Connection Server. Falls back to $env:HVConnectionServer.
-
-.PARAMETER Credential
-    PSCredential for authenticating to Horizon. Prompted if omitted.
+.PARAMETER CsvPath       Path to CSV file (headers: MachineName, User [,Domain]).
+.PARAMETER ConnectionServer  Horizon Connection Server FQDN (or $env:HVConnectionServer).
+.PARAMETER Credential    PSCredential for Horizon login (prompted if omitted).
 
 .EXAMPLE
     .\Assign-HorizonDesktops.ps1 -CsvPath .\Assignments.csv -ConnectionServer view01.iprod.local -Verbose
 
 .NOTES
-    Author      : Marinus van Deventer
-    Version     : 2.5
-    Created     : 30‑May‑2025
-    Change‑log  :
-        2.5 – Added dynamic fallback to Omnissa.Horizon.Helper when core API proxy types
-              are missing (fixes QueryServiceService type error).
-        2.4 – Dependency trimmed to core PowerCLI; helper removed.
-        2.3 – Fixed divide‑by‑zero progress calculation.
+    Author  : Marinus van Deventer
+    Version : 2.6
+    Date    : 30-May-2025
+    Changelog
+      2.6 - Detect VMware.Hv namespace first (as used by Horizon 8.12.1); import helper
+            only when neither VMware.Hv nor Omnissa.Horizon proxies are present.
+      2.5 - Added Omnissa fallback logic.
+      2.4 - Removed helper dependency.
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
@@ -45,116 +42,101 @@ param(
 if (-not $ConnectionServer) { throw 'ConnectionServer is mandatory when $env:HVConnectionServer is not set.' }
 $ErrorActionPreference = 'Stop'
 
-#region Logging setup
-$workingDir = 'C:\temp\scripts'
-$logDir = Join-Path $workingDir 'logs'
+#region Logging
+$workDir = 'C:\temp\scripts'
+$logDir  = Join-Path $workDir 'logs'
 if (-not (Test-Path $logDir)) { New-Item -Path $logDir -ItemType Directory -Force | Out-Null }
-$timeStamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-Start-Transcript -Path (Join-Path $logDir "Assign-HorizonDesktop_$timeStamp.log") -Append | Out-Null
-#endregion
-
-#region Helper functions
-function Write-Log {
-    param([string]$Message,[ValidateSet('INFO','WARN','ERROR','DEBUG')][string]$Level='INFO')
-    Write-Information "$(Get-Date -UFormat '%Y-%m-%d %H:%M:%S') - $Level : $Message" -InformationAction Continue
-}
+$logFile = Join-Path $logDir ("Assign-HorizonDesktop_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date))
+Start-Transcript -Path $logFile -Append | Out-Null
+function Write-Log { param($Message,[ValidateSet('INFO','WARN','ERROR','DEBUG')]$Level='INFO'); Write-Information "$(Get-Date -UFormat '%Y-%m-%d %H:%M:%S') - $Level : $Message" -InformationAction Continue }
 #endregion
 
 try {
-    #region Module loading
+    #region Load Horizon module and connect
     Write-Log 'Importing VMware PowerCLI Horizon module...'
     Import-Module VMware.VimAutomation.HorizonView -ErrorAction Stop
-    #endregion
-
-    #region Horizon connection
     if (-not $Credential) { $Credential = Get-Credential -Message "Credentials for $ConnectionServer" }
     Write-Log "Connecting to $ConnectionServer..."
     $hvServer = Connect-HVServer -Server $ConnectionServer -Credential $Credential
     #endregion
 
-    #region Ensure API proxy types are present
-    $proxyType = [type]::GetType('Omnissa.Horizon.QueryServiceService', $false)
-    if (-not $proxyType) {
-        Write-Log 'Omnissa.Horizon proxy types not found – attempting to load Omnissa.Horizon.Helper...' 'WARN'
+    #region Detect proxy namespace
+    $vmwareNs  = [type]::GetType('VMware.Hv.QueryServiceService', $false)
+    $omnissaNs = [type]::GetType('Omnissa.Horizon.QueryServiceService', $false)
+    if (-not ($vmwareNs -or $omnissaNs)) {
+        Write-Log 'Horizon proxy types missing – importing Omnissa.Horizon.Helper...' 'WARN'
         try {
             Import-Module Omnissa.Horizon.Helper -ErrorAction Stop
-            $proxyType = [type]::GetType('Omnissa.Horizon.QueryServiceService', $false)
-            if ($proxyType) {
-                Write-Log 'Omnissa.Horizon.Helper imported successfully.' 'INFO'
-            } else {
-                Write-Log 'Proxy types still missing after helper load.' 'ERROR'
-                throw 'Required Horizon API proxy types are not available. Ensure PowerCLI 13.3+ or install Omnissa.Horizon.Helper.'
-            }
-        }
-        catch {
-            throw "Failed to import Omnissa.Horizon.Helper: $($_.Exception.Message)"
-        }
+            $vmwareNs  = [type]::GetType('VMware.Hv.QueryServiceService', $false)
+            $omnissaNs = [type]::GetType('Omnissa.Horizon.QueryServiceService', $false)
+            if (-not ($vmwareNs -or $omnissaNs)) { throw 'Proxy types still absent after helper load' }
+            Write-Log 'Proxy types generated via helper.' 'INFO'
+        } catch { throw "Unable to load Horizon API proxy types: $($_.Exception.Message)" }
     }
+    $nsPrefix = if ($vmwareNs) { 'VMware.Hv' } else { 'Omnissa.Horizon' }
+    Write-Log "Using proxy namespace: $nsPrefix" 'DEBUG'
     #endregion
 
-    #region CSV import & validation (unchanged core logic)
-    Write-Log "Reading CSV $CsvPath..."
-    $rows = Import-Csv -Path $CsvPath
-    if (-not $rows) { throw 'CSV is empty or header only.' }
-    foreach ($col in 'MachineName','User') {
-        if (-not ($rows[0].psobject.Properties.Name -contains $col)) { throw "CSV missing column: $col" }
+    #region Helper functions (namespace‑agnostic)
+    function New-ServiceInstance([string]$class) {
+        return [Activator]::CreateInstance([type]::GetType("$nsPrefix.$class", $true))
     }
-    #endregion
 
-    #region Assignment helpers using namespace‑agnostic resolution
     function Get-HvUserObject {
-        param([string]$User,[string]$Domain,$HvConn)
-        $userName = $User -replace '^(.*\\)|@.*$',''
-        $resolvedDomain = if ($Domain) { $Domain } elseif ($User -match '\\') {
-            ($User -split '\\')[0]
-        } elseif ($User -match '@') {
-            ($User -split '@')[1]
-        } else {
-            if (Get-Command Get-ADDomain -ErrorAction SilentlyContinue) { (Get-ADDomain).DNSRoot } else { $env:USERDNSDOMAIN }
-        }
-        Get-HVUser -HVUserLoginName $userName -HVDomain $resolvedDomain -HVConnectionServer $HvConn
+        param([string]$User,[string]$Domain,$Conn)
+        $ uname = $User -replace '^(.*\\)|@.*$',''
+        $dom = if ($Domain) { $Domain } elseif ($User -match '\\') { ($User -split '\\')[0] } elseif ($User -match '@') { ($User -split '@')[1] } else { ($env:USERDNSDOMAIN) }
+        $qs = New-ServiceInstance 'QueryServiceService'
+        $def = New-ServiceInstance 'QueryDefinition'
+        $def.queryEntityType = 'ADUserOrGroupSummaryView'
+        $f1  = New-ServiceInstance 'QueryFilterEquals'
+        $f1.memberName='base.loginName';$f1.value=$uname
+        $f2  = New-ServiceInstance 'QueryFilterEquals'
+        $f2.memberName='base.domain';$f2.value=$dom
+        $and = New-ServiceInstance 'QueryFilterAnd'
+        $and.Filters=@($f1,$f2); $def.Filter=$and
+        $res = ($qs.queryService_create($Conn.ExtensionData,$def)).results
+        $qs.QueryService_DeleteAll($Conn.ExtensionData)
+        return $res[0]
     }
+
     function Set-HvMachineUser {
-        param($Machine,$User,$HvConn)
-        # Resolve namespace dynamically
-        $ns = ([type]::GetType('Omnissa.Horizon.MachineService',$false) -as [type])
-        if (-not $ns) { $ns = [type]::GetType('VMware.Hv.MachineService',$true) }
-        $svc   = [Activator]::CreateInstance($ns)
-        $helper = $svc.read($HvConn.ExtensionData,$Machine.id)
+        param($Machine,$User,$Conn)
+        $svc   = New-ServiceInstance 'MachineService'
+        $helper= $svc.read($Conn.ExtensionData,$Machine.id)
         $helper.getbasehelper().setuser($User.id)
-        $svc.update($HvConn.ExtensionData,$helper)
+        $svc.update($Conn.ExtensionData,$helper)
     }
     #endregion
 
-    #region Processing loop (same as previous logic but using functions above) ...
-    $total = $rows.Count; $i=0; $result=@()
-    foreach ($r in $rows) {
+    #region CSV processing
+    Write-Log "Reading assignments from $CsvPath..."
+    $rows = Import-Csv -Path $CsvPath
+    if (-not $rows) { throw 'CSV has no data.' }
+    foreach ($col in 'MachineName','User') { if (-not ($rows[0].psobject.Properties.Name -contains $col)) { throw "CSV missing $col column" } }
+    $total=$rows.Count; $i=0; $out=@()
+    foreach ($row in $rows) {
         $i++
-        Write-Progress -Activity 'Assigning desktops' -Status "Processing $i of $total" -PercentComplete ([math]::Round($i/$total*100))
-        if ([string]::IsNullOrWhiteSpace($r.MachineName) -or [string]::IsNullOrWhiteSpace($r.User)) {
-            Write-Log "Row $i incomplete – skipped." 'WARN'; continue
-        }
+        Write-Progress -Activity 'Assigning desktops' -Status "Processing $i of $total" -PercentComplete ([int]($i/$total*100))
+        if ([string]::IsNullOrWhiteSpace($row.MachineName) -or [string]::IsNullOrWhiteSpace($row.User)) { Write-Log "Row $i incomplete – skipped." 'WARN'; continue }
         try {
-            $machine = Get-HVMachine -MachineName $r.MachineName -HvServer $hvServer
+            $machine = Get-HVMachine -MachineName $row.MachineName -HvServer $hvServer
             if (-not $machine) { throw 'Machine not found' }
             $pool = Get-HVPoolSummary -PoolName $machine.base.desktopName -HvServer $hvServer
             if ($pool.userAssignment -ne 'DEDICATED') { throw 'Pool not dedicated' }
-            $user = Get-HvUserObject -User $r.User -Domain $r.Domain -HvConn $hvServer
+            $user = Get-HvUserObject -User $row.User -Domain $row.Domain -Conn $hvServer
             if (-not $user) { throw 'User not found' }
-            if ($PSCmdlet.ShouldProcess($r.MachineName,"assign to $($r.User)")) { Set-HvMachineUser $machine $user $hvServer }
+            if ($PSCmdlet.ShouldProcess($row.MachineName,"assign to $($row.User)")) { Set-HvMachineUser $machine $user $hvServer }
             $status='Assigned'
-        } catch { $status = "Failed - $($_.Exception.Message)"; Write-Log "$($r.MachineName)->$($r.User): $status" 'ERROR' }
-        $result += [pscustomobject]@{Machine=$r.MachineName;User=$r.User;Status=$status}
+        } catch { $status="Failed - $($_.Exception.Message)"; Write-Log "$($row.MachineName)->$($row.User): $status" 'ERROR' }
+        $out += [pscustomobject]@{Machine=$row.MachineName;User=$row.User;Status=$status}
     }
     Write-Progress -Activity 'Assigning desktops' -Completed -Status 'Done'
     Write-Log 'Processing finished.'
-    $result | Sort-Object Status,Machine | Format-Table -AutoSize
+    $out | Sort-Object Status,Machine | Format-Table -AutoSize
     #endregion
 }
-finally {
-    if ($hvServer) { Disconnect-HVServer -Server $hvServer -Confirm:$false }
-    Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
-}
+finally { if ($hvServer) { Disconnect-HVServer -Server $hvServer -Confirm:$false } Stop-Transcript -ErrorAction SilentlyContinue | Out-Null }
 
 # Signed-off-by: Marinus van Deventer
 # End of script
