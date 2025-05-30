@@ -10,7 +10,7 @@
     Path to the log file.
 .NOTES
     Author: Marinus van Deventer
-    Version: 1.3  # Updated version
+    Version: 1.4  # Updated version
     Requires: VMware.VimAutomation.HorizonView, VMware.Hv.Helper
     Date: 2025-05-30
 #>
@@ -101,6 +101,7 @@ foreach ($assignment in $assignments) {
 
     try {
         $hvServer = Connect-HVServer -Server $server -Credential $cred -ErrorAction Stop
+        $services = $hvServer.ExtensionData
         Write-Log "Connected to $server"
     } catch {
         Write-Log "ERROR: Failed to connect to $server. $_"
@@ -115,20 +116,31 @@ foreach ($assignment in $assignments) {
             continue
         }
 
-        # CORRECTED: Use -User instead of -UserName for Get-HVUser
-        $user = Get-HVUser -User $userUPN -ErrorAction Stop
-        if (-not $user) {
+        # Validate user existence using direct API call
+        $userService = $services.User
+        $filter = New-Object VMware.Hv.QueryFilterEquals -Property @{
+            'memberName' = 'userloginname'
+            'value' = $userUPN
+        }
+        $query = New-Object VMware.Hv.QueryDefinition -Property @{
+            'queryEntityType' = 'UserSummaryView'
+            'filter' = $filter
+        }
+        
+        $userList = $userService.User_List($services, $query)
+        if ($userList.totalCount -eq 0) {
             Write-Log "ERROR: User '$userUPN' not found on $server."
             continue
         }
+        if ($userList.totalCount -gt 1) {
+            Write-Log "WARNING: Found $($userList.totalCount) users for '$userUPN'. Using first result."
+        }
 
-        # Use the internal service to assign user to machine
-        $services = $hvServer.ExtensionData
+        # Assign user to machine
         $machineService = $services.Machine
-
         $assignmentSpec = New-Object VMware.Hv.MachineAssignmentSpec
         $assignmentSpec.Id = $machine.Id
-        $assignmentSpec.User = $userUPN  # Uses UPN directly for assignment
+        $assignmentSpec.User = $userUPN
 
         $machineService.AssignUser($assignmentSpec)
         Write-Log "SUCCESS: Assigned $machineName to $userUPN on $server"
