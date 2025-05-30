@@ -19,7 +19,7 @@
 #region Parameters
 [CmdletBinding()]
 param (
-    [Parameter(Mandatory)]
+    [Parameter()]
     [ValidateNotNullOrEmpty()]
     [string]$AssignmentListPath = "C:\temp\scripts\Assignments.csv",
 
