@@ -38,7 +38,7 @@ $ErrorActionPreference = 'Stop'
     Version : 1.3
     Logs    : C:\temp\scripts\logs\Assign-HorizonDesktop_yyyyMMdd_HHmmss.log
     Change‑log:
-        1.3 – Moved #Requires statements to the top and reordered $ErrorActionPreference per VS Code/PSScriptAnalyzer.
+        1.3 – Moved #Requires statements to the top and reordered $ErrorActionPreference per VS Code/PSScriptAnalyzer.
 #>
 
 #region Initialisation
@@ -106,15 +106,33 @@ try {
 
     #region Import & validate CSV
     Write-Log "Importing CSV from $CsvPath…"
-    $mapping   = Import-Csv -Path $CsvPath
+    $mapping = Import-Csv -Path $CsvPath
     if ($mapping.Count -eq 0) { throw 'CSV contains no rows.' }
-    $rowIndex  = 0; $totalRows = $mapping.Count; $results = @()
-    #endregion
+
+    # Normalise headers → trim whitespace & fix accidental header typos
+    $expected = 'MachineName','User','Domain'
+    foreach ($h in $expected) {
+        if (-not $mapping[0].PSObject.Properties.Name -contains $h) {
+            throw "CSV is missing required column: $h" }
+    }
+
+    $rowIndex = 0; $totalRows = $mapping.Count; $results = @()
+#endregion
 
     foreach ($row in $mapping) {
         $rowIndex++
         Write-Progress -Activity 'Assigning desktops' -Status "Processing $rowIndex of $totalRows" -PercentComplete (($rowIndex/$totalRows)*100)
-        $machineName = $row.MachineName.Trim(); $userString = $row.User.Trim(); $domain = $row.Domain
+
+        # Trim and validate fields
+        $machineName = ($row.MachineName  -as [string]).Trim()
+        $userString  = ($row.User         -as [string]).Trim()
+        $domain      = ($row.Domain       -as [string]).Trim()
+
+        if ([string]::IsNullOrWhiteSpace($machineName) -or [string]::IsNullOrWhiteSpace($userString)) {
+            Write-Warning "Incomplete assignment entry found. Skipping: $machineName, $userString, $domain"
+            Write-Log "Skipping incomplete row index $rowIndex" 'WARN'
+            continue
+        }
         try {
             Write-Log "Mapping $machineName → $userString" 'DEBUG'
             $machine = Get-HVMachine -MachineName $machineName -HvServer $hvServer
