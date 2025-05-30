@@ -8,6 +8,8 @@
     Path to the CSV input file containing assignments.
 .PARAMETER LogFile
     Path to the log file.
+.EXAMPLE
+    .\Assign-HorizonUsers.ps1 -AssignmentListPath "C:\temp\scripts\Assignments.csv"
 .NOTES
     Author: Marinus van Deventer
     Version: 1.1
@@ -26,6 +28,7 @@ param (
     [string]$LogFile
 )
 
+# Set dynamic default log file path if not specified
 if (-not $LogFile) {
     $LogFile = "C:\temp\scripts\logs\HorizonAssignment_{0}.log" -f (Get-Date -Format 'yyyyMMdd_HHmmss')
 }
@@ -44,43 +47,18 @@ function Write-Log {
 }
 #endregion
 
-#region Module Check and Installation
-$requiredModules = @(
-    @{ Name = "VMware.VimAutomation.HorizonView"; Source = "VMware.PowerCLI" },
-    @{ Name = "VMware.Hv.Helper"; Source = "VMware.Hv.Helper" }
-)
-
+#region Module Validation and Import
+$requiredModules = @("VMware.VimAutomation.HorizonView", "VMware.Hv.Helper")
 foreach ($module in $requiredModules) {
-    if (-not (Get-Module -ListAvailable -Name $module.Name)) {
-        Write-Log "Module '$($module.Name)' not found. Attempting installation..."
-        try {
-            # Install VMware.PowerCLI for core modules
-            if ($module.Source -eq "VMware.PowerCLI") {
-                Install-Module -Name VMware.PowerCLI -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
-                Write-Log "Installed VMware.PowerCLI module, which includes $($module.Name)"
-            }
-            elseif ($module.Source -eq "VMware.Hv.Helper") {
-                # VMware.Hv.Helper might not be on PowerShell Gallery; try PSGallery or prompt user
-                try {
-                    Install-Module -Name VMware.Hv.Helper -Scope CurrentUser -Force -ErrorAction Stop
-                    Write-Log "Installed VMware.Hv.Helper module."
-                } catch {
-                    Write-Log "WARNING: VMware.Hv.Helper is not available on PSGallery. Install it manually from GitHub."
-                    Write-Log "URL: https://github.com/vmware/PowerCLI-Example-Scripts/tree/master/Modules/VMware.Hv.Helper"
-                    throw
-                }
-            }
-        } catch {
-            Write-Log "ERROR: Failed to install module '$($module.Name)'. $_"
-            throw
-        }
+    if (-not (Get-Module -ListAvailable -Name $module)) {
+        Write-Log "ERROR: Required module '$module' not found. Install via PowerCLI or VMware PowerShell Gallery."
+        throw "Module '$module' is missing. Script cannot continue."
     }
-
     try {
-        Import-Module $module.Name -ErrorAction Stop
-        Write-Log "Imported module: $($module.Name)"
+        Import-Module $module -ErrorAction Stop
+        Write-Log "Imported module: $module"
     } catch {
-        Write-Log "ERROR: Failed to import module '$($module.Name)'. $_"
+        Write-Log "ERROR: Failed to import module '$module'. $_"
         throw
     }
 }
@@ -117,6 +95,7 @@ foreach ($assignment in $assignments) {
     $userUPN = $assignment.UserUPN
     $machineName = $assignment.MachineName
 
+    # Validate assignment entry
     if (-not $server -or -not $userUPN -or -not $machineName) {
         Write-Log "WARNING: Incomplete assignment entry found. Skipping: $($assignment | Out-String)"
         continue
@@ -133,18 +112,20 @@ foreach ($assignment in $assignments) {
     }
 
     try {
-        $machine = Get-HVMachine -Name $machineName -ErrorAction Stop
+        # Retrieve machine and user using summaries
+        $machine = Get-HVMachineSummary | Where-Object { $_.base.name -eq $machineName }
         if (-not $machine) {
             Write-Log "ERROR: Machine '$machineName' not found on $server."
             continue
         }
 
-        $user = Get-HVUser -UserName $userUPN -ErrorAction Stop
+        $user = Get-HVUserSummary | Where-Object { $_.base.name -eq $userUPN }
         if (-not $user) {
             Write-Log "ERROR: User '$userUPN' not found on $server."
             continue
         }
 
+        # Perform assignment
         $services = $hvServer.ExtensionData
         $machineService = $services.Machine
         $assignmentSpec = New-Object VMware.Hv.MachineAssignmentSpec
