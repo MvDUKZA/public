@@ -1,156 +1,194 @@
 $ErrorActionPreference = 'Stop'
+#Requires -Version 5.1
+#Requires -Modules VMware.VimAutomation.HorizonView, Omnissa.Horizon.Helper, ActiveDirectory
 <#
 .SYNOPSIS
-    Bulk‑assign dedicated VMware Horizon 8.12.1 desktops to users listed in a CSV file.
+    Bulk‑assign dedicated VMware Horizon 8.12.1 desktops to users defined in a CSV file.
 
 .DESCRIPTION
-    Reads a CSV mapping file and assigns each Horizon "machine" (desktop VM) to the
-    corresponding user.  Only dedicated‑assignment desktop pools are supported because
-    user‑to‑machine binding is meaningless in floating pools.
+    Reads a mapping file (CSV) and binds each Horizon desktop machine to a user account.
+    Only *dedicated‑assignment* pools are supported – floating pools do not maintain a
+    persistent machine‑to‑user relationship.
 
-    The script uses the official VMware PowerCLI Horizon modules (Omnissa.VimAutomation.HorizonView)
-    together with Omnissa.Horizon.Helper, which wraps the View API for high‑level functions.
+    The script relies solely on official Omnissa/VMware modules and does **not** require
+    ControlUp.
 
 .PARAMETER CsvPath
-    Full path of the CSV file containing the mappings.  Columns are:
-        MachineName – Horizon machine name (as shown in the console)
-        User        – sAMAccountName or user@domain format
-        Domain      – (optional) NetBIOS or DNS domain name.  If omitted and the User field
-                      contains a domain qualifier (e.g. ACME\jsmith or jsmith@acme.local)
-                      that value is used; otherwise the script attempts to detect the
-                      current AD forest’s DNS root.
+    Path to the CSV file containing at minimum the columns:
+        • MachineName – Horizon machine name as seen in the admin console
+        • User        – sAMAccountName, NetBIOS\sam, or user@dns format
+        • Domain      – (optional) NetBIOS or DNS domain.  Used when *User* lacks one.
 
 .PARAMETER ConnectionServer
-    FQDN of a Horizon Connection Server.  Defaults to the value of the HVConnectionServer
-    environment variable, if present, otherwise the parameter is mandatory.
+    FQDN of a Horizon Connection Server.  When omitted the script uses the
+    HVConnectionServer environment variable.
 
 .PARAMETER Credential
-    PSCredential used for Horizon API authentication.  If omitted you will be prompted.
+    PSCredential for authenticating to the Horizon API.  If omitted you are prompted.
 
 .EXAMPLE
-    PS C:\temp\scripts> .\Assign-HorizonDesktops.ps1 -CsvPath .\Mappings.csv -ConnectionServer view01.acme.local
+    PS C:\temp\scripts> .\Assign-HorizonDesktops.ps1 \
+        -CsvPath .\Mappings.csv \
+        -ConnectionServer view01.acme.local \
+        -Verbose
 
 .NOTES
-    Author      : Powershell‑expert (ChatGPT)
-    Created     : 30‑May‑2025
-    Requirements:  ▪ PowerShell 5.1+ (Core also fine)
-                   ▪ Omnissa PowerCLI 13.3+   →  Install‑Module VMware.PowerCLI ‑Scope AllUsers
-                   ▪ Omnissa.Horizon.Helper   →  Install‑Module Omnissa.Horizon.Helper ‑Scope AllUsers
-    Working dir : C:\temp\scripts
-    Log file    : C:\temp\scripts\logs\Assign‑HorizonDesktop_yyyyMMdd_HHmmss.log
+    Author  : Marinus van Deventer
+    Created : 30‑May‑2025
+    Version : 1.1
+    Source  : https://github.com/yourrepo/Assign-HorizonDesktops
+    Logs    : C:\temp\scripts\logs\Assign-HorizonDesktop_yyyyMMdd_HHmmss.log
+    Change‑log:
+        1.1 – Added progress bar, stricter validation, adherence to coding standards.
+        1.0 – Initial release.
 #>
 
-#region Parameters & Validation
-[CmdletBinding(SupportsShouldProcess)]
+#region Parameters & validation
+[CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium')]
 param(
-    [Parameter(Mandatory)]
-    [ValidateScript({Test‑Path $_})]
+    [Parameter(Mandatory, HelpMessage = 'Full path to CSV mapping file')]
+    [ValidateScript({ Test-Path $_ })]
     [string]$CsvPath,
 
-    [Parameter()]
+    [Parameter(HelpMessage = 'Horizon Connection Server FQDN')]
+    [ValidateNotNullOrEmpty()]
     [string]$ConnectionServer = $env:HVConnectionServer,
 
-    [Parameter()]
+    [Parameter(HelpMessage = 'Credential for Horizon authentication')]
     [System.Management.Automation.PSCredential]$Credential
 )
-if (-not $ConnectionServer) { throw 'ConnectionServer is mandatory when $env:HVConnectionServer is not set.' }
-#endregion
-
-#region Initialisation
-$script:WorkingDir = 'C:\temp\scripts'
-$script:LogDir     = Join‑Path $script:WorkingDir 'logs'
-if (-not (Test‑Path $LogDir)) { New‑Item -Path $LogDir -ItemType Directory -Force | Out‑Null }
-$TimeStamp = Get‑Date -Format 'yyyyMMdd_HHmmss'
-$LogFile   = Join‑Path $LogDir "Assign‑HorizonDesktop_$TimeStamp.log"
-Start‑Transcript -Path $LogFile -Append | Out‑Null
-
-function Write‑Log {
-    param([string]$Message,[string]$Level = 'INFO')
-    Write‑Verbose "[$((Get‑Date).ToString('u'))] [$Level] $Message"
+if (-not $ConnectionServer) {
+    throw 'ConnectionServer is mandatory when HVConnectionServer environment variable is not set.'
 }
-#endregion
+#endregion Parameters
 
-#region Module loading
-Write‑Log 'Importing Omnissa PowerCLI modules…'
-Import‑Module -Name VMware.VimAutomation.HorizonView -ErrorAction Stop
-if (-not (Get‑Module -ListAvailable -Name Omnissa.Horizon.Helper)) {
-    Install‑Module -Name Omnissa.Horizon.Helper -Force -AllowClobber -Scope AllUsers
-}
-Import‑Module -Name Omnissa.Horizon.Helper -ErrorAction Stop
-#endregion
+#region Initialisation
+$workingDir = 'C:\temp\scripts'
+$logDir     = Join-Path $workingDir 'logs'
+if (-not (Test-Path $logDir)) { New-Item -Path $logDir -ItemType Directory -Force | Out-Null }
 
-#region Helper functions
-function Get‑HvUserObject {
+$timeStamp  = Get-Date -Format 'yyyyMMdd_HHmmss'
+$logFile    = Join-Path $logDir "Assign-HorizonDesktop_$timeStamp.log"
+Start-Transcript -Path $logFile -Append | Out-Null
+
+function Write-Log {
+    [CmdletBinding()]
     param(
-        [string]$SamOrUpn,
-        [string]$Domain,
-        [object]$HvSrv
-    )
-    $login  = $SamOrUpn -replace '^(.*\\)|@.*$',''   # strip domain
-    $domain = if ($Domain) { $Domain } elseif ($SamOrUpn -match '\\') {
-        ($SamOrUpn -split '\\')[0]
-    } elseif ($SamOrUpn -match '@') {
-        ($SamOrUpn -split '@')[1]
-    } else {
-        (Get‑ADDomain).DNSRoot
-    }
-    Get‑HVUser -HVUserLoginName $login -HVDomain $domain -HVConnectionServer $HvSrv
-}
+        [Parameter(Mandatory)]
+        [string]$Message,
 
-function New‑HvDesktopAssignment {
-    param(
-        [object]$MachineObj,
-        [object]$UserObj,
-        [object]$HvSrv
+        [ValidateSet('INFO','DEBUG','ERROR','WARN')]
+        [string]$Level = 'INFO'
     )
-    $machineService  = New‑Object vmware.hv.machineservice
-    $machineHelper   = $machineService.read($HvSrv.ExtensionData, $MachineObj.id)
-    $machineHelper.getbasehelper().setuser($UserObj.id)
-    $machineService.update($HvSrv.ExtensionData, $machineHelper)
+    $prefix = "[$((Get-Date).ToString('u'))] [$Level]"
+    Write-Information "$prefix $Message" -InformationAction Continue
 }
 #endregion
+
+#region Module loading
+Write-Log 'Loading Omnissa PowerCLI modules…'
+Import-Module VMware.VimAutomation.HorizonView -ErrorAction Stop
+if (-not (Get-Module -ListAvailable Omnissa.Horizon.Helper)) {
+    Install-Module Omnissa.Horizon.Helper -Scope AllUsers -Force -AllowClobber
+}
+Import-Module Omnissa.Horizon.Helper -ErrorAction Stop
+#endregion
+
+#region Helper functions
+function Get-HvUserObject {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$User,
+        [Parameter()][string]$Domain,
+        [Parameter(Mandatory)]$HvServer
+    )
+    $sam  = $User -replace '^(.*\\)|@.*$',''   # remove domain prefix/suffix
+    $dom  = if ($Domain) { $Domain }
+            elseif ($User -match '\\') { ($User -split '\\')[0] }
+            elseif ($User -match '@')   { ($User -split '@')[1] }
+            else { (Get-ADDomain).DNSRoot }
+
+    return Get-HVUser -HVUserLoginName $sam -HVDomain $dom -HVConnectionServer $HvServer
+}
+
+function Set-HvMachineUser {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Machine,
+        [Parameter(Mandatory)]$User,
+        [Parameter(Mandatory)]$HvServer
+    )
+    $machineService = New-Object VMware.Hv.MachineService
+    $machineHelper  = $machineService.read($HvServer.ExtensionData, $Machine.id)
+    $machineHelper.getbasehelper().setuser($User.id)
+    $machineService.update($HvServer.ExtensionData, $machineHelper)
+}
+#endregion Helper functions
 
 try {
-    #region Connect to Horizon
-    if (-not $Credential) { $Credential = Get‑Credential -Message "Credentials for $ConnectionServer" }
-    Write‑Log "Connecting to $ConnectionServer…"
-    $HvServer = Connect‑HVServer -Server $ConnectionServer -Credential $Credential
+    #region Connect to Horizon
+    if (-not $Credential) {
+        $Credential = Get-Credential -Message "Credentials for $ConnectionServer"
+    }
+    Write-Log "Connecting to $ConnectionServer…"
+    $hvServer = Connect-HVServer -Server $ConnectionServer -Credential $Credential
     #endregion
 
-    #region Process CSV
-    $Mapping = Import‑Csv -Path $CsvPath
-    $Result  = foreach ($row in $Mapping) {
-        $machineName = $row.MachineName
-        $userString  = $row.User
+    #region Import & validate CSV
+    Write-Log "Importing CSV from $CsvPath…"
+    $mapping   = Import-Csv -Path $CsvPath
+    if ($mapping.Count -eq 0) { throw 'CSV contains no rows.' }
+    $rowIndex  = 0
+    $totalRows = $mapping.Count
+    $results   = @()
+    #endregion
+
+    foreach ($row in $mapping) {
+        $rowIndex++
+        Write-Progress -Activity 'Assigning desktops' -Status "Processing $rowIndex of $totalRows" -PercentComplete (($rowIndex/$totalRows)*100)
+
+        $machineName = $row.MachineName.Trim()
+        $userString  = $row.User.Trim()
         $domain      = $row.Domain
 
-        Write‑Log "Processing mapping: $machineName ⇨ $userString" 'DEBUG'
         try {
-            $machineObj = Get‑HVMachine -MachineName $machineName -HvServer $HvServer
-            if (-not $machineObj) { throw "Machine not found" }
+            Write-Log "Mapping $machineName → $userString" 'DEBUG'
+            $machine = Get-HVMachine -MachineName $machineName -HvServer $hvServer
+            if (-not $machine) { throw 'Machine not found' }
 
-            $poolSummary = Get‑HVPoolSummary -PoolName $machineObj.base.desktopName -HvServer $HvServer
-            if ($poolSummary.userAssignment -ne 'DEDICATED') { throw "Pool user assignment is $($poolSummary.userAssignment) – only DEDICATED supported" }
-
-            $userObj = Get‑HvUserObject -SamOrUpn $userString -Domain $domain -HvSrv $HvServer
-            if (-not $userObj) { throw "User not found" }
-
-            if ($PSCmdlet.ShouldProcess("$machineName","assign to $userString")) {
-                New‑HvDesktopAssignment -MachineObj $machineObj -UserObj $userObj -HvSrv $HvServer
+            $pool = Get-HVPoolSummary -PoolName $machine.base.desktopName -HvServer $hvServer
+            if ($pool.userAssignment -ne 'DEDICATED') {
+                throw "Pool is $($pool.userAssignment); only DEDICATED supported."
             }
-            [pscustomobject]@{Machine=$machineName;User=$userString;Status='Assigned'}
+
+            $user   = Get-HvUserObject -User $userString -Domain $domain -HvServer $hvServer
+            if (-not $user) { throw 'User not found' }
+
+            if ($PSCmdlet.ShouldProcess($machineName, "assign to $userString")) {
+                Set-HvMachineUser -Machine $machine -User $user -HvServer $hvServer
+            }
+            $status = 'Assigned'
         }
         catch {
-            Write‑Log "❌ $machineName ⇨ $userString : $_" 'ERROR'
-            [pscustomobject]@{Machine=$machineName;User=$userString;Status="Failed – $_"}
+            $status = "Failed – $($_.Exception.Message)"
+            Write-Log "$machineName → $userString : $status" 'ERROR'
+        }
+
+        $results += [pscustomobject]@{
+            Machine = $machineName
+            User    = $userString
+            Status  = $status
         }
     }
-    #endregion
 
-    Write‑Log 'Assignment run complete.'
-    $Result | Sort‑Object Status,Machine | Format‑Table -AutoSize
+    Write-Progress -Activity 'Assigning desktops' -Completed -Status 'Complete'
+    Write-Log 'Assignment run complete.'
+    $results | Sort-Object Status, Machine | Format-Table -AutoSize
 }
 finally {
-    if ($HvServer) { Disconnect‑HVServer -Server $HvServer -Confirm:$false }
-    Stop‑Transcript | Out‑Null
+    if ($hvServer) { Disconnect-HVServer -Server $hvServer -Confirm:$false }
+    Stop-Transcript | Out-Null
 }
+
+# Signed-off-by: Marinus van Deventer
+# End of script
