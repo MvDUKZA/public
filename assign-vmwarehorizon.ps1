@@ -8,11 +8,9 @@
     Path to the CSV input file containing assignments.
 .PARAMETER LogFile
     Path to the log file.
-.EXAMPLE
-    .\Assign-HorizonUsers.ps1 -AssignmentListPath "C:\temp\scripts\Assignments.csv"
 .NOTES
     Author: Marinus van Deventer
-    Version: 1.1
+    Version: 1.2
     Requires: VMware.VimAutomation.HorizonView, VMware.Hv.Helper
     Date: 2025-05-30
 #>
@@ -28,7 +26,6 @@ param (
     [string]$LogFile
 )
 
-# Set dynamic default log file path if not specified
 if (-not $LogFile) {
     $LogFile = "C:\temp\scripts\logs\HorizonAssignment_{0}.log" -f (Get-Date -Format 'yyyyMMdd_HHmmss')
 }
@@ -47,11 +44,11 @@ function Write-Log {
 }
 #endregion
 
-#region Module Validation and Import
+#region Module Check and Import
 $requiredModules = @("VMware.VimAutomation.HorizonView", "VMware.Hv.Helper")
 foreach ($module in $requiredModules) {
     if (-not (Get-Module -ListAvailable -Name $module)) {
-        Write-Log "ERROR: Required module '$module' not found. Install via PowerCLI or VMware PowerShell Gallery."
+        Write-Log "ERROR: Required module '$module' not found. Install VMware PowerCLI manually or via PSGallery."
         throw "Module '$module' is missing. Script cannot continue."
     }
     try {
@@ -95,7 +92,6 @@ foreach ($assignment in $assignments) {
     $userUPN = $assignment.UserUPN
     $machineName = $assignment.MachineName
 
-    # Validate assignment entry
     if (-not $server -or -not $userUPN -or -not $machineName) {
         Write-Log "WARNING: Incomplete assignment entry found. Skipping: $($assignment | Out-String)"
         continue
@@ -112,27 +108,28 @@ foreach ($assignment in $assignments) {
     }
 
     try {
-        # Retrieve machine and user using summaries
-        $machine = Get-HVMachineSummary | Where-Object { $_.base.name -eq $machineName }
+        # Retrieve machine and user objects
+        $machine = Get-HVMachine -Name $machineName -ErrorAction Stop
         if (-not $machine) {
             Write-Log "ERROR: Machine '$machineName' not found on $server."
             continue
         }
 
-        $user = Get-HVUserSummary | Where-Object { $_.base.name -eq $userUPN }
+        $user = Get-HVUser -UserName $userUPN -ErrorAction Stop
         if (-not $user) {
             Write-Log "ERROR: User '$userUPN' not found on $server."
             continue
         }
 
-        # Perform assignment
+        # Use the internal service to assign user to machine
         $services = $hvServer.ExtensionData
         $machineService = $services.Machine
+
         $assignmentSpec = New-Object VMware.Hv.MachineAssignmentSpec
         $assignmentSpec.Id = $machine.Id
         $assignmentSpec.User = $userUPN
-        $machineService.AssignUser($assignmentSpec)
 
+        $machineService.AssignUser($assignmentSpec)
         Write-Log "SUCCESS: Assigned $machineName to $userUPN on $server"
     } catch {
         Write-Log "ERROR: Failed assignment for $userUPN on $server. $_"
