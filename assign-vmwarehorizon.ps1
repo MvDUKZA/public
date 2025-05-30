@@ -1,39 +1,43 @@
 #Requires -Version 5.1
-#Requires -Modules VMware.VimAutomation.HorizonView, Omnissa.Horizon.Helper
+#Requires -Modules VMware.VimAutomation.HorizonView
 
 <#
 .SYNOPSIS
-    Bulk-assign dedicated VMware Horizon 8.12.1 desktops to users specified in a CSV file.
+    Bulk‑assign dedicated VMware Horizon 8.12.1 desktops to users listed in a CSV file.
 
 .DESCRIPTION
-    Reads a CSV mapping file and assigns each Horizon desktop VM to a user. Only
-    dedicated‑assignment pools are supported as floating pools do not persist a user -> VM
-    binding.
+    Reads a CSV mapping file and assigns each Horizon desktop VM to the specified user.
+    Only *dedicated‑assignment* pools are supported because floating pools do not persist
+    a user -> VM binding.
 
-    Dependencies are limited to the official Omnissa / VMware PowerCLI modules. The
-    ActiveDirectory module is optional and used only to discover the default domain when
-    neither a Domain column nor a domain qualifier in the User field are present.
+    **Dependencies** – The script requires only the official VMware PowerCLI module
+    **VMware.VimAutomation.HorizonView** (ships with the VMware PowerCLI bundle 13.x).
+    No additional community/helper modules are needed.
 
 .PARAMETER CsvPath
-    Path to the CSV file. Required columns: MachineName, User. Optional: Domain.
+    Path to the CSV file containing the mappings. Required columns: MachineName, User.
+    Optional column: Domain.
 
 .PARAMETER ConnectionServer
-    FQDN of a Horizon Connection Server. Falls back to the HVConnectionServer environment
-    variable when omitted.
+    FQDN of a Horizon Connection Server. If omitted the script uses the
+    HVConnectionServer environment variable.
 
 .PARAMETER Credential
-    PSCredential for Horizon authentication. You will be prompted if not supplied.
+    PSCredential for authenticating to Horizon. You will be prompted if omitted.
 
 .EXAMPLE
-    PS C:\temp\scripts> .\Assign-HorizonDesktops.ps1 -CsvPath .\Assignments.csv -ConnectionServer view01.iprod.local -Verbose
+    PS C:\temp\scripts> .\Assign‑HorizonDesktops.ps1 -CsvPath .\Assignments.csv \
+                           -ConnectionServer view01.iprod.local -Verbose
 
 .NOTES
     Author   : Marinus van Deventer
-    Created  : 30-May-2025
-    Version  : 2.3
-    Log File : C:\temp\scripts\logs\Assign-HorizonDesktop_yyyyMMdd_HHmmss.log
+    Created  : 30‑May‑2025
+    Version  : 2.4
+    Log File : C:\temp\scripts\logs\Assign‑HorizonDesktop_yyyyMMdd_HHmmss.log
 
     Change‑log
+        2.4 - Removed dependency on Omnissa.Horizon.Helper; script now imports only
+              VMware.VimAutomation.HorizonView.
         2.3 - Fixed divide‑by‑zero when CSV has header only or is empty; safer progress calc.
         2.2 - Removed mandatory ActiveDirectory dependency, added fallback domain logic.
         2.1 - Replaced non‑ASCII punctuation.
@@ -62,9 +66,11 @@ $ErrorActionPreference = 'Stop'
 #region Paths & logging setup
 $workingDir = 'C:\temp\scripts'
 $logDir     = Join-Path $workingDir 'logs'
-if (-not (Test-Path $logDir)) { New-Item -Path $logDir -ItemType Directory -Force | Out-Null }
+if (-not (Test-Path $logDir)) {
+    New-Item -Path $logDir -ItemType Directory -Force | Out-Null
+}
 $timeStamp  = Get-Date -Format 'yyyyMMdd_HHmmss'
-$logFile    = Join-Path $logDir "Assign-HorizonDesktop_$timeStamp.log"
+$logFile    = Join-Path $logDir "Assign‑HorizonDesktop_$timeStamp.log"
 Start-Transcript -Path $logFile -Append | Out-Null
 #endregion
 
@@ -114,25 +120,23 @@ function Set-HvMachineUser {
         [Parameter(Mandatory)][object]$User,
         [Parameter(Mandatory)]$HvServer
     )
-    $svc    = [VMware.Hv.MachineService]::new()
-    $helper = $svc.read($HvServer.ExtensionData, $Machine.id)
-    $helper.getbasehelper().setuser($User.id)
-    $svc.update($HvServer.ExtensionData, $helper)
+    $machineService = [VMware.Hv.MachineService]::new()
+    $machineHelper  = $machineService.read($HvServer.ExtensionData, $Machine.id)
+    $machineHelper.getbasehelper().setuser($User.id)
+    $machineService.update($HvServer.ExtensionData, $machineHelper)
 }
 #endregion
 
 try {
     #region Module loading
-    Write-Log 'Importing VMware PowerCLI modules...'
+    Write-Log 'Importing VMware PowerCLI Horizon module...'
     Import-Module VMware.VimAutomation.HorizonView -ErrorAction Stop
-    if (-not (Get-Module -ListAvailable Omnissa.Horizon.Helper)) {
-        Install-Module Omnissa.Horizon.Helper -Scope AllUsers -Force -AllowClobber
-    }
-    Import-Module Omnissa.Horizon.Helper -ErrorAction Stop
     #endregion
 
     #region Horizon connection
-    if (-not $Credential) { $Credential = Get-Credential -Message "Credentials for $ConnectionServer" }
+    if (-not $Credential) {
+        $Credential = Get-Credential -Message "Credentials for $ConnectionServer"
+    }
     Write-Log "Connecting to $ConnectionServer..."
     $hvServer = Connect-HVServer -Server $ConnectionServer -Credential $Credential
     #endregion
@@ -156,7 +160,9 @@ try {
     #endregion
 
     #region Assignment loop
-    $index = 0; $total = ($csv | Measure-Object).Count; $results = @()
+    $index = 0
+    $total = ($csv | Measure-Object).Count
+    $results = @()
 
     foreach ($row in $csv) {
         $index++
@@ -200,13 +206,17 @@ try {
         }
     }
 
-    if ($total -gt 0) { Write-Progress -Activity 'Assigning desktops' -Completed -Status 'Done' }
+    if ($total -gt 0) {
+        Write-Progress -Activity 'Assigning desktops' -Completed -Status 'Done'
+    }
     Write-Log 'Assignment process finished.'
     $results | Sort-Object Status, Machine | Format-Table -AutoSize
     #endregion
 }
 finally {
-    if ($hvServer) { Disconnect-HVServer -Server $hvServer -Confirm:$false }
+    if ($hvServer) {
+        Disconnect-HVServer -Server $hvServer -Confirm:$false
+    }
     Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
 }
 
