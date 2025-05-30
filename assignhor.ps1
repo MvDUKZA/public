@@ -10,7 +10,7 @@
     Path to the log file.
 .NOTES
     Author: Marinus van Deventer
-    Version: 1.3
+    Version: 1.4
     Requires: Omnissa.VimAutomation.HorizonView, Omnissa.Horizon.Helper
     Date: 2025-05-29
 #>
@@ -35,6 +35,19 @@ function Write-Log {
     $entry = "$timestamp - $Message"
     Add-Content -Path $LogFile -Value $entry
     Write-Host $entry
+}
+#endregion
+
+#region Ensure Log Directory Exists
+$logDir = Split-Path -Path $LogFile -Parent
+if (-not (Test-Path $logDir)) {
+    try {
+        New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+        Write-Host "Created log directory: $logDir"
+    } catch {
+        Write-Host "ERROR: Failed to create log directory: $logDir. $_"
+        throw
+    }
 }
 #endregion
 
