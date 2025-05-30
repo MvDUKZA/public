@@ -1,18 +1,16 @@
 <#
 .SYNOPSIS
-    Assign Horizon users to virtual machines from a CSV using VMware Horizon 8.12.1 PowerCLI.
+    Assigns Horizon users to machines from a CSV for Horizon 8.12.1 environments.
 .DESCRIPTION
-    Reads a CSV (HorizonServer, UserUPN, MachineName), connects to each Horizon server, and assigns users to machines.
+    Reads a CSV (HorizonServer, UserUPN, MachineName), connects to each Horizon server,
+    and assigns each user to the correct VM, using only supported APIs.
 .PARAMETER AssignmentListPath
-    Path to the CSV file containing assignments.
+    Path to the CSV file.
 .PARAMETER LogFile
-    Path to the log file (default: timestamped file under C:\temp\scripts\logs).
+    Path to the log file (default: C:\temp\scripts\logs\HorizonAssignment_yyyymmdd_hhmmss.log).
 .NOTES
     Author: Marinus van Deventer
-    Version: 1.0.1
-    Requires: VMware.VimAutomation.HorizonView, VMware.Hv.Helper
-    WorkingDirectory: C:\temp\scripts
-    LogDirectory: C:\temp\scripts\logs
+    Version: 1.0.0
     Date: 2025-05-30
 #>
 
@@ -24,127 +22,131 @@ param (
     [string]$AssignmentListPath = "C:\temp\scripts\Assignments.csv",
 
     [Parameter()]
-    [ValidateNotNullOrEmpty()]
     [string]$LogFile
 )
 
+# Ensure log directory exists and set default log path if missing
 if (-not $LogFile) {
     $LogDirectory = "C:\temp\scripts\logs"
-    if (-not (Test-Path $LogDirectory)) { New-Item -Path $LogDirectory -ItemType Directory | Out-Null }
-    $LogFile = Join-Path $LogDirectory "HorizonAssignment_{0}.log" -f (Get-Date -Format 'yyyyMMdd_HHmmss')
+    if (-not (Test-Path $LogDirectory)) { New-Item -Path $LogDirectory -ItemType Directory -Force | Out-Null }
+    $LogFile = Join-Path $LogDirectory ("HorizonAssignment_{0}.log" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
 }
 #endregion
 
 #region Logging Function
 function Write-Log {
-    [CmdletBinding()]
-    param (
-        [Parameter(Mandatory)] [string]$Message
-    )
-    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $entry = "[$($script:ScriptVersion)] $timestamp - $Message"
+    param([string]$Message, [string]$Level = "INFO")
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $ver = "[1.0.0]"
+    $entry = "$ts $ver [$Level] - $Message"
     Add-Content -Path $LogFile -Value $entry
     Write-Host $entry
 }
 #endregion
 
-#region Script Version
-$script:ScriptVersion = '1.0.1'
-#endregion
-
-#region Module Check and Import
-$requiredModules = 'VMware.VimAutomation.HorizonView','VMware.Hv.Helper'
-foreach ($mod in $requiredModules) {
-    if (-not (Get-Module -ListAvailable -Name $mod)) {
-        Write-Log "ERROR: Required module '$mod' not available. Install via PowerCLI or copy helper module."
-        throw "Missing module $mod"
+#region Module Checks and Import
+$modules = @("VMware.VimAutomation.HorizonView", "VMware.Hv.Helper")
+foreach ($m in $modules) {
+    if (-not (Get-Module -ListAvailable -Name $m)) {
+        Write-Log "ERROR: Module $m missing." "ERROR"
+        throw "Module $m missing."
     }
-    Import-Module $mod -ErrorAction Stop
-    Write-Log "Imported module: $mod"
+    Import-Module $m -ErrorAction Stop
+    Write-Log "Imported module: $m"
 }
 #endregion
 
 #region CSV Import
 if (-not (Test-Path $AssignmentListPath)) {
-    Write-Log "ERROR: CSV file not found at $AssignmentListPath"
-    throw "CSV path invalid"
+    Write-Log "ERROR: CSV not found at $AssignmentListPath" "ERROR"
+    throw "CSV file missing"
 }
-$assignments = Import-Csv -Path $AssignmentListPath
+$assignments = Import-Csv $AssignmentListPath
 if (-not $assignments) {
-    Write-Log "ERROR: No assignments found in CSV"
-    throw "CSV contains no data"
+    Write-Log "ERROR: No assignments in CSV" "ERROR"
+    throw "CSV empty"
 }
 Write-Log "Loaded $($assignments.Count) assignments"
 #endregion
 
 #region Credentials
-$cred = Get-Credential -Message 'Enter Horizon Admin credentials'
-Write-Log 'Credentials obtained'
+$cred = Get-Credential -Message "Enter Horizon Admin credentials"
 #endregion
 
-#region Helper Function: Get-UserId
+#region Get-UserId helper
 function Get-UserId {
-    [CmdletBinding()]
-    param (
-        [Parameter(Mandatory)][VMware.Hv.Services]$Services,
-        [Parameter(Mandatory)][string]$UserName
+    param(
+        [VMware.Hv.Services]$Services,
+        [string]$UserName
     )
-    $def = [VMware.Hv.QueryDefinition]::new()
-    $def.queryEntityType = 'ADUserOrGroupSummaryView'
-    $filterUser = [VMware.Hv.QueryFilterEquals]::new()
-    $filterUser.PropertyName = 'base.name'
-    $filterUser.Value = $UserName
-    $filterGroup = [VMware.Hv.QueryFilterEquals]::new()
-    $filterGroup.PropertyName = 'base.group'
-    $filterGroup.Value = $false
-    $andFilter = [VMware.Hv.QueryFilterAnd]::new()
-    $andFilter.Filters = @($filterUser, $filterGroup)
-    $def.Filter = $andFilter
-    $result = $Services.QueryService.Query($def)
-    if (-not $result.Results) { throw "User '$UserName' not found" }
-    return $result.Results[0]
+    $defn = New-Object VMware.Hv.QueryDefinition
+    $defn.queryEntityType = 'ADUserOrGroupSummaryView'
+    $groupFilter = New-Object VMware.Hv.QueryFilterEquals
+    $groupFilter.PropertyName = 'base.group'
+    $groupFilter.Value = $false
+    $userFilter = New-Object VMware.Hv.QueryFilterEquals
+    $userFilter.PropertyName = 'base.name'
+    $userFilter.Value = $UserName
+    $andFilter = New-Object VMware.Hv.QueryFilterAnd
+    $andFilter.Filters = @($userFilter, $groupFilter)
+    $defn.Filter = $andFilter
+    $res = $Services.QueryService.Query($defn)
+    if (-not $res.Results) {
+        throw "User '$UserName' not found"
+    }
+    return $res.Results[0]
 }
 #endregion
 
 #region Process Assignments
-foreach ($entry in $assignments) {
-    $server    = $entry.HorizonServer
-    $userUPN   = $entry.UserUPN
-    $vmName    = $entry.MachineName
+foreach ($a in $assignments) {
+    $server      = $a.HorizonServer
+    $userUPN     = $a.UserUPN
+    $machineName = $a.MachineName
 
-    if (-not ($server -and $userUPN -and $vmName)) {
-        Write-Log "WARNING: Incomplete entry, skipping: $($entry | Out-String)"
+    if (-not ($server -and $userUPN -and $machineName)) {
+        Write-Log "Skipping incomplete entry: $($a | Out-String)" "WARN"
         continue
     }
-    Write-Log "Starting assignment: $userUPN -> $vmName on $server"
+
+    Write-Log "Processing: Server=$server, User=$userUPN, Machine=$machineName"
 
     try {
-        $hvConn = Connect-HVServer -Server $server -Credential $cred -ErrorAction Stop
+        $hv = Connect-HVServer -Server $server -Credential $cred -ErrorAction Stop
+        $services = $hv.ExtensionData
         Write-Log "Connected to $server"
     } catch {
-        Write-Log "ERROR: Connection to $server failed: $_"
+        Write-Log "Connection failed: $_" "ERROR"
         continue
     }
 
     try {
-        # Find VM via client filter
-        $vm = Get-HVMachine -Server $hvConn | Where-Object { $_.Base.Name -eq $vmName }
-        if (-not $vm) { throw "VM '$vmName' not found" }
+        # Find the machine by name
+        $vm = Get-HVMachine | Where-Object { $_.Base.Name -eq $machineName }
+        if (-not $vm) {
+            Write-Log "Machine '$machineName' not found" "ERROR"
+            continue
+        }
 
-        # Find User with helper function
-        $userObj = Get-UserId -Services $hvConn.ExtensionData -UserName $userUPN
+        # Find the user by UPN (using the helper)
+        $user = Get-UserId -Services $services -UserName $userUPN
 
-        # Perform assignment
-        $assignSpec = [VMware.Hv.MachineAssignmentSpec]::new()
-        $assignSpec.Id   = $vm.Id
-        $assignSpec.User = $userUPN
-        $hvConn.ExtensionData.Machine.AssignUser($assignSpec)
-        Write-Log "SUCCESS: Assigned $userUPN to $vmName"
+        # Assign user to machine
+        $spec = New-Object VMware.Hv.MachineAssignmentSpec
+        $spec.Id   = $vm.Id
+        $spec.User = $userUPN
+
+        $services.Machine.AssignUser($spec)
+        Write-Log "Assigned $userUPN to $machineName"
     } catch {
-        Write-Log "ERROR: Assignment error: $_"
+        Write-Log "Assignment error: $_" "ERROR"
     } finally {
-        Disconnect-HVServer -Confirm:$false
-        Write-Log "Disconnected from $server"
+        try {
+            Disconnect-HVServer -Confirm:$false
+            Write-Log "Disconnected from $server"
+        } catch {
+            Write-Log "Disconnect failed: $_" "WARN"
+        }
     }
 }
 #endregion
