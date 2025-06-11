@@ -23,16 +23,17 @@ function Test-DepCompatibility {
         # Run dumpbin to get headers
         $output = & $dumpbinPath /headers $ExePath 2>&1
         if ($LASTEXITCODE -ne 0) {
-            Write-Warning "Failed to analyze $ExePath with dumpbin."
+            Write-Warning "Failed to analyze $ExePath with dumpbin. Exit code: $LASTEXITCODE"
             return $null
         }
 
-        # Check for NXCOMPAT flag in the output
-        $isNxCompat = $output -match "NX compatible"
+        # Convert output to a string and check for NXCOMPAT flag
+        $outputString = $output -join " "
+        $isNxCompat = $outputString -match "NX compatible"
 
         return [PSCustomObject]@{
-            ExePath     = $ExePath
-            DEPCompatible = $isNxCompat
+            ExePath       = $ExePath
+            DEPCompatible = [bool]$isNxCompat  # Ensure boolean output
         }
     }
     catch {
