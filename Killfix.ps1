@@ -1,32 +1,42 @@
-# ======== DEBUGGING VERSION ========
-# Put this on a share and run it manually first:
-#   .\KillStartHosts.ps1
+# === CONFIGURATION ===
+$logPath         = Join-Path $env:LOCALAPPDATA 'KillStartHosts.log'
+$process1        = 'SearchHost'
+$process2        = 'StartMenuExperienceHost'
+$checkInterval   = 1    # seconds between process checks
+$killDelay       = 3    # seconds to wait between kills
 
-$Log = "$env:USERPROFILE\Desktop\KillStartHosts_Debug.log"
-"`n===== $(Get-Date) =====" | Out-File $Log -Append
+# === ENSURE LOG FOLDER EXISTS ===
+$dir = Split-Path $logPath
+if (-not (Test-Path $dir)) {
+    try { New-Item -Path $dir -ItemType Directory -Force | Out-Null } catch { Exit 1 }
+}
 
+# === LOGGING FUNCTION ===
+function Write-Log {
+    param([string]$msg)
+    $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    "$ts`t$msg" | Out-File -FilePath $logPath -Append -Encoding utf8
+}
+
+# === WAIT & KILL FUNCTION ===
 function Wait-And-Kill {
-    param(
-        [string]$ProcName
-    )
-
-    "`$(Get-Date -Format 'HH:mm:ss') Waiting for $ProcName…" | Out-File $Log -Append
-    while (-not (Get-Process -Name $ProcName -ErrorAction SilentlyContinue)) {
-        Start-Sleep -Seconds 1
+    param([string]$name)
+    Write-Log "Waiting for process '$name'..."
+    while (-not (Get-Process -Name $name -ErrorAction SilentlyContinue)) {
+        Start-Sleep -Seconds $checkInterval
     }
-
-    "`$(Get-Date -Format 'HH:mm:ss') $ProcName found, killing…" | Out-File $Log -Append
+    Write-Log "Detected '$name'; attempting to stop."
     try {
-        Stop-Process -Name $ProcName -Force -ErrorAction Stop
-        "`$(Get-Date -Format 'HH:mm:ss') $ProcName stopped." | Out-File $Log -Append
+        Stop-Process -Name $name -Force -ErrorAction Stop
+        Write-Log "Successfully stopped '$name'."
     } catch {
-        "`$(Get-Date -Format 'HH:mm:ss') ERROR stopping $ProcName: $($_.Exception.Message)" |
-            Out-File $Log -Append
+        Write-Log "ERROR stopping '$name': $($_.Exception.Message)"
     }
 }
 
-# Wait for each host in turn
-Wait-And-Kill -ProcName 'SearchHost'
-Wait-And-Kill -ProcName 'StartMenuExperienceHost'
-
-"`$(Get-Date -Format 'HH:mm:ss') Done." | Out-File $Log -Append
+# === MAIN ===
+Write-Log "=== Script start ==="
+Wait-And-Kill -name $process1
+Start-Sleep -Seconds $killDelay
+Wait-And-Kill -name $process2
+Write-Log "=== Script complete ==="
