@@ -1,13 +1,17 @@
-# Force WSUS registration
 $svc = New-Object -ComObject Microsoft.Update.ServiceManager
 $svc.ClientApplicationID = "WSUS Reset"
-# Disable Microsoft Update as default
-$svc.SetServiceOption("9482f4b4-e343-43b6-b170-9a65bc822c77", 7, 0)
-# Enable WSUS ServiceID as default
-$wsusServiceId = ($svc.Services | Where-Object { $_.Name -like "*Server Update*" }).ServiceID
-$svc.SetServiceOption($wsusServiceId, 7, 1)
 
-# Restart WU
-Restart-Service wuauserv
+# Find the WSUS service
+$wsusService = $svc.Services | Where-Object { $_.Name -like "*Windows Server Update Services*" }
+
+if ($wsusService) {
+    # Set WSUS as the default Automatic Updates service
+    $svc.SetServiceOption($wsusService.ServiceID, 7, 1)  # 7 = IS_DEFAULT_AU_SERVICE, 1 = Enable
+    Write-Host "WSUS set as default Automatic Updates service."
+} else {
+    Write-Host "WSUS service not found. Check WSUS configuration."
+}
+
+# Restart Windows Update service to apply changes
+Restart-Service wuauserv -Force
 Start-Sleep -Seconds 5
-usoclient StartScan
