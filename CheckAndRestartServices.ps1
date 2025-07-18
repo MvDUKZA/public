@@ -42,6 +42,7 @@
     - Version 1.3: Replaced $using:service with -ArgumentList and param in Invoke-Command ScriptBlocks to resolve variable scoping issues in parallel execution.
     - Version 1.4: Added WinRM connectivity check with Test-WSMan to handle and log connection errors without displaying them. Added inner try-catch for Get-WinEvent to continue service start even if event query fails.
     - Version 1.5: Fixed logging strings to properly delimit variables followed by colons using ${}. Added -ErrorAction Stop to Invoke-Command calls to ensure errors are caught without displaying red messages in the console.
+    - Version 1.6: Changed logging to use a ConcurrentBag to collect log messages in parallel threads and write them to the log file after processing to avoid concurrent write issues.
 
 #>
 
@@ -98,12 +99,16 @@ try {
 #endregion
 
 #region Processing
+# Create a concurrent bag for log messages
+$logMessages = New-Object System.Collections.Concurrent.ConcurrentBag[string]
+
 # Process computers in parallel
 $results = $computers | ForEach-Object -Parallel {
     $computer = $_.Name
     $os = $_.OperatingSystem
     $serviceNames = $using:ServiceNames
-    $logPath = $using:logPath
+    $logMessages = $using:logMessages
+    $logPath = $using:logPath  # Not used in parallel, but for consistency
 
     # Local results collection
     $localResults = @()
@@ -124,7 +129,7 @@ $results = $computers | ForEach-Object -Parallel {
             } else {
                 $connectionError = 'Unknown WinRM connection error'
             }
-            Add-Content -Path $logPath -Value "[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))] WinRM connection failed to ${computer}: $connectionError"
+            $logMessages.Add("[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))] WinRM connection failed to ${computer}: $connectionError")
         }
     }
 
@@ -188,7 +193,7 @@ $results = $computers | ForEach-Object -Parallel {
                 } catch {
                     $stoppedOn = 'Event query failed'
                     $reason = $_.Exception.Message
-                    Add-Content -Path $logPath -Value "[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))] Failed to query event log on ${computer} for ${service}: $($_.Exception.Message)"
+                    $logMessages.Add("[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))] Failed to query event log on ${computer} for ${service}: $($_.Exception.Message)")
                 }
 
                 # Attempt to start service using Invoke-Command
@@ -197,7 +202,7 @@ $results = $computers | ForEach-Object -Parallel {
                     $success = $true
                 } catch {
                     $success = $false
-                    Add-Content -Path $logPath -Value "[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))] Failed to start ${service} on ${computer}: $($_.Exception.Message)"
+                    $logMessages.Add("[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))] Failed to start ${service} on ${computer}: $($_.Exception.Message)")
                 }
             }
 
@@ -209,7 +214,7 @@ $results = $computers | ForEach-Object -Parallel {
             $stoppedOn = 'N/A'
             $reason = $_.Exception.Message
             $success = 'N/A'
-            Add-Content -Path $logPath -Value "[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))] Error processing ${service} on ${computer}: $($_.Exception.Message)"
+            $logMessages.Add("[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))] Error processing ${service} on ${computer}: $($_.Exception.Message)")
         }
 
         $localResults += [PSCustomObject]@{
@@ -228,12 +233,15 @@ $results = $computers | ForEach-Object -Parallel {
     $localResults
 
 } -ThrottleLimit 50
+
+# Write collected log messages to file
+$logMessages | ForEach-Object { Add-Content -Path $logPath -Value $_ }
 #endregion
 
 #region Output
 # Export to CSV
 try {
-    $results | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
+    $results | Where-Object { $_ } | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
     Write-Verbose "Exported results to $OutputPath"
 } catch {
     Add-Content -Path $logPath -Value "[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))] Failed to export CSV: $($_.Exception.Message)"
