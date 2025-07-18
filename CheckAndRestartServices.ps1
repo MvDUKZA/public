@@ -9,7 +9,7 @@
     the status of specified services. If a service is stopped, it attempts to start it, queries the System 
     event log for the most recent stop event, and records the details. Results are exported to a CSV file 
     with columns: ComputerName, OS, IsAlive, ServiceName, ServiceStatus, Service Stopped on, 
-    Service stopped By or reason, Service Successfully restarted.
+    Service stopped By or reason, Service Successfully restarted, ConnectionFailed.
     
     The script uses parallel processing for efficiency with large numbers of computers (2000-2500).
     Logging occurs to C:\temp\scripts\logs\servicecheck.log for errors.
@@ -41,6 +41,7 @@
     - Version 1.2: Updated service operations to use Invoke-Command for compatibility with PowerShell 7, as -ComputerName is not supported in Get-Service and Start-Service.
     - Version 1.3: Replaced $using:service with -ArgumentList and param in Invoke-Command ScriptBlocks to resolve variable scoping issues in parallel execution.
     - Version 1.4: Implemented concurrent logging using ConcurrentBag to fix logging issues in parallel execution. Sanitized reason field to replace newlines and prevent empty lines in CSV. Connection failures are handled in try-catch.
+    - Version 1.5: Changed logging to collect per-computer logs and return them with results to ensure modifications propagate from parallel runspaces. Added ConnectionFailed column. Added inner try-catch for Get-WinEvent. Added -ErrorAction Stop to Invoke-Command. Filtered nulls from results before export.
 
 #>
 
@@ -97,18 +98,15 @@ try {
 #endregion
 
 #region Processing
-# Create a concurrent bag for log messages
-$logMessages = New-Object System.Collections.Concurrent.ConcurrentBag[string]
-
 # Process computers in parallel
-$results = $computers | ForEach-Object -Parallel {
+$parallelOutputs = $computers | ForEach-Object -Parallel {
     $computer = $_.Name
     $os = $_.OperatingSystem
     $serviceNames = $using:ServiceNames
-    $logMessages = $using:logMessages
 
-    # Local results collection
+    # Local results and logs collection
     $localResults = @()
+    $localLogs = @()
 
     # Check if alive (quick ping)
     $isAlive = Test-Connection -ComputerName $computer -Count 1 -Quiet -ErrorAction SilentlyContinue
@@ -124,13 +122,15 @@ $results = $computers | ForEach-Object -Parallel {
                 'Service Stopped on'          = 'N/A'
                 'Service stopped By or reason' = 'N/A'
                 'Service Successfully restarted' = 'N/A'
+                ConnectionFailed              = 'N/A'
             }
             continue
         }
 
+        $connectionFailed = $false
         try {
             # Get service using Invoke-Command
-            $serv = Invoke-Command -ComputerName $computer -ScriptBlock { param($svcName) Get-Service -Name $svcName -ErrorAction Stop } -ArgumentList $service
+            $serv = Invoke-Command -ComputerName $computer -ErrorAction Stop -ScriptBlock { param($svcName) Get-Service -Name $svcName -ErrorAction Stop } -ArgumentList $service
             $initialStatus = $serv.Status
             $wasStopped = $initialStatus -eq 'Stopped'
             $stoppedOn = 'N/A'
@@ -138,46 +138,50 @@ $results = $computers | ForEach-Object -Parallel {
             $success = 'N/A'
 
             if ($wasStopped) {
-                $stoppedOn = ''
-                $reason = ''
+                try {
+                    # Query most recent stop event
+                    $eventFilter = @{
+                        LogName      = 'System'
+                        ProviderName = 'Microsoft-Windows-Service Control Manager'
+                        ID           = 7036
+                    }
+                    $events = Get-WinEvent -ComputerName $computer -FilterHashtable $eventFilter -MaxEvents 100 -ErrorAction Stop |
+                              Where-Object { $_.Message -match $service -and $_.Message -match 'stopped state' } |
+                              Select-Object -First 1
 
-                # Query most recent stop event
-                $eventFilter = @{
-                    LogName      = 'System'
-                    ProviderName = 'Microsoft-Windows-Service Control Manager'
-                    ID           = 7036
-                }
-                $events = Get-WinEvent -ComputerName $computer -FilterHashtable $eventFilter -MaxEvents 100 -ErrorAction Stop |
-                          Where-Object { $_.Message -match $service -and $_.Message -match 'stopped state' } |
-                          Select-Object -First 1
-
-                if ($events) {
-                    $stoppedOn = $events.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')
-                    $reason = $events.Message.Trim() -replace "`r`n|`n|`r", ' '
-                } else {
-                    $stoppedOn = 'No event found'
-                    $reason = 'No stop event found in logs'
+                    if ($events) {
+                        $stoppedOn = $events.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')
+                        $reason = $events.Message.Trim() -replace "`r`n|`n|`r", ' '
+                    } else {
+                        $stoppedOn = 'No event found'
+                        $reason = 'No stop event found in logs'
+                    }
+                } catch {
+                    $stoppedOn = 'Event query failed'
+                    $reason = $_.Exception.Message -replace "`r`n|`n|`r", ' '
+                    $localLogs += "[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))] Failed to query event log on ${computer} for ${service}: $($_.Exception.Message)"
                 }
 
                 # Attempt to start service using Invoke-Command
                 try {
-                    Invoke-Command -ComputerName $computer -ScriptBlock { param($svcName) Start-Service -Name $svcName -ErrorAction Stop } -ArgumentList $service
+                    Invoke-Command -ComputerName $computer -ErrorAction Stop -ScriptBlock { param($svcName) Start-Service -Name $svcName -ErrorAction Stop } -ArgumentList $service
                     $success = $true
                 } catch {
                     $success = $false
-                    $logMessages.Add("[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))] Failed to start ${service} on ${computer}: $($_.Exception.Message)")
+                    $localLogs += "[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))] Failed to start ${service} on ${computer}: $($_.Exception.Message)"
                 }
             }
 
             # Get final status using Invoke-Command
-            $finalStatus = (Invoke-Command -ComputerName $computer -ScriptBlock { param($svcName) Get-Service -Name $svcName -ErrorAction Stop } -ArgumentList $service).Status
+            $finalStatus = (Invoke-Command -ComputerName $computer -ErrorAction Stop -ScriptBlock { param($svcName) Get-Service -Name $svcName -ErrorAction Stop } -ArgumentList $service).Status
 
         } catch {
+            $connectionFailed = $true
             $finalStatus = 'Error'
             $stoppedOn = 'N/A'
             $reason = $_.Exception.Message -replace "`r`n|`n|`r", ' '
             $success = 'N/A'
-            $logMessages.Add("[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))] Error processing ${service} on ${computer}: $($_.Exception.Message)")
+            $localLogs += "[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))] Error processing ${service} on ${computer}: $($_.Exception.Message)"
         }
 
         $localResults += [PSCustomObject]@{
@@ -189,16 +193,24 @@ $results = $computers | ForEach-Object -Parallel {
             'Service Stopped on'          = $stoppedOn
             'Service stopped By or reason' = $reason
             'Service Successfully restarted' = $success
+            ConnectionFailed              = if ($connectionFailed) { 'Yes' } else { 'No' }
         }
     }
 
-    # Return local results
-    $localResults
+    # Return results and logs
+    [PSCustomObject]@{
+        Results = $localResults
+        Logs = $localLogs
+    }
 
 } -ThrottleLimit 50
 
-# Write collected log messages to file
-$logMessages | ForEach-Object { Add-Content -Path $logPath -Value $_ }
+# Collect results and logs
+$results = $parallelOutputs.Results | ForEach-Object { $_ } | Where-Object { $_ }
+$allLogs = $parallelOutputs.Logs | ForEach-Object { $_ }
+
+# Write logs to file
+$allLogs | ForEach-Object { Add-Content -Path $logPath -Value $_ }
 #endregion
 
 #region Output
