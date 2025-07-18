@@ -41,6 +41,7 @@
     - Version 1.2: Updated service operations to use Invoke-Command for compatibility with PowerShell 7, as -ComputerName is not supported in Get-Service and Start-Service.
     - Version 1.3: Replaced $using:service with -ArgumentList and param in Invoke-Command ScriptBlocks to resolve variable scoping issues in parallel execution.
     - Version 1.4: Added WinRM connectivity check with Test-WSMan to handle and log connection errors without displaying them. Added inner try-catch for Get-WinEvent to continue service start even if event query fails.
+    - Version 1.5: Fixed logging strings to properly delimit variables followed by colons using ${}. Added -ErrorAction Stop to Invoke-Command calls to ensure errors are caught without displaying red messages in the console.
 
 #>
 
@@ -123,7 +124,7 @@ $results = $computers | ForEach-Object -Parallel {
             } else {
                 $connectionError = 'Unknown WinRM connection error'
             }
-            Add-Content -Path $logPath -Value "[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))] WinRM connection failed to $computer: $connectionError"
+            Add-Content -Path $logPath -Value "[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))] WinRM connection failed to ${computer}: $connectionError"
         }
     }
 
@@ -158,7 +159,7 @@ $results = $computers | ForEach-Object -Parallel {
 
         try {
             # Get service using Invoke-Command
-            $serv = Invoke-Command -ComputerName $computer -ScriptBlock { param($svcName) Get-Service -Name $svcName -ErrorAction Stop } -ArgumentList $service
+            $serv = Invoke-Command -ComputerName $computer -ErrorAction Stop -ScriptBlock { param($svcName) Get-Service -Name $svcName -ErrorAction Stop } -ArgumentList $service
             $initialStatus = $serv.Status
             $wasStopped = $initialStatus -eq 'Stopped'
             $stoppedOn = 'N/A'
@@ -187,28 +188,28 @@ $results = $computers | ForEach-Object -Parallel {
                 } catch {
                     $stoppedOn = 'Event query failed'
                     $reason = $_.Exception.Message
-                    Add-Content -Path $logPath -Value "[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))] Failed to query event log on $computer for $service: $($_.Exception.Message)"
+                    Add-Content -Path $logPath -Value "[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))] Failed to query event log on ${computer} for ${service}: $($_.Exception.Message)"
                 }
 
                 # Attempt to start service using Invoke-Command
                 try {
-                    Invoke-Command -ComputerName $computer -ScriptBlock { param($svcName) Start-Service -Name $svcName -ErrorAction Stop } -ArgumentList $service
+                    Invoke-Command -ComputerName $computer -ErrorAction Stop -ScriptBlock { param($svcName) Start-Service -Name $svcName -ErrorAction Stop } -ArgumentList $service
                     $success = $true
                 } catch {
                     $success = $false
-                    Add-Content -Path $logPath -Value "[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))] Failed to start $service on $computer: $($_.Exception.Message)"
+                    Add-Content -Path $logPath -Value "[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))] Failed to start ${service} on ${computer}: $($_.Exception.Message)"
                 }
             }
 
             # Get final status using Invoke-Command
-            $finalStatus = (Invoke-Command -ComputerName $computer -ScriptBlock { param($svcName) Get-Service -Name $svcName -ErrorAction Stop } -ArgumentList $service).Status
+            $finalStatus = (Invoke-Command -ComputerName $computer -ErrorAction Stop -ScriptBlock { param($svcName) Get-Service -Name $svcName -ErrorAction Stop } -ArgumentList $service).Status
 
         } catch {
             $finalStatus = 'Error'
             $stoppedOn = 'N/A'
             $reason = $_.Exception.Message
             $success = 'N/A'
-            Add-Content -Path $logPath -Value "[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))] Error processing $service on $computer: $($_.Exception.Message)"
+            Add-Content -Path $logPath -Value "[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))] Error processing ${service} on ${computer}: $($_.Exception.Message)"
         }
 
         $localResults += [PSCustomObject]@{
