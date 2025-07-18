@@ -40,6 +40,7 @@
     - Version 1.1: Added OS column to output. Set N/A explicitly for non-stopped services. Added handling for no stop event found.
     - Version 1.2: Updated service operations to use Invoke-Command for compatibility with PowerShell 7, as -ComputerName is not supported in Get-Service and Start-Service.
     - Version 1.3: Replaced $using:service with -ArgumentList and param in Invoke-Command ScriptBlocks to resolve variable scoping issues in parallel execution.
+    - Version 1.4: Added WinRM connectivity check with Test-WSMan to handle and log connection errors without displaying them. Added inner try-catch for Get-WinEvent to continue service start even if event query fails.
 
 #>
 
@@ -109,6 +110,23 @@ $results = $computers | ForEach-Object -Parallel {
     # Check if alive (quick ping)
     $isAlive = Test-Connection -ComputerName $computer -Count 1 -Quiet -ErrorAction SilentlyContinue
 
+    # Check WinRM connectivity if alive
+    $remotingAvailable = $false
+    $connectionError = ''
+    if ($isAlive) {
+        Test-WSMan -ComputerName $computer -ErrorAction SilentlyContinue -ErrorVariable connErr
+        if ($?) {
+            $remotingAvailable = $true
+        } else {
+            if ($connErr.Count -gt 0) {
+                $connectionError = $connErr[0].Exception.Message
+            } else {
+                $connectionError = 'Unknown WinRM connection error'
+            }
+            Add-Content -Path $logPath -Value "[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))] WinRM connection failed to $computer: $connectionError"
+        }
+    }
+
     foreach ($service in $serviceNames) {
         if (-not $isAlive) {
             $localResults += [PSCustomObject]@{
@@ -124,6 +142,20 @@ $results = $computers | ForEach-Object -Parallel {
             continue
         }
 
+        if (-not $remotingAvailable) {
+            $localResults += [PSCustomObject]@{
+                ComputerName                  = $computer
+                OS                            = $os
+                IsAlive                       = $isAlive
+                ServiceName                   = $service
+                ServiceStatus                 = 'Remoting Failed'
+                'Service Stopped on'          = 'N/A'
+                'Service stopped By or reason' = $connectionError
+                'Service Successfully restarted' = 'N/A'
+            }
+            continue
+        }
+
         try {
             # Get service using Invoke-Command
             $serv = Invoke-Command -ComputerName $computer -ScriptBlock { param($svcName) Get-Service -Name $svcName -ErrorAction Stop } -ArgumentList $service
@@ -134,25 +166,28 @@ $results = $computers | ForEach-Object -Parallel {
             $success = 'N/A'
 
             if ($wasStopped) {
-                $stoppedOn = ''
-                $reason = ''
+                try {
+                    # Query most recent stop event
+                    $eventFilter = @{
+                        LogName      = 'System'
+                        ProviderName = 'Microsoft-Windows-Service Control Manager'
+                        ID           = 7036
+                    }
+                    $events = Get-WinEvent -ComputerName $computer -FilterHashtable $eventFilter -MaxEvents 100 -ErrorAction Stop |
+                              Where-Object { $_.Message -match $service -and $_.Message -match 'stopped state' } |
+                              Select-Object -First 1
 
-                # Query most recent stop event
-                $eventFilter = @{
-                    LogName      = 'System'
-                    ProviderName = 'Microsoft-Windows-Service Control Manager'
-                    ID           = 7036
-                }
-                $events = Get-WinEvent -ComputerName $computer -FilterHashtable $eventFilter -MaxEvents 100 -ErrorAction Stop |
-                          Where-Object { $_.Message -match $service -and $_.Message -match 'stopped state' } |
-                          Select-Object -First 1
-
-                if ($events) {
-                    $stoppedOn = $events.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')
-                    $reason = $events.Message.Trim()
-                } else {
-                    $stoppedOn = 'No event found'
-                    $reason = 'No stop event found in logs'
+                    if ($events) {
+                        $stoppedOn = $events.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')
+                        $reason = $events.Message.Trim()
+                    } else {
+                        $stoppedOn = 'No event found'
+                        $reason = 'No stop event found in logs'
+                    }
+                } catch {
+                    $stoppedOn = 'Event query failed'
+                    $reason = $_.Exception.Message
+                    Add-Content -Path $logPath -Value "[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))] Failed to query event log on $computer for $service: $($_.Exception.Message)"
                 }
 
                 # Attempt to start service using Invoke-Command
@@ -204,3 +239,4 @@ try {
     throw "Failed to export CSV: $($_.Exception.Message)"
 }
 #endregion
+
