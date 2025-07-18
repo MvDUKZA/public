@@ -40,9 +40,7 @@
     - Version 1.1: Added OS column to output. Set N/A explicitly for non-stopped services. Added handling for no stop event found.
     - Version 1.2: Updated service operations to use Invoke-Command for compatibility with PowerShell 7, as -ComputerName is not supported in Get-Service and Start-Service.
     - Version 1.3: Replaced $using:service with -ArgumentList and param in Invoke-Command ScriptBlocks to resolve variable scoping issues in parallel execution.
-    - Version 1.4: Added WinRM connectivity check with Test-WSMan to handle and log connection errors without displaying them. Added inner try-catch for Get-WinEvent to continue service start even if event query fails.
-    - Version 1.5: Fixed logging strings to properly delimit variables followed by colons using ${}. Added -ErrorAction Stop to Invoke-Command calls to ensure errors are caught without displaying red messages in the console.
-    - Version 1.6: Changed logging to use a ConcurrentBag to collect log messages in parallel threads and write them to the log file after processing to avoid concurrent write issues.
+    - Version 1.4: Implemented concurrent logging using ConcurrentBag to fix logging issues in parallel execution. Sanitized reason field to replace newlines and prevent empty lines in CSV. Connection failures are handled in try-catch.
 
 #>
 
@@ -108,30 +106,12 @@ $results = $computers | ForEach-Object -Parallel {
     $os = $_.OperatingSystem
     $serviceNames = $using:ServiceNames
     $logMessages = $using:logMessages
-    $logPath = $using:logPath  # Not used in parallel, but for consistency
 
     # Local results collection
     $localResults = @()
 
     # Check if alive (quick ping)
     $isAlive = Test-Connection -ComputerName $computer -Count 1 -Quiet -ErrorAction SilentlyContinue
-
-    # Check WinRM connectivity if alive
-    $remotingAvailable = $false
-    $connectionError = ''
-    if ($isAlive) {
-        Test-WSMan -ComputerName $computer -ErrorAction SilentlyContinue -ErrorVariable connErr
-        if ($?) {
-            $remotingAvailable = $true
-        } else {
-            if ($connErr.Count -gt 0) {
-                $connectionError = $connErr[0].Exception.Message
-            } else {
-                $connectionError = 'Unknown WinRM connection error'
-            }
-            $logMessages.Add("[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))] WinRM connection failed to ${computer}: $connectionError")
-        }
-    }
 
     foreach ($service in $serviceNames) {
         if (-not $isAlive) {
@@ -148,23 +128,9 @@ $results = $computers | ForEach-Object -Parallel {
             continue
         }
 
-        if (-not $remotingAvailable) {
-            $localResults += [PSCustomObject]@{
-                ComputerName                  = $computer
-                OS                            = $os
-                IsAlive                       = $isAlive
-                ServiceName                   = $service
-                ServiceStatus                 = 'Remoting Failed'
-                'Service Stopped on'          = 'N/A'
-                'Service stopped By or reason' = $connectionError
-                'Service Successfully restarted' = 'N/A'
-            }
-            continue
-        }
-
         try {
             # Get service using Invoke-Command
-            $serv = Invoke-Command -ComputerName $computer -ErrorAction Stop -ScriptBlock { param($svcName) Get-Service -Name $svcName -ErrorAction Stop } -ArgumentList $service
+            $serv = Invoke-Command -ComputerName $computer -ScriptBlock { param($svcName) Get-Service -Name $svcName -ErrorAction Stop } -ArgumentList $service
             $initialStatus = $serv.Status
             $wasStopped = $initialStatus -eq 'Stopped'
             $stoppedOn = 'N/A'
@@ -172,33 +138,30 @@ $results = $computers | ForEach-Object -Parallel {
             $success = 'N/A'
 
             if ($wasStopped) {
-                try {
-                    # Query most recent stop event
-                    $eventFilter = @{
-                        LogName      = 'System'
-                        ProviderName = 'Microsoft-Windows-Service Control Manager'
-                        ID           = 7036
-                    }
-                    $events = Get-WinEvent -ComputerName $computer -FilterHashtable $eventFilter -MaxEvents 100 -ErrorAction Stop |
-                              Where-Object { $_.Message -match $service -and $_.Message -match 'stopped state' } |
-                              Select-Object -First 1
+                $stoppedOn = ''
+                $reason = ''
 
-                    if ($events) {
-                        $stoppedOn = $events.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')
-                        $reason = $events.Message.Trim()
-                    } else {
-                        $stoppedOn = 'No event found'
-                        $reason = 'No stop event found in logs'
-                    }
-                } catch {
-                    $stoppedOn = 'Event query failed'
-                    $reason = $_.Exception.Message
-                    $logMessages.Add("[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))] Failed to query event log on ${computer} for ${service}: $($_.Exception.Message)")
+                # Query most recent stop event
+                $eventFilter = @{
+                    LogName      = 'System'
+                    ProviderName = 'Microsoft-Windows-Service Control Manager'
+                    ID           = 7036
+                }
+                $events = Get-WinEvent -ComputerName $computer -FilterHashtable $eventFilter -MaxEvents 100 -ErrorAction Stop |
+                          Where-Object { $_.Message -match $service -and $_.Message -match 'stopped state' } |
+                          Select-Object -First 1
+
+                if ($events) {
+                    $stoppedOn = $events.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')
+                    $reason = $events.Message.Trim() -replace "`r`n|`n|`r", ' '
+                } else {
+                    $stoppedOn = 'No event found'
+                    $reason = 'No stop event found in logs'
                 }
 
                 # Attempt to start service using Invoke-Command
                 try {
-                    Invoke-Command -ComputerName $computer -ErrorAction Stop -ScriptBlock { param($svcName) Start-Service -Name $svcName -ErrorAction Stop } -ArgumentList $service
+                    Invoke-Command -ComputerName $computer -ScriptBlock { param($svcName) Start-Service -Name $svcName -ErrorAction Stop } -ArgumentList $service
                     $success = $true
                 } catch {
                     $success = $false
@@ -207,12 +170,12 @@ $results = $computers | ForEach-Object -Parallel {
             }
 
             # Get final status using Invoke-Command
-            $finalStatus = (Invoke-Command -ComputerName $computer -ErrorAction Stop -ScriptBlock { param($svcName) Get-Service -Name $svcName -ErrorAction Stop } -ArgumentList $service).Status
+            $finalStatus = (Invoke-Command -ComputerName $computer -ScriptBlock { param($svcName) Get-Service -Name $svcName -ErrorAction Stop } -ArgumentList $service).Status
 
         } catch {
             $finalStatus = 'Error'
             $stoppedOn = 'N/A'
-            $reason = $_.Exception.Message
+            $reason = $_.Exception.Message -replace "`r`n|`n|`r", ' '
             $success = 'N/A'
             $logMessages.Add("[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))] Error processing ${service} on ${computer}: $($_.Exception.Message)")
         }
@@ -241,11 +204,10 @@ $logMessages | ForEach-Object { Add-Content -Path $logPath -Value $_ }
 #region Output
 # Export to CSV
 try {
-    $results | Where-Object { $_ } | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
+    $results | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
     Write-Verbose "Exported results to $OutputPath"
 } catch {
     Add-Content -Path $logPath -Value "[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))] Failed to export CSV: $($_.Exception.Message)"
     throw "Failed to export CSV: $($_.Exception.Message)"
 }
 #endregion
-
