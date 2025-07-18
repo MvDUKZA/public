@@ -39,6 +39,7 @@
     - Version 1.0: Initial creation.
     - Version 1.1: Added OS column to output. Set N/A explicitly for non-stopped services. Added handling for no stop event found.
     - Version 1.2: Updated service operations to use Invoke-Command for compatibility with PowerShell 7, as -ComputerName is not supported in Get-Service and Start-Service.
+    - Version 1.3: Replaced $using:service with -ArgumentList and param in Invoke-Command ScriptBlocks to resolve variable scoping issues in parallel execution.
 
 #>
 
@@ -125,7 +126,7 @@ $results = $computers | ForEach-Object -Parallel {
 
         try {
             # Get service using Invoke-Command
-            $serv = Invoke-Command -ComputerName $computer -ScriptBlock { Get-Service -Name $using:service -ErrorAction Stop }
+            $serv = Invoke-Command -ComputerName $computer -ScriptBlock { param($svcName) Get-Service -Name $svcName -ErrorAction Stop } -ArgumentList $service
             $initialStatus = $serv.Status
             $wasStopped = $initialStatus -eq 'Stopped'
             $stoppedOn = 'N/A'
@@ -156,7 +157,7 @@ $results = $computers | ForEach-Object -Parallel {
 
                 # Attempt to start service using Invoke-Command
                 try {
-                    Invoke-Command -ComputerName $computer -ScriptBlock { Start-Service -Name $using:service -ErrorAction Stop }
+                    Invoke-Command -ComputerName $computer -ScriptBlock { param($svcName) Start-Service -Name $svcName -ErrorAction Stop } -ArgumentList $service
                     $success = $true
                 } catch {
                     $success = $false
@@ -165,7 +166,7 @@ $results = $computers | ForEach-Object -Parallel {
             }
 
             # Get final status using Invoke-Command
-            $finalStatus = (Invoke-Command -ComputerName $computer -ScriptBlock { Get-Service -Name $using:service -ErrorAction Stop }).Status
+            $finalStatus = (Invoke-Command -ComputerName $computer -ScriptBlock { param($svcName) Get-Service -Name $svcName -ErrorAction Stop } -ArgumentList $service).Status
 
         } catch {
             $finalStatus = 'Error'
@@ -203,4 +204,3 @@ try {
     throw "Failed to export CSV: $($_.Exception.Message)"
 }
 #endregion
-
