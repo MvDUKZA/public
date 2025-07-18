@@ -38,6 +38,7 @@
     Change Log:
     - Version 1.0: Initial creation.
     - Version 1.1: Added OS column to output. Set N/A explicitly for non-stopped services. Added handling for no stop event found.
+    - Version 1.2: Updated service operations to use Invoke-Command for compatibility with PowerShell 7, as -ComputerName is not supported in Get-Service and Start-Service.
 
 #>
 
@@ -123,8 +124,8 @@ $results = $computers | ForEach-Object -Parallel {
         }
 
         try {
-            # Get service
-            $serv = Get-Service -Name $service -ComputerName $computer -ErrorAction Stop
+            # Get service using Invoke-Command
+            $serv = Invoke-Command -ComputerName $computer -ScriptBlock { Get-Service -Name $using:service -ErrorAction Stop }
             $initialStatus = $serv.Status
             $wasStopped = $initialStatus -eq 'Stopped'
             $stoppedOn = 'N/A'
@@ -153,9 +154,9 @@ $results = $computers | ForEach-Object -Parallel {
                     $reason = 'No stop event found in logs'
                 }
 
-                # Attempt to start service
+                # Attempt to start service using Invoke-Command
                 try {
-                    $serv | Start-Service -ErrorAction Stop
+                    Invoke-Command -ComputerName $computer -ScriptBlock { Start-Service -Name $using:service -ErrorAction Stop }
                     $success = $true
                 } catch {
                     $success = $false
@@ -163,8 +164,8 @@ $results = $computers | ForEach-Object -Parallel {
                 }
             }
 
-            # Get final status
-            $finalStatus = (Get-Service -Name $service -ComputerName $computer -ErrorAction Stop).Status
+            # Get final status using Invoke-Command
+            $finalStatus = (Invoke-Command -ComputerName $computer -ScriptBlock { Get-Service -Name $using:service -ErrorAction Stop }).Status
 
         } catch {
             $finalStatus = 'Error'
