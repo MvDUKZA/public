@@ -2,13 +2,13 @@
     <settings pass="windowsPE">
         <component name="Microsoft-Windows-International-Core-WinPE" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
             <SetupUILanguage>
-                <UILanguage>en-US</UILanguage>  # NEW: Changed to en-US
+                <UILanguage>en-GB</UILanguage>  # CHANGED: To UK
             </SetupUILanguage>
-            <InputLocale>en-US</InputLocale>
-            <SystemLocale>en-US</SystemLocale>
-            <UILanguage>en-US</UILanguage>
-            <UILanguageFallback>en-US</UILanguageFallback>
-            <UserLocale>en-US</UserLocale>
+            <InputLocale>en-GB</InputLocale>  # CHANGED: To UK
+            <SystemLocale>en-GB</SystemLocale>  # CHANGED: To UK
+            <UILanguage>en-GB</UILanguage>  # CHANGED: To UK
+            <UILanguageFallback>en-GB</UILanguageFallback>  # CHANGED: To UK
+            <UserLocale>en-GB</UserLocale>  # CHANGED: To UK
         </component>
         <component name="Microsoft-Windows-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
             <DiskConfiguration>
@@ -19,7 +19,7 @@
                         <CreatePartition wcm:action="add">
                             <Order>1</Order>
                             <Type>EFI</Type>
-                            <Size>500</Size>  # NEW: Increased for reliability
+                            <Size>500</Size>
                         </CreatePartition>
                         <CreatePartition wcm:action="add">
                             <Order>2</Order>
@@ -29,7 +29,7 @@
                         <CreatePartition wcm:action="add">
                             <Order>3</Order>
                             <Type>Primary</Type>
-                            <Extend>true</Extend>  # NEW: Added for full disk use
+                            <Extend>true</Extend>
                         </CreatePartition>
                     </CreatePartitions>
                     <ModifyPartitions>
@@ -56,6 +56,12 @@
                         <PartitionID>3</PartitionID>
                     </InstallTo>
                     <WillShowUI>OnError</WillShowUI>
+                    <InstallFrom>  # NEW: Added for Enterprise selection
+                        <MetaData wcm:action="add">
+                            <Key>/IMAGE/NAME</Key>
+                            <Value>Windows 11 Enterprise</Value>
+                        </MetaData>
+                    </InstallFrom>
                 </OSImage>
             </ImageInstall>
             <UserData>
@@ -65,7 +71,7 @@
             </UserData>
         </component>
     </settings>
-    <settings pass="oobeSystem">  # NEW: Full OOBE section added
+    <settings pass="oobeSystem">
         <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
             <OOBE>
                 <HideEULAPage>true</HideEULAPage>
@@ -73,11 +79,11 @@
                 <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
                 <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
                 <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
-                <ProtectYourPC>3</ProtectYourPC>  # NEW: Privacy settings
+                <ProtectYourPC>3</ProtectYourPC>
             </OOBE>
             <UserAccounts>
                 <AdministratorPassword>
-                    <Value>{PLACEHOLDER_PASSWORD}</Value>  # NEW: Placeholder for security
+                    <Value>{PLACEHOLDER_PASSWORD}</Value>
                     <PlainText>true</PlainText>
                 </AdministratorPassword>
                 <LocalAccounts>
@@ -91,10 +97,10 @@
                     </LocalAccount>
                 </LocalAccounts>
             </UserAccounts>
-            <TimeZone>UTC</TimeZone>
+            <TimeZone>UTC</TimeZone>  # Adjust if needed for UK (GMT Standard Time)
         </component>
     </settings>
-    <settings pass="specialize">  # NEW: Added for computer name, etc.
+    <settings pass="specialize">
         <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
             <ComputerName>Win11-Golden</ComputerName>
             <RegisteredOrganization>MyOrg</RegisteredOrganization>
