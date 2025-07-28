@@ -2,13 +2,14 @@
     <settings pass="windowsPE">
         <component name="Microsoft-Windows-International-Core-WinPE" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
             <SetupUILanguage>
-                <UILanguage>en-GB</UILanguage>  # CHANGED: To UK
+                <UILanguage>en-GB</UILanguage>
+                <WillShowUI>Never</WillShowUI>  <!-- NEW: Force no UI for language/keyboard -->
             </SetupUILanguage>
-            <InputLocale>en-GB</InputLocale>  # CHANGED: To UK
-            <SystemLocale>en-GB</SystemLocale>  # CHANGED: To UK
-            <UILanguage>en-GB</UILanguage>  # CHANGED: To UK
-            <UILanguageFallback>en-GB</UILanguageFallback>  # CHANGED: To UK
-            <UserLocale>en-GB</UserLocale>  # CHANGED: To UK
+            <InputLocale>en-GB:00000809</InputLocale>  <!-- NEW: Explicit UK keyboard/layout -->
+            <SystemLocale>en-GB</SystemLocale>
+            <UILanguage>en-GB</UILanguage>
+            <UILanguageFallback>en-GB</UILanguageFallback>
+            <UserLocale>en-GB</UserLocale>
         </component>
         <component name="Microsoft-Windows-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
             <DiskConfiguration>
@@ -56,7 +57,7 @@
                         <PartitionID>3</PartitionID>
                     </InstallTo>
                     <WillShowUI>OnError</WillShowUI>
-                    <InstallFrom>  # NEW: Added for Enterprise selection
+                    <InstallFrom>
                         <MetaData wcm:action="add">
                             <Key>/IMAGE/NAME</Key>
                             <Value>Windows 11 Enterprise</Value>
@@ -75,7 +76,7 @@
         <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
             <OOBE>
                 <HideEULAPage>true</HideEULAPage>
-                <HideLocalAccountScreen>true</HideLocalAccountScreen>
+                <HideLocalAccountScreen>true</HideLocalAccountScreen>  <!-- NEW: Explicit hide for account prompts -->
                 <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
                 <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
                 <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
@@ -97,7 +98,13 @@
                     </LocalAccount>
                 </LocalAccounts>
             </UserAccounts>
-            <TimeZone>UTC</TimeZone>  # Adjust if needed for UK (GMT Standard Time)
+            <TimeZone>GMT Standard Time</TimeZone>  <!-- NEW: Set to UK timezone -->
+        </component>
+        <component name="Microsoft-Windows-International-Core" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+            <InputLocale>en-GB</InputLocale>  <!-- NEW: Reinforce in oobeSystem -->
+            <SystemLocale>en-GB</SystemLocale>
+            <UILanguage>en-GB</UILanguage>
+            <UserLocale>en-GB</UserLocale>
         </component>
     </settings>
     <settings pass="specialize">
