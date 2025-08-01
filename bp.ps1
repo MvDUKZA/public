@@ -13,9 +13,9 @@
 
 .NOTES
     Author: Marinus van Deventer
-    Version: 1.1
+    Version: 1.2
     Date: August 01, 2025
-    Changes: Added floppy/ and isos/ folders with common subfolders for each OS family.
+    Changes: Added floppy/ and isos/ with common subfolders for each OS family, full structure creation.
     Reference: New-Item[](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.management/new-item?view=powershell-7.4)
     Reference: Set-Content[](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.management/set-content?view=powershell-7.4)
     Reference: Test-Path[](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.management/test-path?view=powershell-7.4)
@@ -83,15 +83,29 @@ try {
     # builds\
     $BuildsPath = "$RootPath\builds"
     New-Item -Path $BuildsPath -ItemType Directory -Force | Out-Null
-    New-Item -Path "$BuildsPath\artefacts" -ItemType Directory -Force | Out-Null
+    # builds/artefacts\
+    $ArtefactsPath = "$BuildsPath\artefacts"
+    New-Item -Path $ArtefactsPath -ItemType Directory -Force | Out-Null
     # builds/artefacts/windows\
-    $ArtefactsWindows = "$BuildsPath\artefacts\windows"
+    $ArtefactsWindows = "$ArtefactsPath\windows"
     New-Item -Path $ArtefactsWindows -ItemType Directory -Force | Out-Null
+    # builds/artefacts/windows/win11\
+    $ArtefactsWin11 = "$ArtefactsWindows\win11"
+    New-Item -Path $ArtefactsWin11 -ItemType Directory -Force | Out-Null
+    # builds/artefacts/windows/winsvr2022\
+    $ArtefactsWinSvr2022 = "$ArtefactsWindows\winsvr2022"
+    New-Item -Path $ArtefactsWinSvr2022 -ItemType Directory -Force | Out-Null
     # builds/artefacts/linux\
-    $ArtefactsLinux = "$BuildsPath\artefacts\linux"
+    $ArtefactsLinux = "$ArtefactsPath\linux"
     New-Item -Path $ArtefactsLinux -ItemType Directory -Force | Out-Null
+    # builds/artefacts/linux/ubuntu\
+    $ArtefactsUbuntu = "$ArtefactsLinux\ubuntu"
+    New-Item -Path $ArtefactsUbuntu -ItemType Directory -Force | Out-Null
+    # builds/artefacts/linux/rhel\
+    $ArtefactsRhel = "$ArtefactsLinux\rhel"
+    New-Item -Path $ArtefactsRhel -ItemType Directory -Force | Out-Null
     # builds/artefacts/macos\
-    $ArtefactsMacos = "$BuildsPath\artefacts\macos"
+    $ArtefactsMacos = "$ArtefactsPath\macos"
     New-Item -Path $ArtefactsMacos -ItemType Directory -Force | Out-Null
     New-Item -Path "$BuildsPath\logs" -ItemType Directory -Force | Out-Null
     New-Item -Path "$BuildsPath\manifests" -ItemType Directory -Force | Out-Null
@@ -104,28 +118,32 @@ try {
     # configs/windows\
     $WindowsConfigs = "$ConfigsPath\windows"
     New-Item -Path $WindowsConfigs -ItemType Directory -Force | Out-Null
-    # configs/windows/client\
-    $WindowsClient = "$WindowsConfigs\client"
-    New-Item -Path $WindowsClient -ItemType Directory -Force | Out-Null
-    # configs/windows/client/vsphere\
-    $WindowsClientVsphere = "$WindowsClient\vsphere"
-    New-Item -Path $WindowsClientVsphere -ItemType Directory -Force | Out-Null
-    Set-Content -Path "$WindowsClientVsphere\autounattend.xml" -Value "<!-- Dummy autounattend.xml for Windows client vSphere -->"
-    # configs/windows/client/azure\
-    $WindowsClientAzure = "$WindowsClient\azure"
-    New-Item -Path $WindowsClientAzure -ItemType Directory -Force | Out-Null
-    Set-Content -Path "$WindowsClientAzure\autounattend.xml" -Value "<!-- Dummy autounattend.xml for Windows client Azure -->"
-    # configs/windows/server\
-    $WindowsServer = "$WindowsConfigs\server"
-    New-Item -Path $WindowsServer -ItemType Directory -Force | Out-Null
-    # configs/windows/server/vsphere\
-    $WindowsServerVsphere = "$WindowsServer\vsphere"
-    New-Item -Path $WindowsServerVsphere -ItemType Directory -Force | Out-Null
-    Set-Content -Path "$WindowsServerVsphere\autounattend.xml" -Value "<!-- Dummy autounattend.xml for Windows server vSphere -->"
-    # configs/windows/server/azure\
-    $WindowsServerAzure = "$WindowsServer\azure"
-    New-Item -Path $WindowsServerAzure -ItemType Directory -Force | Out-Null
-    Set-Content -Path "$WindowsServerAzure\autounattend.xml" -Value "<!-- Dummy autounattend.xml for Windows server Azure -->"
+    # configs/windows/win11\
+    $Win11Configs = "$WindowsConfigs\win11"
+    New-Item -Path $Win11Configs -ItemType Directory -Force | Out-Null
+    # configs/windows/win11/vsphere\
+    $Win11Vsphere = "$Win11Configs\vsphere"
+    New-Item -Path $Win11Vsphere -ItemType Directory -Force | Out-Null
+    Set-Content -Path "$Win11Vsphere\autounattend.xml" -Value "<!-- Dummy autounattend.xml for Win11 vSphere -->"
+    Set-Content -Path "$Win11Vsphere\variables.pkrvars.hcl" -Value "# Dummy variables for Win11 vSphere"
+    # configs/windows/win11/azure\
+    $Win11Azure = "$Win11Configs\azure"
+    New-Item -Path $Win11Azure -ItemType Directory -Force | Out-Null
+    Set-Content -Path "$Win11Azure\autounattend.xml" -Value "<!-- Dummy autounattend.xml for Win11 Azure -->"
+    Set-Content -Path "$Win11Azure\variables.pkrvars.hcl" -Value "# Dummy variables for Win11 Azure"
+    # configs/windows/winsvr2022\
+    $WinSvr2022Configs = "$WindowsConfigs\winsvr2022"
+    New-Item -Path $WinSvr2022Configs -ItemType Directory -Force | Out-Null
+    # configs/windows/winsvr2022/vsphere\
+    $WinSvr2022Vsphere = "$WinSvr2022Configs\vsphere"
+    New-Item -Path $WinSvr2022Vsphere -ItemType Directory -Force | Out-Null
+    Set-Content -Path "$WinSvr2022Vsphere\autounattend.xml" -Value "<!-- Dummy autounattend.xml for WinSvr2022 vSphere -->"
+    Set-Content -Path "$WinSvr2022Vsphere\variables.pkrvars.hcl" -Value "# Dummy variables for WinSvr2022 vSphere"
+    # configs/windows/winsvr2022/azure\
+    $WinSvr2022Azure = "$WinSvr2022Configs\azure"
+    New-Item -Path $WinSvr2022Azure -ItemType Directory -Force | Out-Null
+    Set-Content -Path "$WinSvr2022Azure\autounattend.xml" -Value "<!-- Dummy autounattend.xml for WinSvr2022 Azure -->"
+    Set-Content -Path "$WinSvr2022Azure\variables.pkrvars.hcl" -Value "# Dummy variables for WinSvr2022 Azure"
     # configs/windows/common\
     $WindowsCommon = "$WindowsConfigs\common"
     New-Item -Path $WindowsCommon -ItemType Directory -Force | Out-Null
@@ -166,4 +184,153 @@ try {
     New-Item -Path $CommonConfigs -ItemType Directory -Force | Out-Null
     Write-Log "Created configs/ structure with dummy files"
 
-    # templates
+    # templates\
+    $TemplatesPath = "$RootPath\templates"
+    New-Item -Path $TemplatesPath -ItemType Directory -Force | Out-Null
+    # templates/windows\
+    $TemplatesWindows = "$TemplatesPath\windows"
+    New-Item -Path $TemplatesWindows -ItemType Directory -Force | Out-Null
+    Set-Content -Path "$TemplatesWindows\vsphere-base.pkr.hcl" -Value "# Dummy vSphere base template for Windows"
+    Set-Content -Path "$TemplatesWindows\azure-base.pkr.hcl" -Value "# Dummy Azure base template for Windows"
+    # templates/linux\
+    $TemplatesLinux = "$TemplatesPath\linux"
+    New-Item -Path $TemplatesLinux -ItemType Directory -Force | Out-Null
+    Set-Content -Path "$TemplatesLinux\vsphere-base.pkr.hcl" -Value "# Dummy vSphere base template for Linux"
+    Set-Content -Path "$TemplatesLinux\azure-base.pkr.hcl" -Value "# Dummy Azure base template for Linux"
+    # templates/components\
+    $TemplatesComponents = "$TemplatesPath\components"
+    New-Item -Path $TemplatesComponents -ItemType Directory -Force | Out-Null
+    Set-Content -Path "$TemplatesComponents\winrm-setup.pkr.hcl" -Value "# Dummy WinRM setup component"
+    Set-Content -Path "$TemplatesComponents\ssh-setup.pkr.hcl" -Value "# Dummy SSH setup component"
+    Set-Content -Path "$TemplatesComponents\cloud-init.pkr.hcl" -Value "# Dummy cloud-init component"
+    Write-Log "Created templates/ with dummy files"
+
+    # scripts\
+    $ScriptsPath = "$RootPath\scripts"
+    New-Item -Path $ScriptsPath -ItemType Directory -Force | Out-Null
+    # scripts/windows\
+    $ScriptsWindows = "$ScriptsPath\windows"
+    New-Item -Path $ScriptsWindows -ItemType Directory -Force | Out-Null
+    # scripts/windows/client\
+    $ScriptsWindowsClient = "$ScriptsWindows\client"
+    New-Item -Path $ScriptsWindowsClient -ItemType Directory -Force | Out-Null
+    Set-Content -Path "$ScriptsWindowsClient\install-horizon.ps1" -Value "# Dummy install-horizon.ps1 for Windows client"
+    Set-Content -Path "$ScriptsWindowsClient\vdi-optimize.ps1" -Value "# Dummy vdi-optimize.ps1 for Windows client"
+    # scripts/windows/server\
+    $ScriptsWindowsServer = "$ScriptsWindows\server"
+    New-Item -Path $ScriptsWindowsServer -ItemType Directory -Force | Out-Null
+    Set-Content -Path "$ScriptsWindowsServer\install-roles.ps1" -Value "# Dummy install-roles.ps1 for Windows server"
+    Set-Content -Path "$ScriptsWindowsServer\configure-domain.ps1" -Value "# Dummy configure-domain.ps1 for Windows server"
+    # scripts/windows/common\
+    $ScriptsWindowsCommon = "$ScriptsWindows\common"
+    New-Item -Path $ScriptsWindowsCommon -ItemType Directory -Force | Out-Null
+    Set-Content -Path "$ScriptsWindowsCommon\security.ps1" -Value "# Dummy security.ps1 for Windows common"
+    Set-Content -Path "$ScriptsWindowsCommon\updates.ps1" -Value "# Dummy updates.ps1 for Windows common"
+    # scripts/linux\
+    $ScriptsLinux = "$ScriptsPath\linux"
+    New-Item -Path $ScriptsLinux -ItemType Directory -Force | Out-Null
+    # scripts/linux/ubuntu\
+    $ScriptsLinuxUbuntu = "$ScriptsLinux\ubuntu"
+    New-Item -Path $ScriptsLinuxUbuntu -ItemType Directory -Force | Out-Null
+    Set-Content -Path "$ScriptsLinuxUbuntu\install-docker.sh" -Value "# Dummy install-docker.sh for Ubuntu"
+    Set-Content -Path "$ScriptsLinuxUbuntu\configure-networking.sh" -Value "# Dummy configure-networking.sh for Ubuntu"
+    # scripts/linux/rhel\
+    $ScriptsLinuxRhel = "$ScriptsLinux\rhel"
+    New-Item -Path $ScriptsLinuxRhel -ItemType Directory -Force | Out-Null
+    Set-Content -Path "$ScriptsLinuxRhel\install-packages.sh" -Value "# Dummy install-packages.sh for RHEL"
+    Set-Content -Path "$ScriptsLinuxRhel\security-harden.sh" -Value "# Dummy security-harden.sh for RHEL"
+    # scripts/linux/common\
+    $ScriptsLinuxCommon = "$ScriptsLinux\common"
+    New-Item -Path $ScriptsLinuxCommon -ItemType Directory -Force | Out-Null
+    Set-Content -Path "$ScriptsLinuxCommon\cloud-init.sh" -Value "# Dummy cloud-init.sh for Linux common"
+    Set-Content -Path "$ScriptsLinuxCommon\kernel-tune.sh" -Value "# Dummy kernel-tune.sh for Linux common"
+    # scripts/lib\
+    $ScriptsLib = "$ScriptsPath\lib"
+    New-Item -Path $ScriptsLib -ItemType Directory -Force | Out-Null
+    Set-Content -Path "$ScriptsLib\package-manager.psm1" -Value "# Dummy package-manager.psm1 module"
+    Set-Content -Path "$ScriptsLib\os-detection.psm1" -Value "# Dummy os-detection.psm1 module"
+    Write-Log "Created scripts/ structure with dummy files"
+
+    # variables\
+    $VariablesPath = "$RootPath\variables"
+    New-Item -Path $VariablesPath -ItemType Directory -Force | Out-Null
+    Set-Content -Path "$VariablesPath\global.pkrvars.hcl" -Value "# Dummy global variables"
+    # variables/platforms\
+    $VariablesPlatforms = "$VariablesPath\platforms"
+    New-Item -Path $VariablesPlatforms -ItemType Directory -Force | Out-Null
+    Set-Content -Path "$VariablesPlatforms\vsphere.pkrvars.hcl" -Value "# Dummy vSphere platform variables"
+    Set-Content -Path "$VariablesPlatforms\azure.pkrvars.hcl" -Value "# Dummy Azure platform variables"
+    # variables/os\
+    $VariablesOS = "$VariablesPath\os"
+    New-Item -Path $VariablesOS -ItemType Directory -Force | Out-Null
+    Set-Content -Path "$VariablesOS\win11.pkrvars.hcl" -Value "# Dummy Win11 OS variables"
+    Set-Content -Path "$VariablesOS\winsvr2022.pkrvars.hcl" -Value "# Dummy WinSvr2022 OS variables"
+    Set-Content -Path "$VariablesOS\ubuntu.pkrvars.hcl" -Value "# Dummy Ubuntu OS variables"
+    Set-Content -Path "$VariablesOS\rhel.pkrvars.hcl" -Value "# Dummy RHEL OS variables"
+    Write-Log "Created variables/ structure with dummy files"
+
+    # .gitignore, .env.example, README.md, Build-Template.ps1, Build-Template.sh
+    Set-Content -Path "$RootPath\.gitignore" -Value "# Dummy .gitignore content"
+    Set-Content -Path "$RootPath\.env.example" -Value "# Dummy .env.example content"
+    Set-Content -Path "$RootPath\README.md" -Value "# Dummy README.md content"
+    Set-Content -Path "$RootPath\Build-Template.ps1" -Value "# Dummy Build-Template.ps1"
+    Set-Content -Path "$RootPath\Build-Template.sh" -Value "# Dummy Build-Template.sh"
+
+    # tests\
+    $TestsPath = "$RootPath\tests"
+    New-Item -Path $TestsPath -ItemType Directory -Force | Out-Null
+    # tests/windows\
+    $TestsWindows = "$TestsPath\windows"
+    New-Item -Path $TestsWindows -ItemType Directory -Force | Out-Null
+    Set-Content -Path "$TestsWindows\script-tests.ps1" -Value "# Dummy Pester tests for Windows"
+    # tests/linux\
+    $TestsLinux = "$TestsPath\linux"
+    New-Item -Path $TestsLinux -ItemType Directory -Force | Out-Null
+    Set-Content -Path "$TestsLinux\script-tests.bats" -Value "# Dummy BATS tests for Linux"
+    Write-Log "Created root files and tests/ structure with dummy files"
+
+    # isos\
+    $IsosPath = "$RootPath\isos"
+    New-Item -Path $IsosPath -ItemType Directory -Force | Out-Null
+    # isos/windows\
+    $IsosWindows = "$IsosPath\windows"
+    New-Item -Path $IsosWindows -ItemType Directory -Force | Out-Null
+    # isos/windows/win11\
+    $IsosWin11 = "$IsosWindows\win11"
+    New-Item -Path $IsosWin11 -ItemType Directory -Force | Out-Null
+    # isos/windows/win11/vsphere\
+    $IsosWin11Vsphere = "$IsosWin11\vsphere"
+    New-Item -Path $IsosWin11Vsphere -ItemType Directory -Force | Out-Null
+    Set-Content -Path "$IsosWin11Vsphere\README.txt" -Value "# Dummy README for Win11 vSphere ISO reference"
+    # isos/windows/win11/azure\
+    $IsosWin11Azure = "$IsosWin11\azure"
+    New-Item -Path $IsosWin11Azure -ItemType Directory -Force | Out-Null
+    Set-Content -Path "$IsosWin11Azure\README.txt" -Value "# Dummy README for Win11 Azure ISO reference"
+    # isos/windows/winsvr2022\
+    $IsosWinSvr2022 = "$IsosWindows\winsvr2022"
+    New-Item -Path $IsosWinSvr2022 -ItemType Directory -Force | Out-Null
+    # isos/windows/winsvr2022/vsphere\
+    $IsosWinSvr2022Vsphere = "$IsosWinSvr2022\vsphere"
+    New-Item -Path $IsosWinSvr2022Vsphere -ItemType Directory -Force | Out-Null
+    Set-Content -Path "$IsosWinSvr2022Vsphere\README.txt" -Value "# Dummy README for WinSvr2022 vSphere ISO reference"
+    # isos/windows/winsvr2022/azure\
+    $IsosWinSvr2022Azure = "$IsosWinSvr2022\azure"
+    New-Item -Path $IsosWinSvr2022Azure -ItemType Directory -Force | Out-Null
+    Set-Content -Path "$IsosWinSvr2022Azure\README.txt" -Value "# Dummy README for WinSvr2022 Azure ISO reference"
+    # isos/windows/common\
+    $IsosWindowsCommon = "$IsosWindows\common"
+    New-Item -Path $IsosWindowsCommon -ItemType Directory -Force | Out-Null
+    Set-Content -Path "$IsosWindowsCommon\README.txt" -Value "# Dummy README for Windows common ISO reference"
+    # isos/linux\
+    $IsosLinux = "$IsosPath\linux"
+    New-Item -Path $IsosLinux -ItemType Directory -Force | Out-Null
+    # isos/linux/ubuntu\
+    $IsosUbuntu = "$IsosLinux\ubuntu"
+    New-Item -Path $IsosUbuntu -ItemType Directory -Force | Out-Null
+    # isos/linux/ubuntu/vsphere\
+    $IsosUbuntuVsphere = "$IsosUbuntu\vsphere"
+    New-Item -Path $IsosUbuntuVsphere -ItemType Directory -Force | Out-Null
+    Set-Content -Path "$IsosUbuntuVsphere\README.txt" -Value "# Dummy README for Ubuntu vSphere ISO reference"
+    # isos/linux/ubuntu/azure\
+    $IsosUbuntuAzure = "$IsosUbuntu\azure"
+    New-Item -Path $IsosUbuntuAzure -
