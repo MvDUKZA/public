@@ -333,4 +333,115 @@ try {
     Set-Content -Path "$IsosUbuntuVsphere\README.txt" -Value "# Dummy README for Ubuntu vSphere ISO reference"
     # isos/linux/ubuntu/azure\
     $IsosUbuntuAzure = "$IsosUbuntu\azure"
-    New-Item -Path $IsosUbuntuAzure -
+    New-Item -Path $IsosUbuntuAzure -ItemType Directory -Force | Out-Null
+    Set-Content -Path "$IsosUbuntuAzure\README.txt" -Value "# Dummy README for Ubuntu Azure ISO reference"
+    # isos/linux/rhel\
+    $IsosRhel = "$IsosLinux\rhel"
+    New-Item -Path $IsosRhel -ItemType Directory -Force | Out-Null
+    # isos/linux/rhel/vsphere\
+    $IsosRhelVsphere = "$IsosRhel\vsphere"
+    New-Item -Path $IsosRhelVsphere -ItemType Directory -Force | Out-Null
+    Set-Content -Path "$IsosRhelVsphere\README.txt" -Value "# Dummy README for RHEL vSphere ISO reference"
+    # isos/linux/rhel/azure\
+    $IsosRhelAzure = "$IsosRhel\azure"
+    New-Item -Path $IsosRhelAzure -ItemType Directory -Force | Out-Null
+    Set-Content -Path "$IsosRhelAzure\README.txt" -Value "# Dummy README for RHEL Azure ISO reference"
+    # isos/linux/common\
+    $IsosLinuxCommon = "$IsosLinux\common"
+    New-Item -Path $IsosLinuxCommon -ItemType Directory -Force | Out-Null
+    Set-Content -Path "$IsosLinuxCommon\README.txt" -Value "# Dummy README for Linux common ISO reference"
+    # isos/macos\
+    $IsosMacos = "$IsosPath\macos"
+    New-Item -Path $IsosMacos -ItemType Directory -Force | Out-Null
+    # isos/macos/common\
+    $IsosMacosCommon = "$IsosMacos\common"
+    New-Item -Path $IsosMacosCommon -ItemType Directory -Force | Out-Null
+    Set-Content -Path "$IsosMacosCommon\README.txt" -Value "# Dummy README for MacOS common ISO reference"
+    # isos/macos/vsphere\
+    $IsosMacosVsphere = "$IsosMacos\vsphere"
+    New-Item -Path $IsosMacosVsphere -ItemType Directory -Force | Out-Null
+    Set-Content -Path "$IsosMacosVsphere\README.txt" -Value "# Dummy README for MacOS vSphere ISO reference"
+    Write-Log "Created isos/ structure with dummy README files"
+
+    # floppy\
+    $FloppyPath = "$RootPath\floppy"
+    New-Item -Path $FloppyPath -ItemType Directory -Force | Out-Null
+    # floppy/windows\
+    $FloppyWindows = "$FloppyPath\windows"
+    New-Item -Path $FloppyWindows -ItemType Directory -Force | Out-Null
+    # floppy/windows/win11\
+    $FloppyWin11 = "$FloppyWindows\win11"
+    New-Item -Path $FloppyWin11 -ItemType Directory -Force | Out-Null
+    # floppy/windows/win11/vsphere\
+    $FloppyWin11Vsphere = "$FloppyWin11\vsphere"
+    New-Item -Path $FloppyWin11Vsphere -ItemType Directory -Force | Out-Null
+    Set-Content -Path "$FloppyWin11Vsphere\autounattend.xml" -Value "<!-- Dummy autounattend.xml for Win11 vSphere floppy -->"
+    # floppy/windows/win11/azure\
+    $FloppyWin11Azure = "$FloppyWin11\azure"
+    New-Item -Path $FloppyWin11Azure -ItemType Directory -Force | Out-Null
+    Set-Content -Path "$FloppyWin11Azure\autounattend.xml" -Value "<!-- Dummy autounattend.xml for Win11 Azure floppy -->"
+    # floppy/windows/winsvr2022\
+    $FloppyWinSvr2022 = "$FloppyWindows\winsvr2022"
+    New-Item -Path $FloppyWinSvr2022 -ItemType Directory -Force | Out-Null
+    # floppy/windows/winsvr2022/vsphere\
+    $FloppyWinSvr2022Vsphere = "$FloppyWinSvr2022\vsphere"
+    New-Item -Path $FloppyWinSvr2022Vsphere -ItemType Directory -Force | Out-Null
+    Set-Content -Path "$FloppyWinSvr2022Vsphere\autounattend.xml" -Value "<!-- Dummy autounattend.xml for WinSvr2022 vSphere floppy -->"
+    # floppy/windows/winsvr2022/azure\
+    $FloppyWinSvr2022Azure = "$FloppyWinSvr2022\azure"
+    New-Item -Path $FloppyWinSvr2022Azure -ItemType Directory -Force | Out-Null
+    Set-Content -Path "$FloppyWinSvr2022Azure\autounattend.xml" -Value "<!-- Dummy autounattend.xml for WinSvr2022 Azure floppy -->"
+    # floppy/windows/common\
+    $FloppyWindowsCommon = "$FloppyWindows\common"
+    New-Item -Path $FloppyWindowsCommon -ItemType Directory -Force | Out-Null
+    Set-Content -Path "$FloppyWindowsCommon\autounattend.xml" -Value "<!-- Dummy autounattend.xml for Windows common floppy -->"
+    # floppy/linux\
+    $FloppyLinux = "$FloppyPath\linux"
+    New-Item -Path $FloppyLinux -ItemType Directory -Force | Out-Null
+    # floppy/linux/ubuntu\
+    $FloppyUbuntu = "$FloppyLinux\ubuntu"
+    New-Item -Path $FloppyUbuntu -ItemType Directory -Force | Out-Null
+    # floppy/linux/ubuntu/vsphere\
+    $FloppyUbuntuVsphere = "$FloppyUbuntu\vsphere"
+    New-Item -Path $FloppyUbuntuVsphere -ItemType Directory -Force | Out-Null
+    Set-Content -Path "$FloppyUbuntuVsphere\ks.cfg" -Value "# Dummy ks.cfg for Ubuntu vSphere floppy"
+    # floppy/linux/ubuntu/azure\
+    $FloppyUbuntuAzure = "$FloppyUbuntu\azure"
+    New-Item -Path $FloppyUbuntuAzure -ItemType Directory -Force | Out-Null
+    Set-Content -Path "$FloppyUbuntuAzure\ks.cfg" -Value "# Dummy ks.cfg for Ubuntu Azure floppy"
+    # floppy/linux/rhel\
+    $FloppyRhel = "$FloppyLinux\rhel"
+    New-Item -Path $FloppyRhel -ItemType Directory -Force | Out-Null
+    # floppy/linux/rhel/vsphere\
+    $FloppyRhelVsphere = "$FloppyRhel\vsphere"
+    New-Item -Path $FloppyRhelVsphere -ItemType Directory -Force | Out-Null
+    Set-Content -Path "$FloppyRhelVsphere\ks.cfg" -Value "# Dummy ks.cfg for RHEL vSphere floppy"
+    # floppy/linux/rhel/azure\
+    $FloppyRhelAzure = "$FloppyRhel\azure"
+    New-Item -Path $FloppyRhelAzure -ItemType Directory -Force | Out-Null
+    Set-Content -Path "$FloppyRhelAzure\ks.cfg" -Value "# Dummy ks.cfg for RHEL Azure floppy"
+    # floppy/linux/common\
+    $FloppyLinuxCommon = "$FloppyLinux\common"
+    New-Item -Path $FloppyLinuxCommon -ItemType Directory -Force | Out-Null
+    Set-Content -Path "$FloppyLinuxCommon\ks.cfg" -Value "# Dummy ks.cfg for Linux common floppy"
+    # floppy/macos\
+    $FloppyMacos = "$FloppyPath\macos"
+    New-Item -Path $FloppyMacos -ItemType Directory -Force | Out-Null
+    # floppy/macos/common\
+    $FloppyMacosCommon = "$FloppyMacos\common"
+    New-Item -Path $FloppyMacosCommon -ItemType Directory -Force | Out-Null
+    Set-Content -Path "$FloppyMacosCommon\autounattend.xml" -Value "<!-- Dummy autounattend.xml for MacOS common floppy -->"
+    # floppy/macos/vsphere\
+    $FloppyMacosVsphere = "$FloppyMacos\vsphere"
+    New-Item -Path $FloppyMacosVsphere -ItemType Directory -Force | Out-Null
+    Set-Content -Path "$FloppyMacosVsphere\autounattend.xml" -Value "<!-- Dummy autounattend.xml for MacOS vSphere floppy -->"
+    Write-Log "Created floppy/ structure with dummy files"
+
+    Write-Log "Folder structure and dummy files created successfully"
+} catch {
+    Write-Log "Error during structure creation: $($_.Exception.Message)" "ERROR"
+    throw "Script execution failed."
+} finally {
+    Write-Log "Script execution completed"
+}
+#endregion
