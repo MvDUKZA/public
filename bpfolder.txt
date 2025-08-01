@@ -1,0 +1,114 @@
+C:\packer\                  # Git repository root: Central entry point for the project; clone from GitHub here. Scalable for multi-OS/platform builds via wrapper loops.
+├── .git\                   # All version control: Tracks configs, scripts, variables, and templates via commits, branches (e.g., linux-dev), and tags (e.g., v1.0-win11). Use for change history and rollback.
+├── bin\                    # Tools (gitignored): Contains executables like Packer; add OS-specific tools (e.g., mkisofs for Linux ISOs) as needed. Scalable by validating tools in the wrapper with Test-Path.
+│   ├── packer.exe          # Packer executable: Core tool for building images; download latest from https://www.packer.io/downloads.
+│   ├── sdelete.exe         # Windows secure delete: Sysinternals tool for secure file deletion during cleanup; optional for Windows builds.
+│   └── shred               # Linux secure delete: GNU tool for secure deletion in Linux provisioners; optional for Linux builds.
+├── builds\                  # Build outputs (gitignored): Stores runtime artefacts; subfolders per OS for scalability in large multi-build environments (e.g., CI/CD matrix jobs).
+│   ├── artefacts\          # Final build artefacts: Contains output images/templates (e.g., OVF for vSphere, VHD for Azure); organised by OS to prevent clutter as builds scale.
+│   │   ├── windows\        # Windows artefacts: Outputs for Win11/Server (e.g., win11-vsphere.ovf).
+│   │   ├── linux\          # Linux artefacts: Outputs for Ubuntu/RHEL (e.g., ubuntu-vsphere.ovf).
+│   │   └── macos\          # MacOS artefacts: Future expansion for macOS builds (e.g., macos-vsphere.ovf).
+│   ├── logs\               # Build logs: Timestamped log files (e.g., build-win11-20250801.log); scalable with OS/platform prefixes for filtering in large setups.
+│   ├── manifests\          # JSON manifests: Auto-generated build records with metadata, hashes, and commit info; one per build for auditing and reproducibility as project scales.
+│   └── reports\            # Audit reports: HTML/JSON reports from audit.ps1; organised by OS for compliance checks in multi-OS environments.
+├── configs\                 # OS-specific configurations: Versioned via Git; modular for adding OSes/platforms. Contains setup files like autounattend.xml; scalable by duplicating subfolders in branches.
+│   ├── windows\            # Windows family: All Windows configs; common/ for shared elements across editions.
+│   │   ├── win11\          # Client edition: Win11 configs; platform subfolders for vsphere/azure.
+│   │   │   ├── vsphere\    # vSphere platform: Win11 vSphere-specific (e.g., autounattend.xml for unattended install).
+│   │   │   └── azure\      # Azure platform: Win11 Azure-specific configs.
+│   │   ├── winsvr2022\     # Server edition: WinServer 2022 configs; similar structure for scalability.
+│   │   │   ├── vsphere\    # vSphere platform for Server.
+│   │   │   └── azure\      # Azure platform for Server.
+│   │   └── common\         # Shared Windows configs: Reusable elements like autounattend_fragments/ for sysprep snippets.
+│   │       └── autounattend_fragments\  # Fragments for modular unattend files; shared across Windows OSes.
+│   ├── linux\              # Linux family: All Linux configs; common/ for shared across distributions.
+│   │   ├── ubuntu\         # Ubuntu distribution: Ubuntu configs; platform subfolders.
+│   │   │   ├── vsphere\    # vSphere platform: Ubuntu vSphere-specific (e.g., kickstart.cfg).
+│   │   │   └── azure\      # Azure platform: Ubuntu Azure-specific.
+│   │   ├── rhel\           # RHEL distribution: RHEL configs; similar for scalability.
+│   │   │   ├── vsphere\    # vSphere for RHEL.
+│   │   │   └── azure\      # Azure for RHEL.
+│   │   └── common\         # Shared Linux configs: Reusable like cloud-init/ for pre-configuration.
+│   │       └── cloud-init\  # Cloud-init fragments; shared across Linux distributions.
+│   └── common\             # Cross-OS configurations: Shared setups applicable to all OS families (e.g., network configs).
+├── templates\               # Packer templates: HCL files for builds; scalable with OS/platform conditionals (e.g., if var.os_type == "linux" use ssh).
+│   ├── windows\            # Windows templates: Base templates for Windows OSes.
+│   │   ├── vsphere-base.pkr.hcl  # vSphere base for Windows; uses vars for edition switching.
+│   │   └── azure-base.pkr.hcl    # Azure base for Windows.
+│   ├── linux\              # Linux templates: Base templates for Linux distributions.
+│   │   ├── vsphere-base.pkr.hcl  # vSphere base for Linux.
+│   │   └── azure-base.pkr.hcl    # Azure base for Linux.
+│   └── components\         # Reusable modules: Shared HCL components for all OSes (e.g., connection setups).
+│       ├── winrm-setup.pkr.hcl  # WinRM for Windows.
+│       └── ssh-setup.pkr.hcl    # SSH for Linux/macOS.
+├── scripts\                 # OS-specific scripts: Versioned via Git; modular for adding distributions/editions.
+│   ├── windows\            # PowerShell scripts for Windows; common/ for shared.
+│   │   ├── client\         # Client OS scripts (Win10/11; e.g., install-horizon.ps1).
+│   │   ├── server\         # Server OS scripts (WinServer; e.g., install-rds.ps1).
+│   │   └── common\         # Shared Windows scripts (e.g., optimizations.ps1).
+│   ├── linux\              # Shell scripts for Linux; common/ for shared.
+│   │   ├── ubuntu\         # Ubuntu-specific (e.g., install-packages.sh).
+│   │   ├── rhel\           # RHEL-specific.
+│   │   └── common\         # Shared Linux scripts (e.g., optimizations.sh).
+│   └── lib\                # Shared modules: .psm1 for PowerShell, .sh libraries for shell; multi-OS.
+│       ├── package-manager.psm1  # Multi-OS package handling (winget/apt).
+│       └── os-detection.psm1     # OS detection logic.
+├── variables\               # Variable definitions: Versioned via Git; scalable with OS/platform subfiles.
+│   ├── global.pkrvars.hcl  # Cross-all variables (e.g., package_source="\\server\packages\").
+│   ├── platforms\          # Platform vars (scalable by adding gcp.pkrvars.hcl).
+│   │   ├── vsphere.pkrvars.hcl  # vSphere vars.
+│   │   └── azure.pkrvars.hcl    # Azure vars.
+│   └── os\                 # OS vars; one per OS/distribution.
+│       ├── win11.pkrvars.hcl    # Win11 vars.
+│       ├── winsvr2022.pkrvars.hcl  # WinServer vars.
+│       ├── ubuntu.pkrvars.hcl      # Ubuntu vars.
+│       └── rhel.pkrvars.hcl        # RHEL vars.
+├── floppy\                  # Floppy files for vSphere: Git-tracked; small configs like autounattend/ks.cfg; common/ for shared.
+│   ├── windows\            # Windows floppy.
+│   │   ├── win11\          # Win11 floppy.
+│   │   │   ├── vsphere\    # vSphere platform floppy.
+│   │   │   └── azure\      # Azure platform floppy.
+│   │   ├── winsvr2022\     # WinServer floppy.
+│   │   │   ├── vsphere\
+│   │   │   └── azure\
+│   │   └── common\         # Shared Windows floppy (e.g., common drivers).
+│   ├── linux\              # Linux floppy.
+│   │   ├── ubuntu\         # Ubuntu floppy.
+│   │   │   ├── vsphere\
+│   │   │   └── azure\
+│   │   ├── rhel\           # RHEL floppy.
+│   │   │   ├── vsphere\
+│   │   │   └── azure\
+│   │   └── common\         # Shared Linux floppy (e.g., common ks.cfg fragments).
+│   └── macos\              # Future MacOS floppy.
+│       ├── vsphere\
+│       └── common\         # Shared MacOS floppy.
+├── isos\                    # ISO references (gitignored): Placeholders/READMEs for external ISOs; common/ for shared.
+│   ├── windows\            # Windows ISOs.
+│   │   ├── win11\          # Win11 ISOs.
+│   │   │   ├── vsphere\
+│   │   │   └── azure\
+│   │   ├── winsvr2022\     # WinServer ISOs.
+│   │   │   ├── vsphere\
+│   │   │   └── azure\
+│   │   └── common\         # Shared Windows ISOs (e.g., common update ISOs).
+│   ├── linux\              # Linux ISOs.
+│   │   ├── ubuntu\         # Ubuntu ISOs.
+│   │   │   ├── vsphere\
+│   │   │   └── azure\
+│   │   ├── rhel\           # RHEL ISOs.
+│   │   │   ├── vsphere\
+│   │   │   └── azure\
+│   │   └── common\         # Shared Linux ISOs (e.g., common tools ISOs).
+│   └── macos\              # Future MacOS ISOs.
+│       ├── vsphere\
+│       └── common\         # Shared MacOS ISOs.
+├── .gitignore               # Git ignore rules (e.g., builds/, bin/).
+├── .env.example             # Example secrets file.
+├── README.md                # Project documentation.
+├── Build-Template.ps1       # Windows build wrapper (PowerShell).
+├── Build-Template.sh        # Linux build wrapper (shell).
+└── tests\                   # Multi-OS testing.
+    ├── windows\             # Pester tests for Windows.
+    └── linux\               # BATS tests for Linux.
