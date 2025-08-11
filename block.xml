@@ -1,0 +1,27 @@
+<QueryList>
+  <Query Id="0" Path="Security">
+    <Select Path="Security">
+      *[System[(EventID=4656 or EventID=4663 or EventID=4688 or EventID=4689 or EventID=4657 or EventID=4672)]]
+    </Select>
+  </Query>
+  <Query Id="1" Path="Microsoft-Windows-UAC/Operational">
+    <Select Path="Microsoft-Windows-UAC/Operational">*</Select>
+  </Query>
+  <Query Id="2" Path="Microsoft-Windows-AppLocker/EXE and DLL">
+    <Select Path="Microsoft-Windows-AppLocker/EXE and DLL">*[System[(EventID=8003 or EventID=8004)]]</Select>
+  </Query>
+  <Query Id="3" Path="Microsoft-Windows-AppLocker/MSI and Script">
+    <Select Path="Microsoft-Windows-AppLocker/MSI and Script">*[System[(EventID=8003 or EventID=8004)]]</Select>
+  </Query>
+  <Query Id="4" Path="Microsoft-Windows-AppInfo/Admin">
+    <Select Path="Microsoft-Windows-AppInfo/Admin">*</Select>
+  </Query>
+  <Query Id="5" Path="Microsoft-Windows-AppInfo/Operational">
+    <Select Path="Microsoft-Windows-AppInfo/Operational">*</Select>
+  </Query>
+  <Query Id="6" Path="Microsoft-Windows-CodeIntegrity/Operational">
+    <Select Path="Microsoft-Windows-CodeIntegrity/Operational">
+      *[System[(EventID=3089 or EventID=3099 or EventID=3033 or EventID=3077)]]
+    </Select>
+  </Query>
+</QueryList>
