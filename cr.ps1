@@ -39,7 +39,7 @@
     Logs: C:\temp\scripts\logs\CheckandRemediate_<yyyyMMdd_HHmm>.log
     Reports: C:\temp\scripts\reports\FailedCompliance_<yyyyMMdd_HHmm>.csv
     Dependencies: Invoke-RestMethod, Import-Csv, Invoke-Command.
-    Changelog: Initial version - August 19, 2025. Updated August 19, 2025: Fixed variable interpolation error in logging; removed -WhatIf support. Updated August 19, 2025: Added 'X-Requested-With' header to API requests for compliance with Qualys requirements. Updated August 19, 2025: Changed output_format to lowercase 'csv_no_metadata'; added -Header to Import-Csv for proper parsing; switched to sequential processing to resolve function scope issues in parallel blocks.
+    Changelog: Initial version - August 19, 2025. Updated August 19, 2025: Fixed variable interpolation error in logging; removed -WhatIf support. Updated August 19, 2025: Added 'X-Requested-With' header to API requests for compliance with Qualys requirements. Updated August 19, 2025: Changed output_format to lowercase 'csv_no_metadata'; switched to sequential processing to resolve function scope issues in parallel blocks. Updated August 19, 2025: Removed -Header from Import-Csv to handle API-provided headers, preventing type conversion errors on non-numeric values like 'Criticality Label'.
     Signed by Marinus van Deventer
 #>
 
@@ -105,7 +105,7 @@ begin {
             $uri = "$QualysBaseUrl/api/2.0/fo/compliance/posture/info/?action=list&policy_id=$PolicyId&output_format=csv_no_metadata&status=Failed&details=All&truncation_limit=$TruncationLimit"
             Write-Log "Querying Qualys API: $uri"
             Invoke-RestMethod -Uri $uri -Headers $headers -Method Get -OutFile $csvPath
-            $data = Import-Csv -Path $csvPath -Header 'Policy ID','Host ID','IP','DNS','NetBIOS','Tracking Method','OS','Instance','Control ID','Status','Reason','Evidence','Last Evaluation'
+            $data = Import-Csv -Path $csvPath
             if ($data.Count -eq 0) {
                 Write-Log 'No failed postures found.'
                 return @()
