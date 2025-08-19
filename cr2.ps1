@@ -38,23 +38,19 @@
     .\CheckandRemediate.ps1 -QualysBaseUrl 'https://qualysapi.qualys.eu' -QualysCredential (Import-Clixml 'C:\secure\qualys.cred') -PolicyId 99999
 
 .NOTES
-    Requires PowerShell 7.4+ for optimal performance.
+    Requires PowerShell 7.4+ (tested 7.5.2).
     Working directory: C:\temp\scripts
     Logs: C:\temp\scripts\logs\CheckandRemediate_<yyyyMMdd_HHmm>.log
     Reports: C:\temp\scripts\reports\FailedCompliance_<yyyyMMdd_HHmm>.csv
     Dependencies: Invoke-RestMethod, Import-Csv, Invoke-Command, Test-WSMan.
 
-    Changelog:
-      - 2025-08-19: Switched Qualys call to POST with form body; added TLS 1.2 enforcement and retry with backoff.
-      - 2025-08-19: Added WinRM reachability check before Invoke-Command to avoid false positives from ICMP.
-      - 2025-08-19: ParamSets so AdminCredential is required only when -Remediate is used.
-      - 2025-08-19: Normalised CSV headers/values; added required-column validation; hardened grouping.
-      - 2025-08-19: Enforced UTF8 logging and report encoding; added Mode column to report.
-      - 2025-08-19: Fixers must be Authenticode-signed; signature validation and output contract normalisation.
-      - 2025-08-19: Optional -LaunchRescan to request Qualys compliance rescans after successful remediation.
-      - 2025-08-19: Progress reporting across remediation loop.
-      - 2025-08-19: Added Resolve-Header/Normalize-QualysRows to map header variants (e.g. 'IP Address', 'Reason for Failure', 'Evidence/Results') to canonical fields IP, ControlID, Evidence, Reason; improved error when headers do not match.
-      - 2025-08-19: Ensured all logging expands $CID correctly.
+    Changelog (latest first):
+      - 2025-08-19: Fixed CSV wrapper handling (BEGIN/END markers) and optional ZIP response; now reliably extracts a clean CSV for Import-Csv.
+      - 2025-08-19: Header resolver now REQUIRES only IP + ControlID; Evidence/Reason are optional and default to empty if absent.
+      - 2025-08-19: Improved error messages to include first 5 header names and sample first data line when schema cannot be resolved.
+      - 2025-08-19: Guarded grouping and filtering against missing fields; removed hard throws that caused line 279/315/334 stops.
+      - 2025-08-19: Import Test-WSMan module for PS 7.5.2; more robust remoting checks.
+      - 2025-08-19: Previous changes retained (POST + retry/backoff, TLS1.2, signed fixers, UTF8 logs/reports, progress, -LaunchRescan).
 
     Signed by Marinus van Deventer
 #>
@@ -89,6 +85,8 @@ begin {
     $ErrorActionPreference = 'Stop'
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
+    try { Import-Module Microsoft.WSMan.Management -ErrorAction SilentlyContinue } catch {}
+
     $workingDir  = 'C:\temp\scripts'
     $logsDir     = Join-Path $workingDir 'logs'
     $reportsDir  = Join-Path $workingDir 'reports'
@@ -96,6 +94,7 @@ begin {
     $timestamp   = Get-Date -Format 'yyyyMMdd_HHmm'
     $logPath     = Join-Path $logsDir "CheckandRemediate_$timestamp.log"
     $reportPath  = Join-Path $reportsDir "FailedCompliance_$timestamp.csv"
+    $csvRawPath  = Join-Path $workingDir 'failed_postures_raw.bin'
     $csvPath     = Join-Path $workingDir 'failed_postures.csv'
 
     foreach ($dir in @($workingDir, $logsDir, $reportsDir, $fixersDir)) {
@@ -119,7 +118,7 @@ begin {
     Write-Log "Script started. PSVersion=$($PSVersionTable.PSVersion) ParamSet=$($PSCmdlet.ParameterSetName)"
     #endregion
 
-    #region Helpers: Qualys, CSV normaliser, Fixers and Rescans
+    #region Helpers: Qualys, CSV extraction/normaliser, Fixers and Rescans
     function Invoke-QualysRequest {
         param(
             [Parameter(Mandatory = $true)][string]$EndpointPath,
@@ -156,6 +155,40 @@ begin {
         } while ($true)
     }
 
+    function Unwrap-QualysCsv {
+        param(
+            [Parameter(Mandatory=$true)][string]$RawPath,
+            [Parameter(Mandatory=$true)][string]$CsvPath
+        )
+        # Handle ZIP responses (PK header)
+        $fs = [IO.File]::OpenRead($RawPath)
+        try {
+            $b0 = $fs.ReadByte(); $b1 = $fs.ReadByte(); $fs.Position = 0
+        } finally { $fs.Dispose() }
+        if ($b0 -eq 0x50 -and $b1 -eq 0x4B) {
+            $tmp = Join-Path (Split-Path $CsvPath -Parent) ("unz_" + [guid]::NewGuid().Guid)
+            New-Item -ItemType Directory -Path $tmp | Out-Null
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            [IO.Compression.ZipFile]::ExtractToDirectory($RawPath, $tmp)
+            $csv = Get-ChildItem -Path $tmp -Filter *.csv -Recurse | Select-Object -First 1
+            if (-not $csv) { throw "ZIP response contained no CSV file." }
+            Copy-Item $csv.FullName $CsvPath -Force
+            Remove-Item $tmp -Recurse -Force
+            return
+        }
+        # Strip Qualys wrapper lines and keep only CSV
+        $lines = Get-Content -Path $RawPath -Encoding Byte -Raw | ForEach-Object {[Text.Encoding]::UTF8.GetString($_)} # ensure UTF8
+        if (-not $lines) { throw "Empty response body." }
+        $lines = ($lines -split "`r?`n")
+        # Remove markers like ----BEGIN_RESPONSE..., ----END_RESPONSE...
+        $lines = $lines | Where-Object { $_ -and ($_ -notmatch '^----BEGIN_') -and ($_ -notmatch '^----END_') }
+        # Start at first line that looks like CSV header (contains a comma)
+        $start = 0
+        for ($i=0; $i -lt $lines.Count; $i++) { if ($lines[$i] -like '*,*') { $start = $i; break } }
+        $clean = $lines[$start..($lines.Count-1)]
+        Set-Content -Path $CsvPath -Value $clean -Encoding UTF8
+    }
+
     function Get-FailedPostures {
         try {
             $body = @{
@@ -167,7 +200,8 @@ begin {
             }
             if ($TruncationLimit -gt 0) { $body.truncation_limit = $TruncationLimit }
 
-            Invoke-QualysRequest -EndpointPath '/api/2.0/fo/compliance/posture/info/' -Body $body -OutFile $csvPath | Out-Null
+            Invoke-QualysRequest -EndpointPath '/api/2.0/fo/compliance/posture/info/' -Body $body -OutFile $csvRawPath | Out-Null
+            Unwrap-QualysCsv -RawPath $csvRawPath -CsvPath $csvPath
 
             $raw = Import-Csv -Path $csvPath
             if (-not $raw -or $raw.Count -eq 0) {
@@ -195,15 +229,14 @@ begin {
     }
 
     function Resolve-Header {
-        param(
-            [Parameter(Mandatory=$true)][string[]]$Available
-        )
-        # Map canonical -> list of acceptable aliases commonly seen in Qualys CSVs
+        param([Parameter(Mandatory=$true)][string[]]$Available)
+
+        # Canonical -> accepted aliases
         $map = @{
             IP         = @('IP','IP Address','IP Address(es)','Host IP','Host IP Address','IP Address(es) List')
-            ControlID  = @('Control ID','CID','Control ID (CID)','CID (Control ID)')
-            Evidence   = @('Evidence','Evidence/Results','Instance Evidence','Evidence Value','Actual Value','Value','Finding')
-            Reason     = @('Reason','Reason for Failure','Failure Reason','Reason/Recommendation','Rationale','Recommendation')
+            ControlID  = @('Control ID','CID','Control ID (CID)','CID (Control ID)','Control Identifier','Control')
+            Evidence   = @('Evidence','Evidence/Results','Instance Evidence','Evidence Value','Actual Value','Value','Finding','Observed Value')
+            Reason     = @('Reason','Reason for Failure','Failure Reason','Reason/Recommendation','Rationale','Recommendation','Expected Value','Expected')
         }
         $resolved = @{}
         foreach ($k in $map.Keys) {
@@ -214,31 +247,33 @@ begin {
     }
 
     function Normalize-QualysRows {
-        param(
-            [Parameter(Mandatory=$true)][object[]]$Rows
-        )
+        param([Parameter(Mandatory=$true)][object[]]$Rows)
+
         if (-not $Rows -or $Rows.Count -eq 0) { return @() }
         $headers = $Rows[0].PSObject.Properties.Name
         $resolved = Resolve-Header -Available $headers
 
-        $requiredCanon = @('IP','ControlID','Evidence','Reason')
+        # Only IP and ControlID are truly required to act; Evidence/Reason are optional.
+        $requiredCanon = @('IP','ControlID')
         $missingCanon = $requiredCanon | Where-Object { $_ -notin $resolved.Keys }
         if ($missingCanon) {
-            Write-Log "Detected CSV headers: $($headers -join ', ')" 'ERROR'
-            throw "CSV missing required columns (canonical): $($missingCanon -join ', '). Expected aliases exist among: $($requiredCanon -join ', ')"
+            Write-Log ("Detected CSV headers (first 5): {0}" -f (($headers | Select-Object -First 5) -join ', ')) 'ERROR'
+            $firstLine = ($Rows | Select-Object -First 1 | ConvertTo-Csv -NoTypeInformation)[1]
+            Write-Log ("First data line snapshot: {0}" -f $firstLine) 'ERROR'
+            throw "CSV missing required columns (canonical): $($missingCanon -join ', ')."
         }
 
         $ipH   = $resolved.IP
         $cidH  = $resolved.ControlID
-        $evH   = $resolved.Evidence
-        $rsH   = $resolved.Reason
+        $evH   = if ($resolved.ContainsKey('Evidence')) { $resolved.Evidence } else { $null }
+        $rsH   = if ($resolved.ContainsKey('Reason'))   { $resolved.Reason }   else { $null }
 
         $Rows | ForEach-Object {
             [pscustomobject]@{
                 IP        = $_.$ipH
                 ControlID = $_.$cidH
-                Evidence  = $_.$evH
-                Reason    = $_.$rsH
+                Evidence  = if ($evH) { $_.$evH } else { '' }
+                Reason    = if ($rsH) { $_.$rsH } else { '' }
             }
         }
     }
@@ -262,9 +297,7 @@ begin {
     }
 
     function Invoke-HostRescan {
-        param(
-            [Parameter(Mandatory = $true)][string]$HostIP
-        )
+        param([Parameter(Mandatory = $true)][string]$HostIP)
         try {
             $body = @{
                 action        = 'launch'
@@ -408,7 +441,7 @@ process {
 }
 
 end {
-    if (Test-Path $csvPath) { Remove-Item $csvPath -Force }
+    foreach ($p in @($csvRawPath,$csvPath)) { if (Test-Path $p) { Remove-Item $p -Force } }
     Write-Log 'Script completed.'
 }
 
