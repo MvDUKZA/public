@@ -27,7 +27,7 @@
     Logs: C:\temp\scripts\logs\CheckandRemediate_<yyyyMMdd_HHmm>.log
     Reports: C:\temp\scripts\reports\FailedCompliance_<yyyyMMdd_HHmm>.csv
     Dependencies: Invoke-RestMethod, Import-Csv, Invoke-Command.
-    Changelog: Initial version - 2025-08-19. Updated 2025-08-19: Added UTF8 encoding for logs and reports, hardcoded column names from guide, fixed variable interpolation in logs. Updated 2025-08-19: Adjusted columns validation to log warning if missing and proceed, fixed interpolation in all Write-Log calls.
+    Changelog: Initial version - 2025-08-19. Updated 2025-08-19: Added UTF8 encoding for logs and reports, hardcoded column names from guide, fixed variable interpolation in logs. Updated 2025-08-19: Added header detection in Get-FailedPostures to skip rubbish lines, changed columns validation to log warning instead of throw, fixed interpolation in all Write-Log calls.
     Signed by Marinus van Deventer
 #>
 
