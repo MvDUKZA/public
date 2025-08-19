@@ -39,7 +39,7 @@
     Logs: C:\temp\scripts\logs\CheckandRemediate_<yyyyMMdd_HHmm>.log
     Reports: C:\temp\scripts\reports\FailedCompliance_<yyyyMMdd_HHmm>.csv
     Dependencies: Invoke-RestMethod, Import-Csv, Invoke-Command.
-    Changelog: Initial version - August 19, 2025. Updated August 19, 2025: Fixed variable interpolation error in logging; removed -WhatIf support. Updated August 19, 2025: Added 'X-Requested-With' header to API requests for compliance with Qualys requirements. Updated August 19, 2025: Changed output_format to lowercase 'csv_no_metadata'; switched to sequential processing to resolve function scope issues in parallel blocks. Updated August 19, 2025: Removed -Header from Import-Csv to handle API-provided headers, preventing type conversion errors on non-numeric values like 'Criticality Label'.
+    Changelog: Initial version - August 19, 2025. Updated August 19, 2025: Fixed variable interpolation error in logging; removed -WhatIf support. Updated August 19, 2025: Added 'X-Requested-With' header to API requests for compliance with Qualys requirements. Updated August 19, 2025: Changed output_format to lowercase 'csv_no_metadata'; switched to sequential processing to resolve function scope issues in parallel blocks. Updated August 19, 2025: Removed -Header from Import-Csv to handle API-provided headers, preventing type conversion errors on non-numeric values like 'Criticality Label'. Updated August 19, 2025: Added filters for null IPs and non-numeric CIDs to prevent validation and conversion errors.
     Signed by Marinus van Deventer
 #>
 
@@ -187,10 +187,13 @@ process {
         $postures = Get-FailedPostures
         if ($postures.Count -eq 0) { return }
 
+        # Filter out rows with null or empty IP
+        $postures = $postures | Where-Object { -not [string]::IsNullOrEmpty($_.IP) }
+
         # Group by host IP and CID
         $grouped = $postures | Group-Object -Property IP | ForEach-Object {
             $hostIP = $_.Name
-            $_.Group | Group-Object -Property 'Control ID' | ForEach-Object {
+            $_.Group | Where-Object { $_.'Control ID' -match '^\d+$' } | Group-Object -Property 'Control ID' | ForEach-Object {
                 [PSCustomObject]@{
                     HostIP   = $hostIP
                     CID      = [int]$_.Name
