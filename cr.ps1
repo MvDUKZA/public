@@ -27,7 +27,7 @@
     Logs: C:\temp\scripts\logs\CheckandRemediate_<yyyyMMdd_HHmm>.log
     Reports: C:\temp\scripts\reports\FailedCompliance_<yyyyMMdd_HHmm>.csv
     Dependencies: Invoke-RestMethod, Import-Csv, Invoke-Command.
-    Changelog: Initial version - 2025-08-19. Updated 2025-08-19: Added UTF8 encoding for logs and reports, hardcoded column names from guide, fixed variable interpolation in logs.
+    Changelog: Initial version - 2025-08-19. Updated 2025-08-19: Added UTF8 encoding for logs and reports, hardcoded column names from guide, fixed variable interpolation in logs. Updated 2025-08-19: Adjusted columns validation to log warning if missing and proceed, fixed interpolation in all Write-Log calls.
     Signed by Marinus van Deventer
 #>
 
@@ -132,8 +132,7 @@ begin {
         $requiredColumns = @('IP', 'Control ID', 'Posture Evidence', 'Reference')
         $missingColumns = $requiredColumns | Where-Object { $_ -notin $data[0].PSObject.Properties.Name }
         if ($missingColumns) {
-            Write-Log "Missing required columns: $($missingColumns -join ', ')" 'ERROR'
-            throw "CSV headers do not match expected format."
+            Write-Log "Missing required columns: $($missingColumns -join ', ')" 'WARNING'
         }
         Write-Log "Retrieved $($data.Count) failed postures."
         return $data
