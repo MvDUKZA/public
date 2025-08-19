@@ -2,7 +2,7 @@
 .SYNOPSIS
     Queries Qualys for failed compliance postures, generates reports, and optionally remediates issues using per-CID fixer scripts.
 .DESCRIPTION
-    Connects to the Qualys API using a service account, retrieves failed compliance data for a specified policy, parses the CSV output with hardcoded columns, groups by host and CID, generates a report, and (if -Remediate is specified) attempts fixes on online hosts via remote PowerShell. Fixers are discovered dynamically from the 'fixers' subfolder.
+    Connects to the Qualys API using a service account, retrieves failed compliance data for a specified policy, parses the CSV output with hardcoded columns, adds remediation columns to the original data, generates a report, and (if -Remediate is specified) attempts fixes on online hosts via remote PowerShell. Fixers are discovered dynamically from the 'fixers' subfolder.
 .PARAMETER QualysBaseUrl
     The base URL for the Qualys API (e.g., 'https://qualysapi.qualys.eu').
 .PARAMETER QualysCredential
@@ -27,7 +27,7 @@
     Logs: C:\temp\scripts\logs\CheckandRemediate_<yyyyMMdd_HHmm>.log
     Reports: C:\temp\scripts\reports\FailedCompliance_<yyyyMMdd_HHmm>.csv
     Dependencies: Invoke-RestMethod, Import-Csv, Invoke-Command.
-    Changelog: Initial version - 2025-08-19. Updated 2025-08-19: Added UTF8 encoding for logs and reports, hardcoded column names from guide, fixed variable interpolation in logs. Updated 2025-08-19: Added header detection in Get-FailedPostures to skip rubbish lines, changed columns validation to log warning instead of throw, fixed interpolation in all Write-Log calls.
+    Changelog: Initial version - 2025-08-19. Updated 2025-08-19: Added UTF8 encoding for logs and reports, hardcoded column names from guide, fixed variable interpolation in logs. Updated 2025-08-19: Changed to modify original data by adding columns instead of regrouping for report, group only for remediation to avoid duplicates.
     Signed by Marinus van Deventer
 #>
 
@@ -214,7 +214,7 @@ process {
         # Filter invalid rows
         $postures = $postures | Where-Object { -not [string]::IsNullOrEmpty($_.IP) -and $_. 'Control ID' -match '^\d+$' }
 
-        # Group by IP and Control ID
+        # Group by IP and Control ID for remediation (to avoid duplicates)
         $grouped = $postures | Group-Object -Property IP | ForEach-Object {
             $hostIp = $_.Name
             $_.Group | Group-Object -Property 'Control ID' | ForEach-Object {
@@ -230,14 +230,11 @@ process {
         $results = @()
         foreach ($item in $grouped) {
             $remediation = Remediate-Host -HostIp $item.HostIp -ControlId $item.ControlId -Evidence $item.Evidence
-            $results += [PSCustomObject]@{
-                HostIp = $item.HostIp
-                ControlId = $item.ControlId
-                Evidence = $item.Evidence
-                Reason = $item.Reason
-                FixAttempted = $remediation.FixAttempted
-                Outcome = $remediation.Outcome
-                Details = $remediation.Details
+            $postures | Where-Object { $_.IP -eq $item.HostIp -and $_. 'Control ID' -eq $item.ControlId } | ForEach-Object {
+                $_ | Add-Member -NotePropertyName FixAttempted -NotePropertyValue $remediation.FixAttempted
+                $_ | Add-Member -NotePropertyName Outcome -NotePropertyValue $remediation.Outcome
+                $_ | Add-Member -NotePropertyName Details -NotePropertyValue $remediation.Details
+                $results += $_
             }
         }
 
