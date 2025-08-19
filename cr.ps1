@@ -43,7 +43,7 @@
       - 2025-08-19: Progress reporting across remediation loop.
       - 2025-08-19: Added Resolve-Header/Normalize-QualysRows to map header variants (e.g. 'IP Address', 'Reason for Failure', 'Evidence/Results') to canonical fields IP, ControlID, Evidence, Reason; improved error when headers do not match.
       - 2025-08-19: Ensured all logging expands $CID correctly.
-      - 2025-08-19: Modified Get-FailedPostures to parse multi-section CSV by skipping summary lines and importing from posture headers.
+      - 2025-08-19: Removed multi-section CSV handling in Get-FailedPostures as per provided CSV format starting directly with headers.
     Signed by Marinus van Deventer
 #>
 [CmdletBinding(DefaultParameterSetName = 'Report', SupportsShouldProcess = $false)]
@@ -140,15 +140,7 @@ begin {
             }
             if ($TruncationLimit -gt 0) { $body.truncation_limit = $TruncationLimit }
             Invoke-QualysRequest -EndpointPath '/api/2.0/fo/compliance/posture/info/' -Body $body -OutFile $csvPath | Out-Null
-            $lines = Get-Content -Path $csvPath
-            $headerIndex = 0
-            for ($i = 0; $i -lt $lines.Count; $i++) {
-                if ($lines[$i] -match '"Control ID"') {
-                    $headerIndex = $i
-                    break
-                }
-            }
-            $data = $lines | Select-Object -Skip $headerIndex | ConvertFrom-Csv
+            $data = Import-Csv -Path $csvPath
             if (-not $data -or $data.Count -eq 0) {
                 Write-Log 'No failed postures found.'
                 return @()
