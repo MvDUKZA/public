@@ -2,10 +2,7 @@
 .SYNOPSIS
     Queries Qualys for failed compliance postures, generates reports, and optionally remediates issues using per-CID fixer scripts.
 .DESCRIPTION
-    Connects to the Qualys API using a service account, retrieves failed compliance data for a specified policy, parses the CSV output,
-    normalises columns to canonical names, groups by host and CID, generates a report, and (if -Remediate is specified) attempts fixes
-    on online hosts via remote PowerShell. Fixers are discovered dynamically from the 'fixers' subfolder and must be Authenticode-signed.
-    Optionally, upon successful remediation, can request a Qualys compliance rescan for the host when -LaunchRescan is provided.
+    Connects to the Qualys API using a service account, retrieves failed compliance data for a specified policy, parses the CSV output with hardcoded columns, groups by host and CID, generates a report, and (if -Remediate is specified) attempts fixes on online hosts via remote PowerShell. Fixers are discovered dynamically from the 'fixers' subfolder.
 .PARAMETER QualysBaseUrl
     The base URL for the Qualys API (e.g., 'https://qualysapi.qualys.eu').
 .PARAMETER QualysCredential
@@ -13,340 +10,249 @@
 .PARAMETER PolicyId
     The Qualys policy ID to query (default: 99999).
 .PARAMETER TruncationLimit
-    Maximum records to retrieve per API call (default: 10000; set to 0 to omit the parameter).
+    Maximum records to retrieve per API call (default: 10000; set to 0 for no limit).
 .PARAMETER AdminCredential
     PSCredential for remote PowerShell execution on target hosts. Mandatory only when -Remediate is used.
 .PARAMETER Remediate
-    Switch to enable remediation (default: off; report-only). Requires -AdminCredential.
-.PARAMETER LaunchRescan
-    When used with -Remediate, requests a Qualys compliance rescan for hosts where a fixer reported Success.
+    Switch to enable remediation (default: $false; report-only mode).
 .EXAMPLE
-    $qualysCred = Get-Credential -Message 'Qualys API Credentials'
-    $adminCred = Get-Credential -Message 'Admin Credentials for Remoting'
-    .\CheckandRemediate.ps1 -QualysBaseUrl 'https://qualysapi.qualys.eu' -QualysCredential $qualysCred -AdminCredential $adminCred -Remediate -LaunchRescan
+    $qualysCredential = Get-Credential -Message 'Qualys API Credentials'
+    $adminCredential = Get-Credential -Message 'Admin Credentials for Remoting'
+    .\CheckandRemediate.ps1 -QualysBaseUrl 'https://qualysapi.qualys.eu' -QualysCredential $qualysCredential -AdminCredential $adminCredential -Remediate
 .EXAMPLE
     .\CheckandRemediate.ps1 -QualysBaseUrl 'https://qualysapi.qualys.eu' -QualysCredential (Import-Clixml 'C:\secure\qualys.cred') -PolicyId 99999
 .NOTES
-    Requires PowerShell 7.4+ for optimal performance.
+    Requires PowerShell 7.4+ for optimal performance. If modules are not available install them.
     Working directory: C:\temp\scripts
     Logs: C:\temp\scripts\logs\CheckandRemediate_<yyyyMMdd_HHmm>.log
     Reports: C:\temp\scripts\reports\FailedCompliance_<yyyyMMdd_HHmm>.csv
-    Dependencies: Invoke-RestMethod, Import-Csv, Invoke-Command, Test-WSMan.
-    Changelog:
-      - 2025-08-19: Switched Qualys call to POST with form body; added TLS 1.2 enforcement and retry with backoff.
-      - 2025-08-19: Added WinRM reachability check before Invoke-Command to avoid false positives from ICMP.
-      - 2025-08-19: ParamSets so AdminCredential is required only when -Remediate is used.
-      - 2025-08-19: Normalised CSV headers/values; added required-column validation; hardened grouping.
-      - 2025-08-19: Enforced UTF8 logging and report encoding; added Mode column to report.
-      - 2025-08-19: Fixers must be Authenticode-signed; signature validation and output contract normalisation.
-      - 2025-08-19: Optional -LaunchRescan to request Qualys compliance rescans after successful remediation.
-      - 2025-08-19: Progress reporting across remediation loop.
-      - 2025-08-19: Added Resolve-Header/Normalize-QualysRows to map header variants (e.g. 'IP Address', 'Reason for Failure', 'Evidence/Results') to canonical fields IP, ControlID, Evidence, Reason; improved error when headers do not match.
-      - 2025-08-19: Ensured all logging expands $CID correctly.
-      - 2025-08-19: Removed multi-section CSV handling in Get-FailedPostures as per provided CSV format starting directly with headers.
+    Dependencies: Invoke-RestMethod, Import-Csv, Invoke-Command.
+    Changelog: Initial version - 2025-08-19. Updated 2025-08-19: Added UTF8 encoding for logs and reports, hardcoded column names from guide, fixed variable interpolation in logs.
     Signed by Marinus van Deventer
 #>
-[CmdletBinding(DefaultParameterSetName = 'Report', SupportsShouldProcess = $false)]
+
+[CmdletBinding(DefaultParameterSetName = 'Report')]
 param (
     [Parameter(Mandatory = $true)]
     [ValidateNotNullOrEmpty()]
     [string]$QualysBaseUrl,
+
     [Parameter(Mandatory = $true)]
     [System.Management.Automation.PSCredential]$QualysCredential,
+
     [Parameter()]
     [int]$PolicyId = 99999,
+
     [Parameter()]
     [int]$TruncationLimit = 10000,
+
     [Parameter(Mandatory = $true, ParameterSetName = 'Remediate')]
     [System.Management.Automation.PSCredential]$AdminCredential,
+
     [Parameter(ParameterSetName = 'Remediate')]
-    [switch]$Remediate,
-    [Parameter(ParameterSetName = 'Remediate')]
-    [switch]$LaunchRescan
+    [switch]$Remediate
 )
+
 begin {
     #region Initialisation
     $ErrorActionPreference = 'Stop'
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    $workingDir = 'C:\temp\scripts'
-    $logsDir = Join-Path $workingDir 'logs'
-    $reportsDir = Join-Path $workingDir 'reports'
-    $fixersDir = Join-Path $workingDir 'fixers'
+    $workingDirectory = 'C:\temp\scripts'
+    $logsDirectory = Join-Path $workingDirectory 'logs'
+    $reportsDirectory = Join-Path $workingDirectory 'reports'
+    $fixersDirectory = Join-Path $workingDirectory 'fixers'
     $timestamp = Get-Date -Format 'yyyyMMdd_HHmm'
-    $logPath = Join-Path $logsDir "CheckandRemediate_$timestamp.log"
-    $reportPath = Join-Path $reportsDir "FailedCompliance_$timestamp.csv"
-    $csvPath = Join-Path $workingDir 'failed_postures.csv'
-    foreach ($dir in @($workingDir, $logsDir, $reportsDir, $fixersDir)) {
-        if (-not (Test-Path $dir -PathType Container)) {
-            New-Item -Path $dir -ItemType Directory -Force | Out-Null
+    $logPath = Join-Path $logsDirectory "CheckandRemediate_$timestamp.log"
+    $reportPath = Join-Path $reportsDirectory "FailedCompliance_$timestamp.csv"
+    $csvPath = Join-Path $workingDirectory 'failed_postures.csv'
+
+    foreach ($directory in @($workingDirectory, $logsDirectory, $reportsDirectory, $fixersDirectory)) {
+        if (-not (Test-Path $directory -PathType Container)) {
+            New-Item -Path $directory -ItemType Directory -Force | Out-Null
         }
     }
-    if (-not (Test-Path $logPath)) { New-Item -ItemType File -Path $logPath -Force | Out-Null }
-    Add-Content -Path $logPath -Value '' -Encoding UTF8
+
     function Write-Log {
-        param(
-            [Parameter(Mandatory = $true)][string]$Message,
-            [ValidateSet('INFO','WARNING','ERROR','DEBUG')][string]$Level = 'INFO'
+        param (
+            [Parameter(Mandatory = $true)]
+            [string]$Message,
+
+            [ValidateSet('INFO', 'WARNING', 'ERROR')]
+            [string]$Level = 'INFO'
         )
         $logEntry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [$Level] $Message"
         Write-Information $logEntry -InformationAction Continue
         Add-Content -Path $logPath -Value $logEntry -Encoding UTF8
     }
-    Write-Log "Script started. PSVersion=$($PSVersionTable.PSVersion) ParamSet=$($PSCmdlet.ParameterSetName)"
+
+    Write-Log "Script started. ParameterSetName=$($PSCmdlet.ParameterSetName)"
     #endregion
-    #region Helpers: Qualys, CSV normaliser, Fixers and Rescans
+
+    #region Helpers
     function Invoke-QualysRequest {
-        param(
-            [Parameter(Mandatory = $true)][string]$EndpointPath,
-            [Parameter(Mandatory = $true)][hashtable]$Body,
-            [Parameter()][string]$Accept = 'text/csv',
-            [Parameter()][string]$OutFile
+        param (
+            [Parameter(Mandatory = $true)]
+            [hashtable]$Body,
+
+            [string]$OutFile = $csvPath
         )
-        $auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$($QualysCredential.UserName):$($QualysCredential.GetNetworkCredential().Password)"))
-        $headers = @{
-            'Authorization' = "Basic $auth"
-            'Accept' = $Accept
-            'X-Requested-With' = 'PowerShell'
-        }
-        $uri = ($QualysBaseUrl.TrimEnd('/')) + $EndpointPath
-        $maxAttempts = 4
-        $attempt = 0
-        do {
-            $attempt++
-            try {
-                Write-Log "Qualys POST $EndpointPath (attempt $attempt)"
-                if ($OutFile) {
-                    Invoke-RestMethod -Uri $uri -Headers $headers -Method Post -ContentType 'application/x-www-form-urlencoded' -Body $Body -OutFile $OutFile -ErrorAction Stop
-                } else {
-                    return Invoke-RestMethod -Uri $uri -Headers $headers -Method Post -ContentType 'application/x-www-form-urlencoded' -Body $Body -ErrorAction Stop
-                }
-                break
-            } catch {
-                if ($attempt -ge $maxAttempts) { throw }
-                $delay = [math]::Pow(2, $attempt)
-                Write-Log "Qualys request failed: $($_.Exception.Message). Retrying in ${delay}s..." 'WARNING'
-                Start-Sleep -Seconds $delay
-            }
-        } while ($true)
-    }
-    function Get-FailedPostures {
         try {
-            $body = @{
-                action = 'list'
-                policy_id = $PolicyId
-                output_format = 'csv_no_metadata'
-                status = 'Failed'
-                details = 'All'
+            $authenticationString = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$($QualysCredential.UserName):$($QualysCredential.GetNetworkCredential().Password)"))
+            $headers = @{
+                'Authorization' = "Basic $authenticationString"
+                'Accept'        = 'text/csv'
+                'X-Requested-With' = 'PowerShell'
             }
-            if ($TruncationLimit -gt 0) { $body.truncation_limit = $TruncationLimit }
-            Invoke-QualysRequest -EndpointPath '/api/2.0/fo/compliance/posture/info/' -Body $body -OutFile $csvPath | Out-Null
-            $data = Import-Csv -Path $csvPath
-            if (-not $data -or $data.Count -eq 0) {
-                Write-Log 'No failed postures found.'
-                return @()
-            }
-            Write-Log "Retrieved $($data.Count) failed postures."
-            return $data
+            $uri = "$QualysBaseUrl/api/2.0/fo/compliance/posture/info/"
+            Invoke-RestMethod -Uri $uri -Headers $headers -Method Post -ContentType 'application/x-www-form-urlencoded' -Body $Body -OutFile $OutFile
         } catch {
-            Write-Log "API query failed: $($_.Exception.Message)" 'ERROR'
+            Write-Log "Qualys request failed: $($_.Exception.Message)" 'ERROR'
             throw
         }
     }
-    function Resolve-Header {
-        param(
-            [Parameter(Mandatory=$true)][string[]]$Available
-        )
-        # Map canonical -> list of acceptable aliases commonly seen in Qualys CSVs
-        $map = @{
-            IP = @('IP','IP Address','IP Address(es)','Host IP','Host IP Address','IP Address(es) List')
-            ControlID = @('Control ID','CID','Control ID (CID)','CID (Control ID)')
-            Evidence = @('Evidence','Evidence/Results','Instance Evidence','Evidence Value','Actual Value','Value','Finding')
-            Reason = @('Reason','Reason for Failure','Failure Reason','Reason/Recommendation','Rationale','Recommendation')
+
+    function Get-FailedPostures {
+        $body = @{
+            action = 'list'
+            policy_id = $PolicyId
+            output_format = 'csv_no_metadata'
+            status = 'Failed'
+            details = 'All'
         }
-        $resolved = @{}
-        foreach ($k in $map.Keys) {
-            $alias = $map[$k] | Where-Object { $_ -in $Available }
-            if ($alias) { $resolved[$k] = $alias[0] }
+        if ($TruncationLimit -gt 0) {
+            $body.truncation_limit = $TruncationLimit
         }
-        return $resolved
+        Invoke-QualysRequest -Body $body
+        $data = Import-Csv -Path $csvPath
+        if ($data.Count -eq 0) {
+            Write-Log "No failed postures found."
+            return @()
+        }
+        # Validate required columns
+        $requiredColumns = @('IP', 'Control ID', 'Posture Evidence', 'Reference')
+        $missingColumns = $requiredColumns | Where-Object { $_ -notin $data[0].PSObject.Properties.Name }
+        if ($missingColumns) {
+            Write-Log "Missing required columns: $($missingColumns -join ', ')" 'ERROR'
+            throw "CSV headers do not match expected format."
+        }
+        Write-Log "Retrieved $($data.Count) failed postures."
+        return $data
     }
-    function Normalize-QualysRows {
-        param(
-            [Parameter(Mandatory=$true)][object[]]$Rows
+
+    function Discover-Fixer {
+        param (
+            [Parameter(Mandatory = $true)]
+            [int]$ControlId
         )
-        if (-not $Rows -or $Rows.Count -eq 0) { return @() }
-        $headers = $Rows[0].PSObject.Properties.Name
-        $resolved = Resolve-Header -Available $headers
-        $requiredCanon = @('IP','ControlID','Evidence','Reason')
-        $missingCanon = $requiredCanon | Where-Object { $_ -notin $resolved.Keys }
-        if ($missingCanon) {
-            Write-Log "Detected CSV headers: $($headers -join ', ')" 'ERROR'
-            throw "CSV missing required columns (canonical): $($missingCanon -join ', '). Expected aliases exist among: $($requiredCanon -join ', ')"
-        }
-        $ipH = $resolved.IP
-        $cidH = $resolved.ControlID
-        $evH = $resolved.Evidence
-        $rsH = $resolved.Reason
-        $Rows | ForEach-Object {
-            [pscustomobject]@{
-                IP = $_.$ipH
-                ControlID = $_.$cidH
-                Evidence = $_.$evH
-                Reason = $_.$rsH
-            }
-        }
-    }
-    function Discover-Fixers {
-        param([Parameter(Mandatory = $true)][int]$CID)
-        $fixerFiles = Get-ChildItem -Path $fixersDir -Filter "$CID-*.ps1" -File | Sort-Object Name
-        if (-not $fixerFiles) {
-            Write-Log "No fixer found for CID $CID."
+        $fixerPath = Get-ChildItem -Path $fixersDirectory -Filter "$ControlId-*.ps1" -File | Select-Object -First 1 -ExpandProperty FullName
+        if (-not $fixerPath) {
+            Write-Log "No fixer found for Control ID $ControlId."
             return $null
         }
-        $candidate = $fixerFiles[0].FullName
-        $sig = Get-AuthenticodeSignature -FilePath $candidate
-        if ($sig.Status -ne 'Valid') {
-            Write-Log "Fixer $candidate has invalid or missing signature: $($sig.Status). Skipping." 'WARNING'
-            return $null
-        }
-        Write-Log "Discovered signed fixer: $candidate for CID $CID."
-        $scriptText = Get-Content $candidate -Raw
-        return [scriptblock]::Create($scriptText)
+        Write-Log "Discovered fixer: $fixerPath for Control ID $ControlId."
+        $scriptContent = Get-Content -Path $fixerPath -Raw
+        return [scriptblock]::Create($scriptContent)
     }
-    function Invoke-HostRescan {
-        param(
-            [Parameter(Mandatory = $true)][string]$HostIP
-        )
-        try {
-            $body = @{
-                action = 'launch'
-                scan_title = "AutoRescan_$($HostIP)_$([DateTime]::UtcNow.ToString('yyyyMMdd_HHmmss'))"
-                ip = $HostIP
-                priority = 'Normal'
-            }
-            Invoke-QualysRequest -EndpointPath '/api/2.0/fo/scan/compliance/' -Body $body -Accept 'application/xml' | Out-Null
-            Write-Log "Requested Qualys compliance rescan for $HostIP."
-            return $true
-        } catch {
-            Write-Log "Failed to request Qualys rescan for $HostIP: $($_.Exception.Message)" 'WARNING'
-            return $false
-        }
-    }
-    function Test-HostForRemoting {
-        param([Parameter(Mandatory = $true)][string]$HostIP)
-        if (-not (Test-Connection -ComputerName $HostIP -Count 1 -Quiet)) {
-            return 'Host Offline'
-        }
-        try {
-            Test-WSMan -ComputerName $HostIP -Authentication Default -ErrorAction Stop | Out-Null
-            return 'OK'
-        } catch {
-            return 'WinRM Unreachable'
-        }
-    }
+
     function Remediate-Host {
         param (
-            [Parameter(Mandatory = $true)][string]$HostIP,
-            [Parameter(Mandatory = $true)][int]$CID,
-            [Parameter()][object]$Evidence
+            [Parameter(Mandatory = $true)]
+            [string]$HostIp,
+
+            [Parameter(Mandatory = $true)]
+            [int]$ControlId,
+
+            [Parameter(Mandatory = $true)]
+            [string]$Evidence
         )
-        $outcome = [PSCustomObject]@{
-            HostIP = $HostIP
-            CID = $CID
+        $outcomeObject = [PSCustomObject]@{
+            HostIp = $HostIp
+            ControlId = $ControlId
             FixAttempted = 'No'
             Outcome = 'Not Attempted'
             Details = ''
         }
-        $reach = Test-HostForRemoting -HostIP $HostIP
-        if ($reach -ne 'OK') {
-            $outcome.Outcome = $reach
-            $outcome.Details = 'Skipping remediation.'
-            Write-Log "Remediation skipped for $HostIP CID $CID: $reach" 'WARNING'
-            return $outcome
+
+        if (-not (Test-Connection -ComputerName $HostIp -Count 1 -Quiet)) {
+            $outcomeObject.Outcome = 'Host Offline'
+            $outcomeObject.Details = 'Skipping remediation.'
+            Write-Log "Host $HostIp offline for Control ID $ControlId." 'WARNING'
+            return $outcomeObject
         }
-        $fixerBlock = Discover-Fixers -CID $CID
+
+        $fixerBlock = Discover-Fixer -ControlId $ControlId
         if (-not $fixerBlock) {
-            $outcome.Outcome = 'No Fixer Available'
-            return $outcome
+            $outcomeObject.Outcome = 'No Fixer Available'
+            return $outcomeObject
         }
-        if ($Remediate) {
+
+        if ($Remediate.IsPresent) {
             try {
-                $result = Invoke-Command -ComputerName $HostIP -Credential $AdminCredential -ScriptBlock $fixerBlock -ErrorAction Stop
-                $outcome.FixAttempted = 'Yes'
-                if ($null -eq $result) { $result = [pscustomobject]@{ Outcome='Succeeded'; Details='No details.' } }
-                if (-not $result.PSObject.Properties.Match('Outcome')) { $result | Add-Member -NotePropertyName Outcome -NotePropertyValue 'Unknown' }
-                if (-not $result.PSObject.Properties.Match('Details')) { $result | Add-Member -NotePropertyName Details -NotePropertyValue '' }
-                $outcome.Outcome = [string]$result.Outcome
-                $outcome.Details = [string]$result.Details
-                Write-Log "Remediation on $HostIP for CID $CID: $($outcome.Outcome)"
+                $result = Invoke-Command -ComputerName $HostIp -Credential $AdminCredential -ScriptBlock $fixerBlock -ArgumentList $Evidence -ErrorAction Stop
+                $outcomeObject.FixAttempted = 'Yes'
+                $outcomeObject.Outcome = $result.Outcome
+                $outcomeObject.Details = $result.Details
+                Write-Log "Remediation on $HostIp for Control ID $ControlId: $($outcomeObject.Outcome)"
             } catch {
-                $outcome.Outcome = 'Failed'
-                $outcome.Details = $_.Exception.Message
-                Write-Log "Remediation failed on $HostIP for CID $CID: $($outcome.Details)" 'ERROR'
+                $outcomeObject.Outcome = 'Failed'
+                $outcomeObject.Details = $_.Exception.Message
+                Write-Log "Remediation failed on $HostIp for Control ID $ControlId: $($outcomeObject.Details)" 'ERROR'
             }
         } else {
-            Write-Log "Dry-run: Would attempt remediation on $HostIP for CID $CID."
+            Write-Log "Dry-run: Would attempt remediation on $HostIp for Control ID $ControlId."
         }
-        return $outcome
+
+        return $outcomeObject
     }
     #endregion
 }
+
 process {
     try {
-        $posturesRaw = Get-FailedPostures
-        if (-not $posturesRaw -or $posturesRaw.Count -eq 0) { return }
-        # Normalise to canonical columns
-        $postures = Normalize-QualysRows -Rows $posturesRaw
-        # Filter out rows with null/empty IP and non-numeric ControlIDs
-        $postures = $postures |
-            Where-Object { -not [string]::IsNullOrEmpty($_.IP) } |
-            Where-Object { $_.ControlID -match '^\d+$' }
-        # Group by host IP and CID
-        $grouped = $postures |
-            Group-Object -Property IP | ForEach-Object {
-                $hostIP = $_.Name
-                $_.Group | Group-Object -Property ControlID | ForEach-Object {
-                    [PSCustomObject]@{
-                        HostIP = $hostIP
-                        CID = [int]$_.Name
-                        Evidence = ($_.Group | ForEach-Object { $_.Evidence } | Where-Object { $_ } | Select-Object -Unique) -join '; '
-                        Reason = ($_.Group | ForEach-Object { $_.Reason } | Where-Object { $_ } | Select-Object -Unique) -join '; '
-                    }
+        $postures = Get-FailedPostures
+        if ($postures.Count -eq 0) { return }
+
+        # Filter invalid rows
+        $postures = $postures | Where-Object { -not [string]::IsNullOrEmpty($_.IP) -and $_. 'Control ID' -match '^\d+$' }
+
+        # Group by IP and Control ID
+        $grouped = $postures | Group-Object -Property IP | ForEach-Object {
+            $hostIp = $_.Name
+            $_.Group | Group-Object -Property 'Control ID' | ForEach-Object {
+                [PSCustomObject]@{
+                    HostIp = $hostIp
+                    ControlId = [int]$_.Name
+                    Evidence = $_.Group.'Posture Evidence' -join '; '
+                    Reason = $_.Group.Reference -join '; '
                 }
             }
-        $results = New-Object System.Collections.Generic.List[object]
-        $total = ($grouped | Measure-Object).Count
-        $i = 0
+        }
+
+        $results = @()
         foreach ($item in $grouped) {
-            $i++
-            Write-Progress -Activity 'Remediation' -Status "Processing $($item.HostIP) CID $($item.CID)" -PercentComplete ([int](($i/$total)*100))
-            $remediation = Remediate-Host -HostIP $item.HostIP -CID $item.CID -Evidence $item.Evidence
-            if ($Remediate -and $LaunchRescan -and $remediation.Outcome -match '^(Succeeded|Success|Fixed)$') {
-                [void](Invoke-HostRescan -HostIP $item.HostIP)
-            }
-            $results.Add([PSCustomObject]@{
-                HostIP = $item.HostIP
-                CID = $item.CID
+            $remediation = Remediate-Host -HostIp $item.HostIp -ControlId $item.ControlId -Evidence $item.Evidence
+            $results += [PSCustomObject]@{
+                HostIp = $item.HostIp
+                ControlId = $item.ControlId
                 Evidence = $item.Evidence
                 Reason = $item.Reason
                 FixAttempted = $remediation.FixAttempted
                 Outcome = $remediation.Outcome
                 Details = $remediation.Details
-            })
+            }
         }
-        Write-Progress -Activity 'Remediation' -Completed -Status 'Done'
-        $mode = if ($Remediate) { 'Remediate' } else { 'Report' }
-        $results |
-            Select-Object @{n='Mode';e={$mode}}, HostIP, CID, Evidence, Reason, FixAttempted, Outcome, Details |
-            Export-Csv -Path $reportPath -NoTypeInformation -Encoding UTF8
-        Write-Log "Report generated: $reportPath"
+
+        $results | Export-Csv -Path $reportPath -NoTypeInformation -Encoding UTF8
+        Write-Log "Report generated at $reportPath."
     } catch {
         Write-Log "Process failed: $($_.Exception.Message)" 'ERROR'
         throw
     }
 }
+
 end {
     if (Test-Path $csvPath) { Remove-Item $csvPath -Force }
-    Write-Log 'Script completed.'
+    Write-Log "Script completed."
 }
+
 # Signed by Marinus van Deventer
