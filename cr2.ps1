@@ -4,8 +4,8 @@
 
 .DESCRIPTION
     Connects to the Qualys API using a service account, retrieves failed compliance data for a specified policy, parses the CSV output,
-    groups by host and CID, generates a report, and (if -Remediate is specified) attempts fixes on online hosts via remote PowerShell.
-    Fixers are discovered dynamically from the 'fixers' subfolder and must be Authenticode-signed. Designed for scheduled runs; logs all actions.
+    normalises columns to canonical names, groups by host and CID, generates a report, and (if -Remediate is specified) attempts fixes
+    on online hosts via remote PowerShell. Fixers are discovered dynamically from the 'fixers' subfolder and must be Authenticode-signed.
     Optionally, upon successful remediation, can request a Qualys compliance rescan for the host when -LaunchRescan is provided.
 
 .PARAMETER QualysBaseUrl
@@ -30,13 +30,11 @@
     When used with -Remediate, requests a Qualys compliance rescan for hosts where a fixer reported Success.
 
 .EXAMPLE
-    # Interactive run with remediation and rescans
     $qualysCred = Get-Credential -Message 'Qualys API Credentials'
     $adminCred = Get-Credential -Message 'Admin Credentials for Remoting'
     .\CheckandRemediate.ps1 -QualysBaseUrl 'https://qualysapi.qualys.eu' -QualysCredential $qualysCred -AdminCredential $adminCred -Remediate -LaunchRescan
 
 .EXAMPLE
-    # Scheduled dry-run (report only)
     .\CheckandRemediate.ps1 -QualysBaseUrl 'https://qualysapi.qualys.eu' -QualysCredential (Import-Clixml 'C:\secure\qualys.cred') -PolicyId 99999
 
 .NOTES
@@ -52,9 +50,11 @@
       - 2025-08-19: ParamSets so AdminCredential is required only when -Remediate is used.
       - 2025-08-19: Normalised CSV headers/values; added required-column validation; hardened grouping.
       - 2025-08-19: Enforced UTF8 logging and report encoding; added Mode column to report.
-      - 2025-08-19: Fixers must be Authenticode-signed; added signature validation and output contract normalisation.
+      - 2025-08-19: Fixers must be Authenticode-signed; signature validation and output contract normalisation.
       - 2025-08-19: Optional -LaunchRescan to request Qualys compliance rescans after successful remediation.
       - 2025-08-19: Progress reporting across remediation loop.
+      - 2025-08-19: Added Resolve-Header/Normalize-QualysRows to map header variants (e.g. 'IP Address', 'Reason for Failure', 'Evidence/Results') to canonical fields IP, ControlID, Evidence, Reason; improved error when headers do not match.
+      - 2025-08-19: Ensured all logging expands $CID correctly.
 
     Signed by Marinus van Deventer
 #>
@@ -117,7 +117,6 @@ begin {
     }
 
     Write-Log "Script started. PSVersion=$($PSVersionTable.PSVersion) ParamSet=$($PSCmdlet.ParameterSetName)"
-    Write-Verbose "WorkingDir=$workingDir Logs=$logPath Reports=$reportPath"
     #endregion
 
     #region Helpers: Qualys, CSV normaliser, Fixers and Rescans
@@ -176,7 +175,7 @@ begin {
                 return @()
             }
 
-            # Normalise headers and values (trim and remove BOM)
+            # Trim BOM, whitespace
             $data = $raw | ForEach-Object {
                 $o = [ordered]@{}
                 foreach ($p in $_.PSObject.Properties) {
@@ -192,6 +191,55 @@ begin {
         } catch {
             Write-Log "API query failed: $($_.Exception.Message)" 'ERROR'
             throw
+        }
+    }
+
+    function Resolve-Header {
+        param(
+            [Parameter(Mandatory=$true)][string[]]$Available
+        )
+        # Map canonical -> list of acceptable aliases commonly seen in Qualys CSVs
+        $map = @{
+            IP         = @('IP','IP Address','IP Address(es)','Host IP','Host IP Address','IP Address(es) List')
+            ControlID  = @('Control ID','CID','Control ID (CID)','CID (Control ID)')
+            Evidence   = @('Evidence','Evidence/Results','Instance Evidence','Evidence Value','Actual Value','Value','Finding')
+            Reason     = @('Reason','Reason for Failure','Failure Reason','Reason/Recommendation','Rationale','Recommendation')
+        }
+        $resolved = @{}
+        foreach ($k in $map.Keys) {
+            $alias = $map[$k] | Where-Object { $_ -in $Available }
+            if ($alias) { $resolved[$k] = $alias[0] }
+        }
+        return $resolved
+    }
+
+    function Normalize-QualysRows {
+        param(
+            [Parameter(Mandatory=$true)][object[]]$Rows
+        )
+        if (-not $Rows -or $Rows.Count -eq 0) { return @() }
+        $headers = $Rows[0].PSObject.Properties.Name
+        $resolved = Resolve-Header -Available $headers
+
+        $requiredCanon = @('IP','ControlID','Evidence','Reason')
+        $missingCanon = $requiredCanon | Where-Object { $_ -notin $resolved.Keys }
+        if ($missingCanon) {
+            Write-Log "Detected CSV headers: $($headers -join ', ')" 'ERROR'
+            throw "CSV missing required columns (canonical): $($missingCanon -join ', '). Expected aliases exist among: $($requiredCanon -join ', ')"
+        }
+
+        $ipH   = $resolved.IP
+        $cidH  = $resolved.ControlID
+        $evH   = $resolved.Evidence
+        $rsH   = $resolved.Reason
+
+        $Rows | ForEach-Object {
+            [pscustomobject]@{
+                IP        = $_.$ipH
+                ControlID = $_.$cidH
+                Evidence  = $_.$evH
+                Reason    = $_.$rsH
+            }
         }
     }
 
@@ -218,15 +266,12 @@ begin {
             [Parameter(Mandatory = $true)][string]$HostIP
         )
         try {
-            # Launch a compliance scan by IP. Adjust option_title/option_id in your environment if needed.
             $body = @{
-                action       = 'launch'
-                scan_title   = "AutoRescan_$($HostIP)_$([DateTime]::UtcNow.ToString('yyyyMMdd_HHmmss'))"
-                ip           = $HostIP
-                iscanner_name = ''  # optional: specify if you require a specific scanner appliance
-                priority     = 'Normal'
+                action        = 'launch'
+                scan_title    = "AutoRescan_$($HostIP)_$([DateTime]::UtcNow.ToString('yyyyMMdd_HHmmss'))"
+                ip            = $HostIP
+                priority      = 'Normal'
             }
-            # The compliance scan endpoint:
             Invoke-QualysRequest -EndpointPath '/api/2.0/fo/scan/compliance/' -Body $body -Accept 'application/xml' | Out-Null
             Write-Log "Requested Qualys compliance rescan for $HostIP."
             return $true
@@ -303,24 +348,22 @@ begin {
 
 process {
     try {
-        $postures = Get-FailedPostures
-        if (-not $postures -or $postures.Count -eq 0) { return }
+        $posturesRaw = Get-FailedPostures
+        if (-not $posturesRaw -or $posturesRaw.Count -eq 0) { return }
 
-        # Validate that expected columns exist
-        $required = @('IP','Control ID','Evidence','Reason')
-        $missing = $required | Where-Object { $_ -notin $postures[0].PSObject.Properties.Name }
-        if ($missing) { throw "CSV missing required columns: $($missing -join ', ')" }
+        # Normalise to canonical columns
+        $postures = Normalize-QualysRows -Rows $posturesRaw
 
-        # Filter out rows with null/empty IP and non-numeric CIDs
+        # Filter out rows with null/empty IP and non-numeric ControlIDs
         $postures = $postures |
             Where-Object { -not [string]::IsNullOrEmpty($_.IP) } |
-            Where-Object { $_.'Control ID' -match '^\d+$' }
+            Where-Object { $_.ControlID -match '^\d+$' }
 
         # Group by host IP and CID
         $grouped = $postures |
             Group-Object -Property IP | ForEach-Object {
                 $hostIP = $_.Name
-                $_.Group | Group-Object -Property 'Control ID' | ForEach-Object {
+                $_.Group | Group-Object -Property ControlID | ForEach-Object {
                     [PSCustomObject]@{
                         HostIP   = $hostIP
                         CID      = [int]$_.Name
