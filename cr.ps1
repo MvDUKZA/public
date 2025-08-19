@@ -23,9 +23,6 @@
 .PARAMETER Remediate
     Switch to enable remediation (default: $false; dry-run mode logs what would happen).
 
-.PARAMETER WhatIf
-    Switch to simulate remediation without executing fixes (works with -Remediate).
-
 .EXAMPLE
     # Interactive run with remediation
     $qualysCred = Get-Credential -Message 'Qualys API Credentials'
@@ -42,11 +39,11 @@
     Logs: C:\temp\scripts\logs\CheckandRemediate_<yyyyMMdd_HHmm>.log
     Reports: C:\temp\scripts\reports\FailedCompliance_<yyyyMMdd_HHmm>.csv
     Dependencies: Invoke-RestMethod, Import-Csv, Invoke-Command.
-    Changelog: Initial version - August 19, 2025.
+    Changelog: Initial version - August 19, 2025. Updated August 19, 2025: Fixed variable interpolation error in logging; removed -WhatIf support.
     Signed by Marinus van Deventer
 #>
 
-[CmdletBinding(SupportsShouldProcess = $true)]
+[CmdletBinding()]
 param (
     [Parameter(Mandatory = $true)]
     [ValidateNotNullOrEmpty()]
@@ -64,9 +61,7 @@ param (
     [Parameter(Mandatory = $true)]
     [System.Management.Automation.PSCredential]$AdminCredential,
 
-    [switch]$Remediate,
-
-    [switch]$WhatIf
+    [switch]$Remediate
 )
 
 begin {
@@ -165,20 +160,16 @@ begin {
         }
 
         if ($Remediate) {
-            if ($PSCmdlet.ShouldProcess("Host $HostIP, CID $CID", 'Execute remediation')) {
-                try {
-                    $result = Invoke-Command -ComputerName $HostIP -Credential $AdminCredential -ScriptBlock $fixerBlock -ErrorAction Stop
-                    $outcome.FixAttempted = 'Yes'
-                    $outcome.Outcome = $result.Outcome
-                    $outcome.Details = $result.Details
-                    Write-Log "Remediation on $HostIP for CID $CID: $($outcome.Outcome)"
-                } catch {
-                    $outcome.Outcome = 'Failed'
-                    $outcome.Details = $_.Exception.Message
-                    Write-Log "Remediation failed on $HostIP for CID $CID: $($outcome.Details)" 'ERROR'
-                }
-            } else {
-                Write-Log "WhatIf: Would remediate $HostIP for CID $CID."
+            try {
+                $result = Invoke-Command -ComputerName $HostIP -Credential $AdminCredential -ScriptBlock $fixerBlock -ErrorAction Stop
+                $outcome.FixAttempted = 'Yes'
+                $outcome.Outcome = $result.Outcome
+                $outcome.Details = $result.Details
+                Write-Log "Remediation on $HostIP for CID $CID: $($outcome.Outcome)"
+            } catch {
+                $outcome.Outcome = 'Failed'
+                $outcome.Details = $_.Exception.Message
+                Write-Log "Remediation failed on $HostIP for CID ${CID}: $($outcome.Details)" 'ERROR'
             }
         } else {
             Write-Log "Dry-run: Would attempt remediation on $HostIP for CID $CID."
