@@ -34,12 +34,12 @@
     .\CheckandRemediate.ps1 -QualysBaseUrl 'https://qualysapi.qualys.eu' -QualysCredential (Import-Clixml 'C:\secure\qualys.cred') -PolicyId 99999
 
 .NOTES
-    Requires PowerShell 7.4+ for optimal performance (e.g., -Parallel). If modules like MicrosoftDefender are missing, they are installed automatically.
+    Requires PowerShell 7.4+ for optimal performance. If modules like MicrosoftDefender are missing, they are installed automatically.
     Working directory: C:\temp\scripts
     Logs: C:\temp\scripts\logs\CheckandRemediate_<yyyyMMdd_HHmm>.log
     Reports: C:\temp\scripts\reports\FailedCompliance_<yyyyMMdd_HHmm>.csv
     Dependencies: Invoke-RestMethod, Import-Csv, Invoke-Command.
-    Changelog: Initial version - August 19, 2025. Updated August 19, 2025: Fixed variable interpolation error in logging; removed -WhatIf support. Updated August 19, 2025: Added 'X-Requested-With' header to API requests for compliance with Qualys requirements.
+    Changelog: Initial version - August 19, 2025. Updated August 19, 2025: Fixed variable interpolation error in logging; removed -WhatIf support. Updated August 19, 2025: Added 'X-Requested-With' header to API requests for compliance with Qualys requirements. Updated August 19, 2025: Changed output_format to lowercase 'csv_no_metadata'; added -Header to Import-Csv for proper parsing; switched to sequential processing to resolve function scope issues in parallel blocks.
     Signed by Marinus van Deventer
 #>
 
@@ -102,10 +102,10 @@ begin {
                 'Accept'        = 'text/csv'
                 'X-Requested-With' = 'PowerShell'
             }
-            $uri = "$QualysBaseUrl/api/2.0/fo/compliance/posture/info/?action=list&policy_id=$PolicyId&output_format=CSV_NO_METADATA&status=Failed&details=All&truncation_limit=$TruncationLimit"
+            $uri = "$QualysBaseUrl/api/2.0/fo/compliance/posture/info/?action=list&policy_id=$PolicyId&output_format=csv_no_metadata&status=Failed&details=All&truncation_limit=$TruncationLimit"
             Write-Log "Querying Qualys API: $uri"
             Invoke-RestMethod -Uri $uri -Headers $headers -Method Get -OutFile $csvPath
-            $data = Import-Csv -Path $csvPath
+            $data = Import-Csv -Path $csvPath -Header 'Policy ID','Host ID','IP','DNS','NetBIOS','Tracking Method','OS','Instance','Control ID','Status','Reason','Evidence','Last Evaluation'
             if ($data.Count -eq 0) {
                 Write-Log 'No failed postures found.'
                 return @()
@@ -190,7 +190,7 @@ process {
         # Group by host IP and CID
         $grouped = $postures | Group-Object -Property IP | ForEach-Object {
             $hostIP = $_.Name
-            $_.Group | Group-Object -Property CID | ForEach-Object {
+            $_.Group | Group-Object -Property 'Control ID' | ForEach-Object {
                 [PSCustomObject]@{
                     HostIP   = $hostIP
                     CID      = [int]$_.Name
@@ -200,33 +200,16 @@ process {
             }
         }
 
-        # Process in parallel if PS7+
-        if ($PSVersionTable.PSVersion.Major -ge 7) {
-            $results = $grouped | ForEach-Object -Parallel {
-                Import-Module -Name $using:workingDir -ErrorAction SilentlyContinue # Re-import if needed
-                $remediation = Remediate-Host -HostIP $_.HostIP -CID $_.CID -Evidence $_.Evidence
-                [PSCustomObject]@{
-                    HostIP    = $_.HostIP
-                    CID       = $_.CID
-                    Evidence  = $_.Evidence
-                    Reason    = $_.Reason
-                    FixAttempted = $remediation.FixAttempted
-                    Outcome   = $remediation.Outcome
-                    Details   = $remediation.Details
-                }
-            } -ThrottleLimit 5
-        } else {
-            $results = $grouped | ForEach-Object {
-                $remediation = Remediate-Host -HostIP $_.HostIP -CID $_.CID -Evidence $_.Evidence
-                [PSCustomObject]@{
-                    HostIP    = $_.HostIP
-                    CID       = $_.CID
-                    Evidence  = $_.Evidence
-                    Reason    = $_.Reason
-                    FixAttempted = $remediation.FixAttempted
-                    Outcome   = $remediation.Outcome
-                    Details   = $remediation.Details
-                }
+        $results = $grouped | ForEach-Object {
+            $remediation = Remediate-Host -HostIP $_.HostIP -CID $_.CID -Evidence $_.Evidence
+            [PSCustomObject]@{
+                HostIP    = $_.HostIP
+                CID       = $_.CID
+                Evidence  = $_.Evidence
+                Reason    = $_.Reason
+                FixAttempted = $remediation.FixAttempted
+                Outcome   = $remediation.Outcome
+                Details   = $remediation.Details
             }
         }
 
