@@ -39,7 +39,7 @@
     Logs: C:\temp\scripts\logs\CheckandRemediate_<yyyyMMdd_HHmm>.log
     Reports: C:\temp\scripts\reports\FailedCompliance_<yyyyMMdd_HHmm>.csv
     Dependencies: Invoke-RestMethod, Import-Csv, Invoke-Command.
-    Changelog: Initial version - August 19, 2025. Updated August 19, 2025: Fixed variable interpolation error in logging; removed -WhatIf support.
+    Changelog: Initial version - August 19, 2025. Updated August 19, 2025: Fixed variable interpolation error in logging; removed -WhatIf support. Updated August 19, 2025: Added 'X-Requested-With' header to API requests for compliance with Qualys requirements.
     Signed by Marinus van Deventer
 #>
 
@@ -100,6 +100,7 @@ begin {
             $headers = @{
                 'Authorization' = "Basic $auth"
                 'Accept'        = 'text/csv'
+                'X-Requested-With' = 'PowerShell'
             }
             $uri = "$QualysBaseUrl/api/2.0/fo/compliance/posture/info/?action=list&policy_id=$PolicyId&output_format=CSV_NO_METADATA&status=Failed&details=All&truncation_limit=$TruncationLimit"
             Write-Log "Querying Qualys API: $uri"
