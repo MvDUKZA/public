@@ -42,15 +42,11 @@
     Working directory: C:\temp\scripts
     Logs: C:\temp\scripts\logs\CheckandRemediate_<yyyyMMdd_HHmm>.log
     Reports: C:\temp\scripts\reports\FailedCompliance_<yyyyMMdd_HHmm>.csv
-    Dependencies: Invoke-RestMethod, Import-Csv, Invoke-Command, Test-WSMan.
 
     Changelog (latest first):
-      - 2025-08-19: Fixed CSV wrapper handling (BEGIN/END markers) and optional ZIP response; now reliably extracts a clean CSV for Import-Csv.
-      - 2025-08-19: Header resolver now REQUIRES only IP + ControlID; Evidence/Reason are optional and default to empty if absent.
-      - 2025-08-19: Improved error messages to include first 5 header names and sample first data line when schema cannot be resolved.
-      - 2025-08-19: Guarded grouping and filtering against missing fields; removed hard throws that caused line 279/315/334 stops.
-      - 2025-08-19: Import Test-WSMan module for PS 7.5.2; more robust remoting checks.
-      - 2025-08-19: Previous changes retained (POST + retry/backoff, TLS1.2, signed fixers, UTF8 logs/reports, progress, -LaunchRescan).
+      - 2025-08-19: FIX PowerShell 7.5.2 encoding error. Rewrote Unwrap-QualysCsv to use byte-safe reads and UTF-8 text handling. Removed invalid -Encoding Byte usage.
+      - 2025-08-19: CSV wrappers/ZIP handling retained; header resolver requires IP+ControlID only; Evidence/Reason optional.
+      - 2025-08-19: Better diagnostics if schema cannot be resolved; PS 7.5.2 WSMan import retained.
 
     Signed by Marinus van Deventer
 #>
@@ -160,11 +156,12 @@ begin {
             [Parameter(Mandatory=$true)][string]$RawPath,
             [Parameter(Mandatory=$true)][string]$CsvPath
         )
-        # Handle ZIP responses (PK header)
+        # Detect ZIP by magic header PK
         $fs = [IO.File]::OpenRead($RawPath)
         try {
             $b0 = $fs.ReadByte(); $b1 = $fs.ReadByte(); $fs.Position = 0
         } finally { $fs.Dispose() }
+
         if ($b0 -eq 0x50 -and $b1 -eq 0x4B) {
             $tmp = Join-Path (Split-Path $CsvPath -Parent) ("unz_" + [guid]::NewGuid().Guid)
             New-Item -ItemType Directory -Path $tmp | Out-Null
@@ -176,17 +173,22 @@ begin {
             Remove-Item $tmp -Recurse -Force
             return
         }
-        # Strip Qualys wrapper lines and keep only CSV
-        $lines = Get-Content -Path $RawPath -Encoding Byte -Raw | ForEach-Object {[Text.Encoding]::UTF8.GetString($_)} # ensure UTF8
-        if (-not $lines) { throw "Empty response body." }
-        $lines = ($lines -split "`r?`n")
-        # Remove markers like ----BEGIN_RESPONSE..., ----END_RESPONSE...
+
+        # Non-ZIP: read raw bytes and decode as UTF-8 text
+        $bytes = [IO.File]::ReadAllBytes($RawPath)
+        $text  = [Text.Encoding]::UTF8.GetString($bytes)
+        if ([string]::IsNullOrWhiteSpace($text)) { throw "Empty response body." }
+
+        # Strip Qualys ----BEGIN_/----END_ wrapper lines, keep only CSV section
+        $lines = $text -split "`r?`n"
         $lines = $lines | Where-Object { $_ -and ($_ -notmatch '^----BEGIN_') -and ($_ -notmatch '^----END_') }
-        # Start at first line that looks like CSV header (contains a comma)
+        # From first line that looks like CSV header (contains at least one comma)
         $start = 0
         for ($i=0; $i -lt $lines.Count; $i++) { if ($lines[$i] -like '*,*') { $start = $i; break } }
         $clean = $lines[$start..($lines.Count-1)]
-        Set-Content -Path $CsvPath -Value $clean -Encoding UTF8
+
+        # Write out as UTF-8
+        Set-Content -Path $CsvPath -Value ($clean -join [Environment]::NewLine) -Encoding UTF8
     }
 
     function Get-FailedPostures {
@@ -209,7 +211,7 @@ begin {
                 return @()
             }
 
-            # Trim BOM, whitespace
+            # Trim BOM and whitespace on both headers and values
             $data = $raw | ForEach-Object {
                 $o = [ordered]@{}
                 foreach ($p in $_.PSObject.Properties) {
@@ -253,7 +255,7 @@ begin {
         $headers = $Rows[0].PSObject.Properties.Name
         $resolved = Resolve-Header -Available $headers
 
-        # Only IP and ControlID are truly required to act; Evidence/Reason are optional.
+        # Only IP and ControlID are required to act; Evidence/Reason are optional.
         $requiredCanon = @('IP','ControlID')
         $missingCanon = $requiredCanon | Where-Object { $_ -notin $resolved.Keys }
         if ($missingCanon) {
