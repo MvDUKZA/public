@@ -1,0 +1,234 @@
+<#
+.SYNOPSIS
+    Pull Qualys failed postures, run per-CID fixers per machine, and report.
+
+.DESCRIPTION
+    - Downloads a plain CSV of failed postures for one policy from Qualys.
+    - Cleans any preamble lines until the real header: ID,IP,OS,DNS Name.
+    - Uses fixed CSV columns exactly as provided by Qualys:
+        IP, DNS Name, Control ID, Posture Evidence, Reason for Failure
+    - Groups by target (IP preferred, else DNS Name) and Control ID (CID).
+    - If -Remediate is used, looks for a fixer at C:\temp\scripts\fixers\<CID>-*.ps1
+      and runs it remotely on that target using -AdminCredential.
+    - Writes C:\temp\scripts\reports\FailedCompliance_<timestamp>.csv
+
+.PARAMETER QualysBaseUrl
+    Qualys API base URL (e.g. https://qualysapi.qualys.eu).
+
+.PARAMETER QualysCredential
+    PSCredential for Qualys API.
+
+.PARAMETER PolicyId
+    Qualys policy ID (default 99999).
+
+.PARAMETER TruncationLimit
+    Max records (default 10000; set 0 to omit).
+
+.PARAMETER AdminCredential
+    Credential for PowerShell Remoting to targets (required with -Remediate).
+
+.PARAMETER Remediate
+    Run fixers for each target/CID if a matching fixer script exists.
+
+.EXAMPLE
+    $q = Get-Credential
+    $a = Get-Credential
+    .\CheckAndRemediate.ps1 -QualysBaseUrl https://qualysapi.qualys.eu -QualysCredential $q -PolicyId 99999 -AdminCredential $a -Remediate
+
+.NOTES
+    PowerShell 7.5.2. Working dir: C:\temp\scripts
+    Logs:   C:\temp\scripts\logs\CheckAndRemediate_<yyyyMMdd_HHmm>.log
+    Report: C:\temp\scripts\reports\FailedCompliance_<yyyyMMdd_HHmm>.csv
+
+    Signed by Marinus van Deventer
+#>
+
+[CmdletBinding(DefaultParameterSetName='Report')]
+param(
+    [Parameter(Mandatory=$true)][ValidateNotNullOrEmpty()][string]$QualysBaseUrl,
+    [Parameter(Mandatory=$true)][System.Management.Automation.PSCredential]$QualysCredential,
+    [int]$PolicyId = 99999,
+    [int]$TruncationLimit = 10000,
+
+    [Parameter(Mandatory=$true, ParameterSetName='Remediate')]
+    [System.Management.Automation.PSCredential]$AdminCredential,
+
+    [Parameter(ParameterSetName='Remediate')]
+    [switch]$Remediate
+)
+
+begin {
+    $ErrorActionPreference = 'Stop'
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+    $workingDir  = 'C:\temp\scripts'
+    $logsDir     = Join-Path $workingDir 'logs'
+    $reportsDir  = Join-Path $workingDir 'reports'
+    $fixersDir   = Join-Path $workingDir 'fixers'
+    foreach ($d in @($workingDir,$logsDir,$reportsDir,$fixersDir)) {
+        if (-not (Test-Path $d -PathType Container)) { New-Item -Path $d -ItemType Directory -Force | Out-Null }
+    }
+
+    $stamp      = Get-Date -Format 'yyyyMMdd_HHmm'
+    $logPath    = Join-Path $logsDir    "CheckAndRemediate_$stamp.log"
+    $reportPath = Join-Path $reportsDir "FailedCompliance_$stamp.csv"
+    $csvPath    = Join-Path $workingDir 'Qualys_Posture.csv'
+
+    if (-not (Test-Path $logPath)) { New-Item -ItemType File -Path $logPath -Force | Out-Null }
+
+    function Write-Log {
+        param([string]$Message,[ValidateSet('INFO','WARNING','ERROR')][string]$Level='INFO')
+        $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        $line = "[$ts] [$Level] $Message"
+        Write-Information $line -InformationAction Continue
+        Add-Content -Path $logPath -Value $line -Encoding UTF8
+    }
+
+    function Remove-CsvRowsAboveHeader {
+        param([Parameter(Mandatory=$true)][string]$FilePath)
+        # Anchor to the exact header Qualys shows (as per your screenshot)
+        $header = 'ID,IP,OS,DNS Name'
+        $lines = Get-Content -Path $FilePath
+        $idx = $lines.IndexOf($header)
+        if ($idx -lt 0) { Write-Log "Header not found in $FilePath" 'ERROR'; throw "Header not found." }
+        if ($idx -gt 0) {
+            $lines | Select-Object -Skip $idx | Set-Content -Path $FilePath -Encoding UTF8
+            Write-Log "Trimmed $($idx) preamble lines in $FilePath"
+        }
+    }
+
+    function Get-QualysFailures {
+        param([string]$BaseUrl,[pscredential]$Cred,[int]$Policy,[int]$Limit,[string]$OutCsv)
+
+        $pair = '{0}:{1}' -f $Cred.UserName, $Cred.GetNetworkCredential().Password
+        $auth = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($pair))
+        $headers = @{ Authorization = "Basic $auth"; Accept = 'text/csv'; 'X-Requested-With'='PowerShell' }
+
+        $body = @{
+            action        = 'list'
+            policy_id     = $Policy
+            output_format = 'csv'   # plain CSV
+            status        = 'Failed'
+            details       = 'All'
+        }
+        if ($Limit -gt 0) { $body.truncation_limit = $Limit }
+
+        $uri = ($BaseUrl.TrimEnd('/')) + '/api/2.0/fo/compliance/posture/info/'
+        Invoke-RestMethod -Uri $uri -Headers $headers -Method Post -ContentType 'application/x-www-form-urlencoded' -Body $body -OutFile $OutCsv
+
+        Remove-CsvRowsAboveHeader -FilePath $OutCsv
+
+        $raw = Import-Csv -Path $OutCsv
+        if (-not $raw -or $raw.Count -eq 0) { return @() }
+
+        # Fixed schema projection (no guessing)
+        $rows = $raw | ForEach-Object {
+            [pscustomobject]@{
+                TargetName = if ($_.IP) { $_.IP } else { $_.'DNS Name' }
+                IP         = $_.IP
+                Hostname   = $_.'DNS Name'
+                CID        = $_.'Control ID'
+                Evidence   = $_.'Posture Evidence'
+                Reason     = $_.'Reason for Failure'
+            }
+        }
+
+        # Keep only actionable records
+        $rows | Where-Object { $_.TargetName -and ($_.CID -match '^\d+$') }
+    }
+
+    function Find-Fixer {
+        param([int]$CID)
+        $match = Get-ChildItem -Path $fixersDir -Filter "$CID-*.ps1" -File | Select-Object -First 1
+        if ($null -eq $match) { return $null }
+        return $match.FullName
+    }
+
+    function Run-Fixer {
+        param([string]$Computer,[pscredential]$Cred,[string]$FixerPath)
+        try {
+            $scriptText = Get-Content -Path $FixerPath -Raw
+            $sb = [scriptblock]::Create($scriptText)
+            $ret = Invoke-Command -ComputerName $Computer -Credential $Cred -ScriptBlock $sb -ErrorAction Stop
+            # Normalise output
+            $outcome = if ($ret -and $ret.PSObject.Properties.Name -contains 'Outcome') { [string]$ret.Outcome } else { 'Succeeded' }
+            $details = if ($ret -and $ret.PSObject.Properties.Name -contains 'Details') { [string]$ret.Details } else { '' }
+            return @('Yes', $outcome, $details)
+        } catch {
+            return @('Yes', 'Failed', $_.Exception.Message)
+        }
+    }
+
+    Write-Log "Initialised. WorkingDir=$workingDir PolicyId=$PolicyId Remediate=$Remediate"
+}
+
+process {
+    try {
+        # 1) Pull failures
+        Write-Log "Downloading Qualys failures..."
+        $failures = Get-QualysFailures -BaseUrl $QualysBaseUrl -Cred $QualysCredential -Policy $PolicyId -Limit $TruncationLimit -OutCsv $csvPath
+        Write-Log "Retrieved $($failures.Count) actionable failures."
+
+        if ($failures.Count -eq 0) {
+            # Still write an empty report with headers
+            @() | Select-Object TargetName,IP,Hostname,CID,Evidence,Reason,FixAttempted,Outcome,Details | Export-Csv -Path $reportPath -NoTypeInformation -Encoding UTF8
+            Write-Log "Report generated: $($reportPath)"
+            return
+        }
+
+        # 2) Group by Target and CID
+        $work = $failures | Group-Object TargetName | ForEach-Object {
+            $t = $_.Name
+            $_.Group | Group-Object CID | ForEach-Object {
+                [pscustomobject]@{
+                    TargetName = $t
+                    CID        = [int]$_.Name
+                    IP         = ($_.Group | ForEach-Object IP       | Where-Object { $_ } | Select-Object -First 1)
+                    Hostname   = ($_.Group | ForEach-Object Hostname | Where-Object { $_ } | Select-Object -First 1)
+                    Evidence   = ($_.Group | ForEach-Object Evidence | Where-Object { $_ } | Select-Object -Unique) -join '; '
+                    Reason     = ($_.Group | ForEach-Object Reason   | Where-Object { $_ } | Select-Object -Unique) -join '; '
+                }
+            }
+        }
+
+        # 3) Remediate (optional) and collect results
+        $results = foreach ($item in $work) {
+            $fixAttempted = 'No'; $outcome = 'Not Attempted'; $details = ''
+            if ($Remediate) {
+                $fixer = Find-Fixer -CID $item.CID
+                if ($null -eq $fixer) {
+                    $fixAttempted = 'No'
+                    $outcome      = 'No Fixer Available'
+                } else {
+                    $vals = Run-Fixer -Computer $item.TargetName -Cred $AdminCredential -FixerPath $fixer
+                    $fixAttempted = $vals[0]; $outcome = $vals[1]; $details = $vals[2]
+                }
+            }
+            [pscustomobject]@{
+                TargetName   = $item.TargetName
+                IP           = $item.IP
+                Hostname     = $item.Hostname
+                CID          = $item.CID
+                Evidence     = $item.Evidence
+                Reason       = $item.Reason
+                FixAttempted = $fixAttempted
+                Outcome      = $outcome
+                Details      = $details
+            }
+        }
+
+        # 4) Report
+        $results | Export-Csv -Path $reportPath -NoTypeInformation -Encoding UTF8
+        Write-Log "Report generated: $($reportPath)"
+    } catch {
+        Write-Log "Failure in process: $($_.Exception.Message)" 'ERROR'
+        throw
+    }
+}
+
+end {
+    if (Test-Path $csvPath) { Remove-Item $csvPath -Force }
+    Write-Log 'Completed.'
+}
+
+# Signed by Marinus van Deventer
