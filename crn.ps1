@@ -7,7 +7,7 @@
     - Uses fixed CSV columns: IP, DNS Name, Control ID, Posture Evidence, Reason for Failure.
     - Groups by target (IP preferred, else DNS Name) and Control ID (CID).
     - If -Remediate, runs C:\temp\scripts\fixers\<CID>-*.ps1 via PowerShell Remoting.
-      If -Parallel, runs fixers concurrently with -ThrottleLimit.
+      If -Parallel, runs concurrently with -ThrottleLimit.
     - If -Rescan, launches a Qualys compliance rescan for hosts with successful fixes (needs IP).
     - Writes C:\temp\scripts\reports\FailedCompliance_<timestamp>.csv
 .PARAMETER QualysBaseUrl
@@ -104,9 +104,12 @@ Write-Log "Script started. ParameterSetName=$($PSCmdlet.ParameterSetName)"
     Uses quoted prefix match for Qualys CSV headers.
 #>
 function Remove-CsvPreamble {
-    param(
-        [Parameter(Mandatory=$true)][string]$FilePath,
-        [Parameter(Mandatory=$true)][string[]]$HeaderColumns
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$HeaderColumns
     )
     try {
         if (-not (Test-Path $FilePath)) { Write-Log "File not found: $FilePath" 'ERROR'; throw "File not found." }
@@ -115,7 +118,7 @@ function Remove-CsvPreamble {
         if ([string]::IsNullOrWhiteSpace($text)) { throw "Empty CSV body." }
         $lines = $text -split "(`r`n|`n|`r)"
         $idx = -1
-        for ($i=0; $i -lt $lines.Count; $i++) {
+        for ($i = 0; $i -lt $lines.Count; $i++) {
             $line = $lines[$i].TrimStart()
             if ($line.StartsWith($quotedPrefix, $true, [Globalization.CultureInfo]::InvariantCulture)) { $idx = $i; break }
         }
@@ -152,7 +155,7 @@ function Remove-CsvPreamble {
     Uses 'csv' format for plain CSV with headers.
 #>
 function Invoke-QualysCsv {
-    param(
+    param (
         [string]$BaseUrl,
         [pscredential]$Cred,
         [int]$Policy,
@@ -199,7 +202,7 @@ function Invoke-QualysCsv {
     Filters null target and non-numeric CID.
 #>
 function Get-QualysFailures {
-    param(
+    param (
         [string]$BaseUrl,
         [pscredential]$Cred,
         [int]$Policy,
@@ -242,8 +245,9 @@ function Get-QualysFailures {
     Returns full path or null.
 #>
 function Find-Fixer {
-    param(
-        [Parameter(Mandatory=$true)][int]$CID
+    param (
+        [Parameter(Mandatory = $true)]
+        [int]$CID
     )
     $match = Get-ChildItem -Path $fixersDir -Filter "$CID-*.ps1" -File -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($null -eq $match) {
@@ -271,13 +275,17 @@ function Find-Fixer {
     Returns array: FixAttempted, Outcome, Details.
 #>
 function Run-Fixer {
-    param(
-        [Parameter(Mandatory=$true)][string]$Computer,
-        [Parameter(Mandatory=$true)][pscredential]$Cred,
-        [Parameter(Mandatory=$true)][string]$FixerPath
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$Computer,
+
+        [Parameter(Mandatory = $true)]
+        [pscredential]$Cred,
+
+        [Parameter(Mandatory = $true)]
+        [string]$FixerPath
     )
     try {
-        if (-not (Test-Path $FixerPath -PathType Leaf)) { throw "Fixer path not found: $FixerPath" }
         $scriptText = Get-Content -Path $FixerPath -Raw -ErrorAction Stop
         $sb = [scriptblock]::Create($scriptText)
         $ret = Invoke-Command -ComputerName $Computer -Credential $Cred -ScriptBlock $sb -ErrorAction Stop
@@ -307,10 +315,15 @@ function Run-Fixer {
     Returns true on success, false on failure.
 #>
 function Invoke-QualysRescan {
-    param(
-        [Parameter(Mandatory=$true)][string]$BaseUrl,
-        [Parameter(Mandatory=$true)][pscredential]$Cred,
-        [Parameter(Mandatory=$true)][string]$HostIP
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$BaseUrl,
+
+        [Parameter(Mandatory = $true)]
+        [pscredential]$Cred,
+
+        [Parameter(Mandatory = $true)]
+        [string]$HostIP
     )
     try {
         $pair = '{0}:{1}' -f $Cred.UserName, $Cred.GetNetworkCredential().Password
@@ -332,7 +345,6 @@ function Invoke-QualysRescan {
     }
 }
 #endregion
-}
 
 process {
     try {
@@ -341,11 +353,7 @@ process {
         $failures = Get-QualysFailures -BaseUrl $QualysBaseUrl -Cred $QualysCredential -Policy $PolicyId -Limit $TruncationLimit -OutCsv $csvPath
         Write-Log "Retrieved $($failures.Count) actionable failures." 'INFO'
 
-        if ($failures.Count -eq 0) {
-            @() | Select-Object TargetName,IP,Hostname,CID,Evidence,Reason,FixAttempted,Outcome,Details | Export-Csv -Path $reportPath -NoTypeInformation -Encoding UTF8
-            Write-Log "Report generated: $reportPath" 'INFO'
-            return
-        }
+        if ($failures.Count -eq 0) { return }
 
         # Group by Target and CID
         $work = $failures | Group-Object TargetName | ForEach-Object {
@@ -456,18 +464,18 @@ process {
             }
         }
 
-        # 4) Report
+        # Report
         $results | Export-Csv -Path $reportPath -NoTypeInformation -Encoding UTF8
-        Write-Log "Report generated: $($reportPath)"
+        Write-Log "Report generated: $reportPath" 'INFO'
     } catch {
-        Write-Log "Failure in process: $($_.Exception.Message)" 'ERROR'
+        Write-Log "Process failed: $($_.Exception.Message)" 'ERROR'
         throw
     }
 }
 
 end {
     if (Test-Path $csvPath) { Remove-Item $csvPath -Force }
-    Write-Log 'Completed.'
+    Write-Log "Script completed." 'INFO'
 }
 
 # Signed by Marinus van Deventer
