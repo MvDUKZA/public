@@ -151,3 +151,27 @@ If (-not (Test-Path $RegPath)) {
 
 # Set the DWORD value
 New-ItemProperty -Path $RegPath -Name $Name -Value $Value -PropertyType DWord -Force | Out-Null
+
+
+# Force x64 registry write regardless of process bitness
+$Hive = [Microsoft.Win32.RegistryHive]::LocalMachine
+$View = [Microsoft.Win32.RegistryView]::Registry64
+
+$Base = [Microsoft.Win32.RegistryKey]::OpenBaseKey($Hive, $View)
+$SubPath = "SOFTWARE\Qualys\QualysAgent\ScanOnDemand\Vulnerability"
+
+# Create/open the key
+$Key = $Base.CreateSubKey($SubPath, [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree)
+
+# Set DWORD value
+$Key.SetValue("ScanOnDemand", 1, [Microsoft.Win32.RegistryValueKind]::DWord)
+
+# (Optional) verify
+$actual = $Key.GetValue("ScanOnDemand")
+if ($actual -ne 1) { throw "Expected 1 but found $actual at HKLM\$SubPath\ScanOnDemand (x64 view)" }
+
+# Cleanup
+$Key.Close()
+$Base.Close()
+
+
