@@ -174,4 +174,28 @@ if ($actual -ne 1) { throw "Expected 1 but found $actual at HKLM\$SubPath\ScanOn
 $Key.Close()
 $Base.Close()
 
+# Force x64 registry view
+$Hive    = [Microsoft.Win32.RegistryHive]::LocalMachine
+$View    = [Microsoft.Win32.RegistryView]::Registry64
+$SubPath = "SOFTWARE\Qualys\QualysAgent\ScanOnDemand\Vulnerability"
+$Name    = "ScanOnDemand"
+$Value   = 1
+
+# Open HKLM in 64-bit view
+$Base = [Microsoft.Win32.RegistryKey]::OpenBaseKey($Hive, $View)
+
+# Create key if missing
+$Key = $Base.CreateSubKey($SubPath, [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree)
+
+# Set DWORD value
+$Key.SetValue($Name, $Value, [Microsoft.Win32.RegistryValueKind]::DWord)
+
+# Verify
+$actual = $Key.GetValue($Name)
+Write-Output "HKLM:\$SubPath\$Name = $actual (x64 view)"
+
+# Cleanup
+$Key.Close()
+$Base.Close()
+
 
