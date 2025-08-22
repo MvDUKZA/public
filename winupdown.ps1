@@ -5,14 +5,14 @@
     Downloads Windows updates from the Microsoft Update Catalogue using the MSCatalogLTS module.
 
 .DESCRIPTION
-    This script installs or updates the MSCatalogLTS module if needed, searches for updates based on queries,
-    filters by architecture and other criteria, downloads the files to a monthyear subfolder, and logs the process.
+    This script installs or updates the MSCatalogLTS module if needed (checking versions first), searches for updates based on queries,
+    filters by architecture and other criteria, downloads the files to a monthyear subfolder, and logs the process. It creates the DownloadPath if it does not exist.
 
 .PARAMETER SearchQueries
-    Array of search strings for updates (e.g., "Windows 11 Version 24H2 Cumulative Update x64").
+    Array of search strings for updates (e.g., "2025-08 Cumulative Update for Windows 11 Version 24H2 for x64-based Systems").
 
 .PARAMETER DownloadPath
-    Base directory to save downloaded updates (subfolder with monthyear will be created).
+    Base directory to save downloaded updates (subfolder with monthyear will be created; created if not exists).
 
 .PARAMETER Architecture
     Filter by architecture (all, x64, x86, arm64; default: x64).
@@ -27,13 +27,15 @@
     Use strict (exact match) searching (default: $true).
 
 .EXAMPLE
-    .\DownloadWindowsUpdates.ps1 -SearchQueries @("Windows 11 Version 24H2 Cumulative Update x64") -DownloadPath "C:\Updates" -Architecture "x64"
+    .\DownloadWindowsUpdates.ps1 -SearchQueries @("2025-08 Cumulative Update for Windows 11 Version 24H2 for x64-based Systems") -DownloadPath "C:\Updates" -Architecture "x64"
 
 .NOTES
     Requires PowerShell 7+ for best performance.
     Based on MSCatalogLTS module: https://github.com/Marco-online/MSCatalogLTS
     Reference: https://learn.microsoft.com/en-us/powershell/module/?view=powershell-7.4
-    Changelog: v1.1 - Added automatic creation of monthyear subfolder (e.g., 0825) under DownloadPath; updated return object.
+    Changelog: v1.3 - Updated .EXAMPLE to use "2025-08 Cumulative Update for Windows 11 Version 24H2 for x64-based Systems" as the search query.
+               v1.2 - Added check/create for DownloadPath if not exists; check module version before updating; updated return object.
+               v1.1 - Added automatic creation of monthyear subfolder (e.g., 0825) under DownloadPath; updated return object.
                v1.0 - Initial version.
 
 #>
@@ -45,7 +47,6 @@ param (
     [string[]]$SearchQueries,
 
     [Parameter(Mandatory = $true)]
-    [ValidateScript({ Test-Path $_ -PathType Container })]
     [string]$DownloadPath,
 
     [ValidateSet("all", "x64", "x86", "arm64")]
@@ -82,14 +83,25 @@ function Write-Log {
 }
 Write-Log "Script started. Parameters: SearchQueries=$($SearchQueries -join ', '), DownloadPath=$DownloadPath, Architecture=$Architecture"
 
+# Create DownloadPath if not exists
+if (-not (Test-Path $DownloadPath -PathType Container)) {
+    Write-Log "Creating DownloadPath: $DownloadPath"
+    New-Item -Path $DownloadPath -ItemType Directory -Force | Out-Null
+}
+
 # Install or update MSCatalogLTS module
 try {
-    if (-not (Get-Module -ListAvailable -Name MSCatalogLTS)) {
-        Write-Log "Installing MSCatalogLTS module..."
+    $installedModule = Get-Module -ListAvailable -Name MSCatalogLTS | Sort-Object Version -Descending | Select-Object -First 1
+    $latestModule = Find-Module -Name MSCatalogLTS -ErrorAction Stop | Select-Object -First 1
+
+    if (-not $installedModule) {
+        Write-Log "Installing MSCatalogLTS module version $($latestModule.Version)..."
         Install-Module -Name MSCatalogLTS -Scope CurrentUser -Force -ErrorAction Stop
-    } else {
-        Write-Log "Updating MSCatalogLTS module..."
+    } elseif ([version]$installedModule.Version -lt [version]$latestModule.Version) {
+        Write-Log "Updating MSCatalogLTS from $($installedModule.Version) to $($latestModule.Version)..."
         Update-Module -Name MSCatalogLTS -Force -ErrorAction Stop
+    } else {
+        Write-Log "MSCatalogLTS module is up to date (version $($installedModule.Version))."
     }
     Import-Module -Name MSCatalogLTS -ErrorAction Stop
 } catch {
