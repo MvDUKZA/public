@@ -6,7 +6,7 @@
 
 .DESCRIPTION
     This script copies the source image folder with a monthyear suffix, mounts the specified Windows image in the copy,
-    adds all .msu and .cab update packages from a folder, commits the changes, and unmounts the image. It handles errors, logs progress, and ensures cleanup.
+    adds all .msu and .cab update packages from a folder in the correct order (SSU first, oldest by creation time), commits the changes, and unmounts the image. It handles errors, logs progress, and ensures cleanup.
 
 .PARAMETER WimFile
     Path to the install.wim file (assumed structure: <root>\sources\install.wim).
@@ -33,7 +33,8 @@
     Requires administrative privileges.
     Based on DISM documentation: https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/dism-image-management-command-line-options-s14
     PowerShell version: Compatible with 5.1+.
-    Changelog: v1.1 - Added copy of source root folder with monthyear suffix (e.g., _0825); changed default ImageIndex to 3 for Enterprise; updated return object.
+    Changelog: v1.2 - Added sorting of updates by ReleaseType (SSU priority) and CreationTime ascending using DISM /Get-PackageInfo; updated progress.
+               v1.1 - Added copy of source root folder with monthyear suffix (e.g., _0825); changed default ImageIndex to 3 for Enterprise; updated return object.
                v1.0 - Initial version.
 
 #>
@@ -118,16 +119,58 @@ try {
     # Get update files
     $updateFiles = Get-ChildItem -Path $UpdatesFolder -Filter *.msu -Recurse
     $updateFiles += Get-ChildItem -Path $UpdatesFolder -Filter *.cab -Recurse
-    $updateFiles = $updateFiles | Sort-Object Name  # Sort alphabetically; adjust if needed
 
     if ($updateFiles.Count -eq 0) {
         Write-Log "No update files found in $UpdatesFolder." "WARNING"
     } else {
         Write-Log "Found $($updateFiles.Count) update files."
-        $progress = 10
+        Write-Log "Analyzing packages for ordering..."
+        Write-Progress -Activity "Patching Windows Image" -Status "Analyzing packages" -PercentComplete 15
+
+        $packageInfos = @()
         foreach ($file in $updateFiles) {
-            $progress += (80 / $updateFiles.Count)
-            Write-Progress -Activity "Patching Windows Image" -Status "Adding package: $($file.Name)" -PercentComplete $progress
+            try {
+                $infoArgs = "/Get-PackageInfo /PackagePath:`"$($file.FullName)`""
+                $infoResult = & dism.exe $infoArgs.Split(' ') | Where-Object { $_ -match ' : ' }
+                $infoHash = @{}
+                foreach ($line in $infoResult) {
+                    $key, $value = $line -split ' : ', 2
+                    $infoHash[$key.Trim()] = $value.Trim()
+                }
+
+                $releaseType = $infoHash['Release Type']
+                $creationTimeStr = $infoHash['Creation Time']
+                $creationTime = if ($creationTimeStr) { [datetime]::Parse($creationTimeStr) } else { [datetime]::MinValue }
+
+                $priority = if ($releaseType -like '*Servicing Stack*') { 0 } else { 1 }
+
+                $packageInfos += [PSCustomObject]@{
+                    File = $file
+                    Priority = $priority
+                    CreationTime = $creationTime
+                    ReleaseType = $releaseType
+                }
+                Write-Log "Analyzed $($file.Name): Priority=$priority, CreationTime=$creationTime, ReleaseType=$releaseType"
+            } catch {
+                Write-Log "Failed to analyze $($file.Name): $_" "WARNING"
+                # Default to high priority and current time if analysis fails
+                $packageInfos += [PSCustomObject]@{
+                    File = $file
+                    Priority = 2
+                    CreationTime = Get-Date
+                    ReleaseType = "Unknown"
+                }
+            }
+        }
+
+        # Sort: Priority asc, then CreationTime asc
+        $sortedPackages = $packageInfos | Sort-Object Priority, CreationTime
+
+        $progress = 15
+        foreach ($pkg in $sortedPackages) {
+            $file = $pkg.File
+            $progress += (75 / $updateFiles.Count)
+            Write-Progress -Activity "Patching Windows Image" -Status "Adding package: $($file.Name) (Type: $($pkg.ReleaseType))" -PercentComplete $progress
 
             try {
                 Write-Log "Adding package: $($file.FullName)"
