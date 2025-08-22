@@ -6,13 +6,13 @@
 
 .DESCRIPTION
     This script installs or updates the MSCatalogLTS module if needed, searches for updates based on queries,
-    filters by architecture and other criteria, downloads the files, and logs the process.
+    filters by architecture and other criteria, downloads the files to a monthyear subfolder, and logs the process.
 
 .PARAMETER SearchQueries
     Array of search strings for updates (e.g., "Windows 11 Version 24H2 Cumulative Update x64").
 
 .PARAMETER DownloadPath
-    Directory to save downloaded updates (must exist).
+    Base directory to save downloaded updates (subfolder with monthyear will be created).
 
 .PARAMETER Architecture
     Filter by architecture (all, x64, x86, arm64; default: x64).
@@ -33,7 +33,8 @@
     Requires PowerShell 7+ for best performance.
     Based on MSCatalogLTS module: https://github.com/Marco-online/MSCatalogLTS
     Reference: https://learn.microsoft.com/en-us/powershell/module/?view=powershell-7.4
-    Changelog: v1.0 - Initial version.
+    Changelog: v1.1 - Added automatic creation of monthyear subfolder (e.g., 0825) under DownloadPath; updated return object.
+               v1.0 - Initial version.
 
 #>
 
@@ -95,6 +96,14 @@ try {
     Write-Log "Failed to install/update MSCatalogLTS: $_" "ERROR"
     throw
 }
+
+# Create monthyear subfolder
+$monthYear = Get-Date -Format "MMyy"
+$fullDownloadPath = Join-Path $DownloadPath $monthYear
+if (-not (Test-Path $fullDownloadPath)) {
+    Write-Log "Creating subfolder: $fullDownloadPath"
+    New-Item -Path $fullDownloadPath -ItemType Directory -Force | Out-Null
+}
 #endregion
 
 #region Main Logic
@@ -127,8 +136,8 @@ try {
         Write-Log "Found latest update: $($latestUpdate.Title)"
 
         if ($PSCmdlet.ShouldProcess($latestUpdate.Title, "Download update")) {
-            Write-Log "Downloading: $($latestUpdate.Title)"
-            Save-MSCatalogUpdate -Update $latestUpdate -Destination $DownloadPath -DownloadAll -ErrorAction Stop
+            Write-Log "Downloading: $($latestUpdate.Title) to $fullDownloadPath"
+            Save-MSCatalogUpdate -Update $latestUpdate -Destination $fullDownloadPath -DownloadAll -ErrorAction Stop
             $allDownloads += $latestUpdate
         }
     }
@@ -140,7 +149,7 @@ try {
         Status = "Success"
         DownloadedUpdates = $allDownloads
         LogFile = $LogFile
-        DownloadPath = $DownloadPath
+        DownloadPath = $fullDownloadPath
     }
 } catch {
     Write-Log "Script error: $_" "ERROR"
