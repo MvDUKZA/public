@@ -1,0 +1,687 @@
+<# 
+.SYNOPSIS
+  Scaffolds a Packer repo for Windows 11 / Windows Server 2025 on vSphere & Azure.
+
+.DESCRIPTION
+  Creates directories and starter files:
+   - packer.hcl (required_plugins)
+   - platforms/{vsphere,azure} sources (variables-only)
+   - builds/images/windows/*.pkr.hcl (compose-only builds)
+   - variables in layered 00->10->20 convention (global/common/specific)
+   - components (http, drivers, provisioners, postprocessors)
+   - scripts (working area) + Packages (immutable snapshots)
+   - floppy & isos placeholders
+   - .gitignore, README, build-matrix.csv
+   - minimal Build-Template.ps1 (validates and builds)
+
+.PARAMETER Root
+  Root directory for the repo. Defaults to C:\packer
+
+.PARAMETER Force
+  Overwrite existing files (never folders). By default, files are created only if missing.
+
+.NOTES
+  All files are dummy but valid enough to run `packer validate` after you add secrets via env vars.
+#>
+
+param(
+  [string]$Root = "C:\packer",
+  [switch]$Force
+)
+
+# ========== Logging & Helpers ==========
+$script:LogFile = Join-Path $env:TEMP "Init-PackerRepo.log"
+
+function Write-Log {
+  param(
+    [ValidateSet('INFO','WARN','ERROR')][string]$Level,
+    [string]$Message,
+    [hashtable]$Data
+  )
+  $ts = (Get-Date).ToString('s')
+  $o  = [ordered]@{ ts = $ts; level = $Level; msg = $Message }
+  if ($Data) { $Data.GetEnumerator() | ForEach-Object { $o[$_.Key] = $_.Value } }
+  $line = ($o | ConvertTo-Json -Compress)
+  Write-Host "[$Level] $Message"
+  Add-Content -LiteralPath $script:LogFile -Value $line
+}
+
+function Throw-IfFalse {
+  param([bool]$Condition, [string]$ErrorMessage)
+  if (-not $Condition) {
+    Write-Log -Level ERROR -Message $ErrorMessage
+    throw $ErrorMessage
+  }
+}
+
+function New-Dir {
+  param([string]$Path)
+  if (-not (Test-Path -LiteralPath $Path)) {
+    New-Item -ItemType Directory -Path $Path -Force | Out-Null
+    Write-Log INFO "Created folder" @{ path = $Path }
+  }
+}
+
+function New-FileSafe {
+  param(
+    [string]$Path,
+    [string]$Content = ""
+  )
+  if ((Test-Path -LiteralPath $Path) -and -not $Force) {
+    Write-Log WARN "Skipped existing file (use -Force to overwrite)" @{ path = $Path }
+    return
+  }
+  $dir = Split-Path -Parent $Path
+  if ($dir) { New-Dir -Path $dir }
+  Set-Content -LiteralPath $Path -Value $Content -Encoding UTF8
+  Write-Log INFO "Wrote file" @{ path = $Path }
+}
+
+# ========== Paths ==========
+$folders = @(
+  "$Root/.git",
+  "$Root/bin",
+  "$Root/builds/images/windows",
+  "$Root/builds/artefacts/windows/win11/vsphere/dev",
+  "$Root/builds/artefacts/windows/win11/vsphere/prod",
+  "$Root/builds/artefacts/windows/win11/azure/dev",
+  "$Root/builds/artefacts/windows/win11/azure/prod",
+  "$Root/builds/artefacts/windows/win2025/vsphere/dev",
+  "$Root/builds/artefacts/windows/win2025/vsphere/prod",
+  "$Root/builds/artefacts/windows/win2025/azure/dev",
+  "$Root/builds/artefacts/windows/win2025/azure/prod",
+  "$Root/builds/logs",
+  "$Root/builds/manifests",
+  "$Root/builds/reports",
+
+  "$Root/platforms/vsphere",
+  "$Root/platforms/azure",
+
+  "$Root/components/http/windows/win11",
+  "$Root/components/http/windows/win2025",
+  "$Root/components/drivers/common/vmware-tools/12.4.6",
+  "$Root/components/drivers/win11/network/intel-proset/28.2",
+  "$Root/components/drivers/win2025/storage/lsi/1.34",
+  "$Root/components/provisioners",
+  "$Root/components/postprocessors",
+
+  "$Root/floppy/win11/vsphere",
+  "$Root/floppy/win11/azure",
+  "$Root/floppy/win2025/vsphere",
+  "$Root/floppy/win2025/azure",
+
+  "$Root/components/isos/win11/vsphere",
+  "$Root/components/isos/win11/azure",
+  "$Root/components/isos/win2025/vsphere",
+  "$Root/components/isos/win2025/azure",
+
+  "$Root/scripts/windows/common",
+  "$Root/scripts/windows/win11",
+  "$Root/scripts/windows/win2025",
+
+  "$Root/Packages/IX-VMware-Tools_12.4.6_01",
+
+  "$Root/variables/00-global",
+  "$Root/variables/10-os",
+  "$Root/variables/20-platform",
+  "$Root/variables/30-env",
+  "$Root/variables/40-image"
+)
+
+# ========== Create Folders ==========
+foreach ($f in $folders) { New-Dir -Path $f }
+
+# ========== Root files ==========
+$gitignore = @"
+# Binaries & outputs
+/bin/
+/builds/artefacts/
+/builds/logs/
+/builds/manifests/
+/builds/reports/
+/components/isos/**/Win*.iso
+*.auto.pkrvars.hcl
+.env
+"@
+
+$readme = @"
+# Packer Repo (Windows 11 + Windows Server 2025) — vSphere & Azure
+
+- Layered vars: 00-global → 10-os → 20-platform → 30-env → 40-image (last wins).
+- `platforms/*` contain builder sources (variables-only).
+- `builds/images/*` compose sources + provisioners (no env/platform hardcoding).
+- `scripts/windows` = working area (continuous history).
+- `Packages/*` = immutable snapshots for Prod.
+- Secrets via env vars: ARM_*, VSPHERE_* or ignored *.auto.pkrvars.hcl.
+"@
+
+$packerHcl = @"
+packer {
+  required_plugins {
+    vsphere = { source = "github.com/hashicorp/vsphere", version = ">= 1.3.0" }
+    azure   = { source = "github.com/hashicorp/azure",   version = ">= 2.1.0" }
+  }
+}
+locals {
+  build_timestamp = regex_replace(timestamp(), "[- TZ:]", "")
+}
+"@
+
+$matrixCsv = @"
+Platform,Env,OS,Image
+vsphere,dev,windows,win11-enterprise
+vsphere,prod,windows,win11-enterprise
+azure,dev,windows,win11-enterprise
+azure,prod,windows,win11-enterprise
+vsphere,dev,windows,win2025-standard
+vsphere,prod,windows,win2025-standard
+azure,dev,windows,win2025-standard
+azure,prod,windows,win2025-standard
+"@
+
+$wrapper = @"
+param(
+  [Parameter(Mandatory=$true)][ValidateSet('vsphere','azure')] [string]$Platform,
+  [Parameter(Mandatory=$true)][ValidateSet('dev','prod')]      [string]$Env,
+  [Parameter(Mandatory=$true)][ValidateSet('windows')]         [string]$OS,
+  [Parameter(Mandatory=$true)]                                  [string]$Image,
+  [string]$PackerExe = Join-Path \$PSScriptRoot 'bin\packer.exe',
+  [switch]\$WhatIf
+)
+
+function Write-Log {
+  param([ValidateSet('INFO','WARN','ERROR')] [string]\$Level,[string]\$Message,[hashtable]\$Data)
+  \$ts=(Get-Date).ToString('s');\$e=[ordered]@{ts=\$ts;level=\$Level;msg=\$Message}
+  if(\$Data){\$Data.GetEnumerator()|%{\$e[\$_.Key]=\$_.Value}}
+  \$line=(\$e|ConvertTo-Json -Compress)
+  Write-Host "[$Level] \$Message"
+  \$logDir=Join-Path \$PSScriptRoot 'builds\logs'; if(-not (Test-Path \$logDir)){New-Item -ItemType Directory -Force -Path \$logDir|Out-Null}
+  Add-Content -LiteralPath (Join-Path \$logDir 'wrapper.jsonl') -Value \$line
+}
+function Throw-IfFalse{param([bool]\$Cond,[string]\$Msg)if(-not \$Cond){Write-Log ERROR \$Msg @{};throw \$Msg}}
+
+\$root = \$PSScriptRoot
+\$buildFile = Join-Path \$root ("builds\images\windows\{0}.pkr.hcl" -f \$Image)
+Throw-IfFalse (Test-Path \$PackerExe) "packer.exe not found: \$PackerExe"
+Throw-IfFalse (Test-Path \$buildFile) "build file missing: \$buildFile"
+
+# Assemble var-files (order matters: last wins)
+\$vf = @(
+  (Join-Path \$root 'variables\00-global\global.pkrvars.hcl'),
+  (Join-Path \$root 'variables\10-os\win11.pkrvars.hcl'),      # selected in image file via variables
+  (Join-Path \$root 'variables\10-os\win2025.pkrvars.hcl'),
+  (Join-Path \$root ('variables\20-platform\{0}.pkrvars.hcl' -f \$Platform)),
+  (Join-Path \$root ('variables\30-env\{0}.pkrvars.hcl' -f \$Env)),
+  (Join-Path \$root ('variables\40-image\{0}.pkrvars.hcl' -f \$Image))
+) | Where-Object { Test-Path \$_ }
+
+Throw-IfFalse (\$vf.Count -gt 0) "No var files resolved"
+& \$PackerExe fmt \$root | Out-Null
+& \$PackerExe validate (\$vf | ForEach-Object { "-var-file=\$_" }) \$buildFile
+Throw-IfFalse (\$LASTEXITCODE -eq 0) "packer validate failed"
+
+if(\$WhatIf){ Write-Log INFO "Validation OK (WhatIf)" @{ image=\$Image; platform=\$Platform; env=\$Env }; return }
+
+& \$PackerExe init \$root | Out-Null
+& \$PackerExe build -force (\$vf | ForEach-Object { "-var-file=\$_" }) \$buildFile
+Throw-IfFalse (\$LASTEXITCODE -eq 0) "packer build failed"
+Write-Log INFO "Build finished" @{ image=\$Image; platform=\$Platform; env=\$Env }
+"@
+
+New-FileSafe (Join-Path $Root ".gitignore")            $gitignore
+New-FileSafe (Join-Path $Root "README.md")             $readme
+New-FileSafe (Join-Path $Root "packer.hcl")            $packerHcl
+New-FileSafe (Join-Path $Root "build-matrix.csv")      $matrixCsv
+New-FileSafe (Join-Path $Root "Build-Template.ps1")    $wrapper
+
+# ========== Platforms: sources (variables-only) ==========
+$vsphereSrc = @"
+# platforms/vsphere/sources.vsphere-iso.pkr.hcl
+# Variables (all set via var-files)
+variable "vcenter_server"        { type = string }
+variable "vcenter_user"          { type = string }
+variable "vcenter_password"      { type = string, sensitive = true }
+variable "plat_vsphere_datacenter" { type = string }
+variable "plat_vsphere_cluster"  { type = string }
+variable "plat_vsphere_datastore"{ type = string }
+variable "plat_vsphere_folder"   { type = string }
+variable "env_network"           { type = string }
+
+variable "vm_name"               { type = string }
+variable "guest_os_type"         { type = string }
+variable "cpus"                  { type = number }
+variable "memory_mb"             { type = number }
+variable "disk_size_gb"          { type = number }
+
+variable "iso_url"               { type = string }
+variable "iso_checksum"          { type = string }
+variable "http_directory"        { type = string }
+
+variable "communicator"          { type = string } # "winrm"
+variable "winrm_username"        { type = string }
+variable "winrm_password"        { type = string, sensitive = true }
+variable "winrm_use_https"       { type = bool, default = false }
+variable "winrm_insecure"        { type = bool, default = true }
+
+source "vsphere-iso" "base" {
+  vcenter_server      = var.vcenter_server
+  username            = var.vcenter_user
+  password            = var.vcenter_password
+
+  datacenter          = var.plat_vsphere_datacenter
+  cluster             = var.plat_vsphere_cluster
+  datastore           = var.plat_vsphere_datastore
+  folder              = var.plat_vsphere_folder
+
+  vm_name             = var.vm_name
+  guest_os_type       = var.guest_os_type
+  CPUs                = var.cpus
+  RAM                 = var.memory_mb
+  disk_controller_type= ["pvscsi"]
+  storage {
+    disk_size             = var.disk_size_gb
+    disk_thin_provisioned = true
+  }
+
+  network_adapters = [{ network = var.env_network, nic_type = "vmxnet3" }]
+
+  iso_urls        = [var.iso_url]
+  iso_checksum    = var.iso_checksum
+
+  http_directory  = var.http_directory
+  boot_wait       = "5s"
+  communicator    = var.communicator
+  winrm_username  = var.winrm_username
+  winrm_password  = var.winrm_password
+  winrm_use_ssl   = var.winrm_use_https
+  winrm_insecure  = var.winrm_insecure
+
+  shutdown_command = ""
+  convert_to_template = true
+}
+"@
+
+$azureSrc = @"
+# platforms/azure/sources.azure-arm.pkr.hcl
+variable "azure_subscription_id" { type = string, sensitive = true }
+variable "azure_tenant_id"       { type = string, sensitive = true }
+variable "azure_client_id"       { type = string, sensitive = true }
+variable "azure_client_secret"   { type = string, sensitive = true }
+
+variable "azure_location"        { type = string }
+variable "env_resource_group"    { type = string }
+variable "env_vnet"              { type = string }
+variable "env_subnet"            { type = string }
+
+variable "sig_name"              { type = string }
+variable "sig_rg"                { type = string }
+variable "sig_offer"             { type = string }
+variable "sig_publisher"         { type = string }
+variable "sig_sku"               { type = string }
+
+variable "vm_size"               { type = string }
+variable "os_type"               { type = string } # "Windows"
+variable "communicator"          { type = string } # "winrm"
+variable "winrm_username"        { type = string }
+variable "winrm_password"        { type = string, sensitive = true }
+variable "vm_temp_name"          { type = string }
+
+source "azure-arm" "base" {
+  subscription_id                   = var.azure_subscription_id
+  tenant_id                         = var.azure_tenant_id
+  client_id                         = var.azure_client_id
+  client_secret                     = var.azure_client_secret
+
+  location                          = var.azure_location
+  build_resource_group_name         = var.env_resource_group
+  virtual_network_name              = var.env_vnet
+  virtual_network_subnet_name       = var.env_subnet
+
+  managed_image_resource_group_name = var.sig_rg
+  shared_image_gallery_destination {
+    resource_group = var.sig_rg
+    gallery_name   = var.sig_name
+    image_name     = "\${var.sig_publisher}-\${var.sig_offer}-\${var.sig_sku}"
+    image_version  = "latest"
+    replication_regions = [var.azure_location]
+  }
+
+  os_type          = var.os_type
+  vm_size          = var.vm_size
+  temp_compute_name= var.vm_temp_name
+
+  communicator     = var.communicator
+  winrm_username   = var.winrm_username
+  winrm_password   = var.winrm_password
+}
+"@
+
+New-FileSafe (Join-Path $Root "platforms/vsphere/sources.vsphere-iso.pkr.hcl") $vsphereSrc
+New-FileSafe (Join-Path $Root "platforms/azure/sources.azure-arm.pkr.hcl")     $azureSrc
+
+# ========== Build definitions (compose-only) ==========
+$buildWin11 = @"
+# builds/images/windows/win11-enterprise.pkr.hcl
+variable "name_prefix"         { type = string }
+variable "env_channel"         { type = string }
+variable "log_root"            { type = string }
+variable "win_prepare_scripts" { type = list(string) }
+variable "win_core_scripts"    { type = list(string) }
+variable "win_opt_scripts"     { type = list(string) }
+
+# From OS/common vars:
+variable "guest_os_type"       { type = string }
+variable "communicator"        { type = string }
+variable "winrm_username"      { type = string }
+variable "winrm_password"      { type = string, sensitive = true }
+
+locals {
+  base_name = "\${var.name_prefix}-win11-enterprise-\${var.env_channel}"
+}
+
+source "vsphere-iso" "win" {}
+source "azure-arm"   "win" {}
+
+build {
+  name    = local.base_name
+  sources = ["source.vsphere-iso.win","source.azure-arm.win"]
+
+  dynamic "provisioner" {
+    for_each = var.win_prepare_scripts
+    content {
+      type            = "powershell"
+      scripts         = [provisioner.value]
+      elevated_user   = var.winrm_username
+      elevated_password = var.winrm_password
+      execute_command = "powershell -ExecutionPolicy Bypass -File {{ .Path }} -LogRoot '\${var.log_root}'"
+    }
+  }
+  dynamic "provisioner" {
+    for_each = var.win_core_scripts
+    content {
+      type            = "powershell"
+      scripts         = [provisioner.value]
+      elevated_user   = var.winrm_username
+      elevated_password = var.winrm_password
+      execute_command = "powershell -ExecutionPolicy Bypass -File {{ .Path }} -LogRoot '\${var.log_root}'"
+    }
+  }
+  dynamic "provisioner" {
+    for_each = var.win_opt_scripts
+    content {
+      type            = "powershell"
+      scripts         = [provisioner.value]
+      elevated_user   = var.winrm_username
+      elevated_password = var.winrm_password
+      execute_command = "powershell -ExecutionPolicy Bypass -File {{ .Path }} -LogRoot '\${var.log_root}'"
+    }
+  }
+}
+"@
+
+$buildWin2025 = @"
+# builds/images/windows/win2025-standard.pkr.hcl
+# Same structure as Win11; values come from OS/platform/env var-files
+variable "name_prefix"         { type = string }
+variable "env_channel"         { type = string }
+variable "log_root"            { type = string }
+variable "win_prepare_scripts" { type = list(string) }
+variable "win_core_scripts"    { type = list(string) }
+variable "win_opt_scripts"     { type = list(string) }
+variable "guest_os_type"       { type = string }
+variable "communicator"        { type = string }
+variable "winrm_username"      { type = string }
+variable "winrm_password"      { type = string, sensitive = true }
+
+locals { base_name = "\${var.name_prefix}-win2025-standard-\${var.env_channel}" }
+
+source "vsphere-iso" "win" {}
+source "azure-arm"   "win" {}
+
+build {
+  name    = local.base_name
+  sources = ["source.vsphere-iso.win","source.azure-arm.win"]
+
+  dynamic "provisioner" {
+    for_each = var.win_prepare_scripts
+    content {
+      type            = "powershell"
+      scripts         = [provisioner.value]
+      elevated_user   = var.winrm_username
+      elevated_password = var.winrm_password
+      execute_command = "powershell -ExecutionPolicy Bypass -File {{ .Path }} -LogRoot '\${var.log_root}'"
+    }
+  }
+  dynamic "provisioner" {
+    for_each = var.win_core_scripts
+    content {
+      type            = "powershell"
+      scripts         = [provisioner.value]
+      elevated_user   = var.winrm_username
+      elevated_password = var.winrm_password
+      execute_command = "powershell -ExecutionPolicy Bypass -File {{ .Path }} -LogRoot '\${var.log_root}'"
+    }
+  }
+  dynamic "provisioner" {
+    for_each = var.win_opt_scripts
+    content {
+      type            = "powershell"
+      scripts         = [provisioner.value]
+      elevated_user   = var.winrm_username
+      elevated_password = var.winrm_password
+      execute_command = "powershell -ExecutionPolicy Bypass -File {{ .Path }} -LogRoot '\${var.log_root}'"
+    }
+  }
+}
+"@
+
+New-FileSafe (Join-Path $Root "builds/images/windows/win11-enterprise.pkr.hcl") $buildWin11
+New-FileSafe (Join-Path $Root "builds/images/windows/win2025-standard.pkr.hcl") $buildWin2025
+
+# ========== Variables ==========
+$globalVars = @"
+# variables/00-global/global.pkrvars.hcl
+name_prefix   = "chucker"
+log_root      = "C:\\PackerLogs"
+
+# ISO defaults (vSphere uses, Azure ignores)
+win11_iso_url       = "file://C:/packer/components/isos/win11/vsphere/Win11_24H2.iso"
+win11_iso_checksum  = "sha256:DEADBEEF..."
+win2025_iso_url     = "file://C:/packer/components/isos/win2025/vsphere/Win2025.iso"
+win2025_iso_checksum= "sha256:FEEDBEEF..."
+
+# Common scripts (provisioner lists)
+win_prepare_scripts = ["scripts/windows/common/Enable-WinRM.ps1"]
+win_core_scripts    = ["scripts/windows/common/Install-VMwareTools.ps1"]
+win_opt_scripts     = ["scripts/windows/common/Optimise-Windows.ps1"]
+"@
+
+$osWin11 = @"
+# variables/10-os/win11.pkrvars.hcl
+guest_os_type  = "windows9_64"
+communicator   = "winrm"
+vm_name        = "win11-enterprise"
+cpus           = 4
+memory_mb      = 8192
+disk_size_gb   = 80
+http_directory = "components/http/windows/win11"
+iso_url        = var.win11_iso_url
+iso_checksum   = var.win11_iso_checksum
+"@
+
+$osWin2025 = @"
+# variables/10-os/win2025.pkrvars.hcl
+guest_os_type  = "windows2019srv_64" # adjust to exact value you use
+communicator   = "winrm"
+vm_name        = "win2025-standard"
+cpus           = 4
+memory_mb      = 8192
+disk_size_gb   = 80
+http_directory = "components/http/windows/win2025"
+iso_url        = var.win2025_iso_url
+iso_checksum   = var.win2025_iso_checksum
+"@
+
+$platVsphere = @"
+# variables/20-platform/vsphere.pkrvars.hcl
+plat_vsphere_datacenter = "Lab-DC"
+plat_vsphere_cluster    = "Lab-Cluster"
+plat_vsphere_datastore  = "DS-Lab"
+plat_vsphere_folder     = "Templates-Lab"
+env_network             = "VM-Lab-Network"
+
+# vSphere creds via env in practice; placeholders here
+vcenter_server   = "vcenter.lab.local"
+vcenter_user     = "packer@vsphere.local"
+vcenter_password = "USE-ENV-OR-AUTO-VARS"
+winrm_username   = "Administrator"
+winrm_password   = "USE-ENV-OR-AUTO-VARS"
+winrm_use_https  = false
+winrm_insecure   = true
+"@
+
+$platAzure = @"
+# variables/20-platform/azure.pkrvars.hcl
+azure_location     = "uksouth"
+env_resource_group = "rg-packer-build"
+env_vnet           = "vnet-packer"
+env_subnet         = "subnet-build"
+
+sig_name           = "sig-core"
+sig_rg             = "rg-sig-core"
+sig_offer          = "win"
+sig_publisher      = "chucker"
+sig_sku            = "ent"
+
+vm_size            = "Standard_D4s_v5"
+os_type            = "Windows"
+communicator       = "winrm"
+winrm_username     = "packer"
+winrm_password     = "USE-ENV-OR-AUTO-VARS"
+azure_subscription_id = "USE-ENV"
+azure_tenant_id       = "USE-ENV"
+azure_client_id       = "USE-ENV"
+azure_client_secret   = "USE-ENV"
+vm_temp_name          = "tmpimg-\${local.build_timestamp}"
+"@
+
+$envDev = @"
+# variables/30-env/dev.pkrvars.hcl
+env_channel = "dev"
+"@
+
+$envProd = @"
+# variables/30-env/prod.pkrvars.hcl
+env_channel = "prod"
+"@
+
+$imgWin11 = @"
+# variables/40-image/win11-enterprise.pkrvars.hcl
+vm_name        = "win11-enterprise"
+"@
+
+$imgWin2025 = @"
+# variables/40-image/win2025-standard.pkrvars.hcl
+vm_name        = "win2025-standard"
+"@
+
+New-FileSafe (Join-Path $Root "variables/00-global/global.pkrvars.hcl") $globalVars
+New-FileSafe (Join-Path $Root "variables/10-os/win11.pkrvars.hcl")      $osWin11
+New-FileSafe (Join-Path $Root "variables/10-os/win2025.pkrvars.hcl")    $osWin2025
+New-FileSafe (Join-Path $Root "variables/20-platform/vsphere.pkrvars.hcl") $platVsphere
+New-FileSafe (Join-Path $Root "variables/20-platform/azure.pkrvars.hcl")   $platAzure
+New-FileSafe (Join-Path $Root "variables/30-env/dev.pkrvars.hcl")       $envDev
+New-FileSafe (Join-Path $Root "variables/30-env/prod.pkrvars.hcl")      $envProd
+New-FileSafe (Join-Path $Root "variables/40-image/win11-enterprise.pkrvars.hcl") $imgWin11
+New-FileSafe (Join-Path $Root "variables/40-image/win2025-standard.pkrvars.hcl") $imgWin2025
+
+# ========== Components: HTTP payloads & drivers ==========
+$autounattend11 = @"
+<!-- components/http/windows/win11/Autounattend.xml (dummy) -->
+<unattend xmlns='urn:schemas-microsoft-com:unattend'>
+  <settings pass='oobeSystem'>
+    <component name='Microsoft-Windows-International-Core' processorArchitecture='amd64' publicKeyToken='31bf3856ad364e35' language='neutral' versionScope='nonSxS'>
+      <InputLocale>en-GB</InputLocale><SystemLocale>en-GB</SystemLocale><UILanguage>en-GB</UILanguage><UserLocale>en-GB</UserLocale>
+    </component>
+  </settings>
+</unattend>
+"@
+
+$autounattend25 = @"
+<!-- components/http/windows/win2025/Autounattend.xml (dummy) -->
+<unattend xmlns='urn:schemas-microsoft-com:unattend'>
+  <settings pass='oobeSystem'>
+    <component name='Microsoft-Windows-Shell-Setup' processorArchitecture='amd64' publicKeyToken='31bf3856ad364e35' language='neutral' versionScope='nonSxS'>
+      <RegisteredOwner>Chucker</RegisteredOwner>
+    </component>
+  </settings>
+</unattend>
+"@
+
+New-FileSafe (Join-Path $Root "components/http/windows/win11/Autounattend.xml")  $autounattend11
+New-FileSafe (Join-Path $Root "components/http/windows/win2025/Autounattend.xml") $autounattend25
+
+# Placeholder driver payloads (do not store real binaries here)
+New-FileSafe (Join-Path $Root "components/drivers/common/vmware-tools/12.4.6/setup64.exe")  "placeholder"
+New-FileSafe (Join-Path $Root "components/drivers/win11/network/intel-proset/28.2/installer.exe") "placeholder"
+New-FileSafe (Join-Path $Root "components/drivers/win2025/storage/lsi/1.34/driver.zip") "placeholder"
+
+# ========== Scripts & Packages ==========
+$enableWinRM = @"
+param([string]\$LogRoot = "C:\PackerLogs")
+function Write-Log{param([ValidateSet('INFO','WARN','ERROR')][string]\$Level,[string]\$Message,[hashtable]\$Data)\$ts=(Get-Date).ToString('s');\$o=[ordered]@{ts=\$ts;level=\$Level;msg=\$Message};if(\$Data){\$Data.GetEnumerator()|%{\$o[\$_.Key]=\$_.Value}}\$line=(\$o|ConvertTo-Json -Compress);if(-not(Test-Path \$LogRoot)){New-Item -ItemType Directory -Force -Path \$LogRoot|Out-Null};Add-Content -LiteralPath (Join-Path \$LogRoot 'provision.jsonl') -Value \$line}
+Write-Log INFO 'Enable WinRM (dummy)' @{}
+"@
+
+$installVMToolsWorking = @"
+param([string]\$LogRoot = "C:\PackerLogs")
+function Write-Log{param([ValidateSet('INFO','WARN','ERROR')][string]\$Level,[string]\$Message,[hashtable]\$Data)\$ts=(Get-Date).ToString('s');\$o=[ordered]@{ts=\$ts;level=\$Level;msg=\$Message};if(\$Data){\$Data.GetEnumerator()|%{\$o[\$_.Key]=\$_.Value}}\$line=(\$o|ConvertTo-Json -Compress);if(-not(Test-Path \$LogRoot)){New-Item -ItemType Directory -Force -Path \$LogRoot|Out-Null};Add-Content -LiteralPath (Join-Path \$LogRoot 'provision.jsonl') -Value \$line}
+Write-Log INFO 'Install VMware Tools (working script)' @{ version = '12.4.6' }
+"@
+
+$optimiseWin = @"
+param([string]\$LogRoot = "C:\PackerLogs")
+function Write-Log{param([ValidateSet('INFO','WARN','ERROR')][string]\$Level,[string]\$Message,[hashtable]\$Data)\$ts=(Get-Date).ToString('s');\$o=[ordered]@{ts=\$ts;level=\$Level;msg=\$Message};if(\$Data){\$Data.GetEnumerator()|%{\$o[\$_.Key]=\$_.Value}}\$line=(\$o|ConvertTo-Json -Compress);if(-not(Test-Path \$LogRoot)){New-Item -ItemType Directory -Force -Path \$LogRoot|Out-Null};Add-Content -LiteralPath (Join-Path \$LogRoot 'provision.jsonl') -Value \$line}
+Write-Log INFO 'Optimise Windows (dummy)' @{}
+"@
+
+New-FileSafe (Join-Path $Root "scripts/windows/common/Enable-WinRM.ps1")           $enableWinRM
+New-FileSafe (Join-Path $Root "scripts/windows/common/Install-VMwareTools.ps1")   $installVMToolsWorking
+New-FileSafe (Join-Path $Root "scripts/windows/common/Optimise-Windows.ps1")      $optimiseWin
+
+$pkgVmtools = @"
+# Immutable snapshot of the working script (example)
+param([string]\$LogRoot = "C:\PackerLogs")
+function Write-Log{param([ValidateSet('INFO','WARN','ERROR')][string]\$Level,[string]\$Message,[hashtable]\$Data)\$ts=(Get-Date).ToString('s');\$o=[ordered]@{ts=\$ts;level=\$Level;msg=\$Message};if(\$Data){\$Data.GetEnumerator()|%{\$o[\$_.Key]=\$_.Value}}\$line=(\$o|ConvertTo-Json -Compress);if(-not(Test-Path \$LogRoot)){New-Item -ItemType Directory -Force -Path \$LogRoot|Out-Null};Add-Content -LiteralPath (Join-Path \$LogRoot 'provision.jsonl') -Value \$line}
+Write-Log INFO 'Install VMware Tools (package snapshot)' @{ package = 'IX-VMware-Tools_12.4.6_01' }
+"@
+New-FileSafe (Join-Path $Root "Packages/IX-VMware-Tools_12.4.6_01/Install-VMwareTools.ps1") $pkgVmtools
+New-FileSafe (Join-Path $Root "Packages/IX-VMware-Tools_12.4.6_01/CHANGELOG.md") "# Initial snapshot"
+
+# ========== Provisioner Components (optional HCL include) ==========
+$provCommon = @"
+# components/provisioners/windows.common.pkr.hcl (placeholder)
+# You can factor shared provisioners here and `source` them in builds if desired.
+"@
+New-FileSafe (Join-Path $Root "components/provisioners/windows.common.pkr.hcl") $provCommon
+New-FileSafe (Join-Path $Root "components/postprocessors/manifest.pkr.hcl")      "# placeholder"
+New-FileSafe (Join-Path $Root "components/postprocessors/sig.pkr.hcl")           "# placeholder"
+
+# ========== Floppy & ISO readme placeholders ==========
+New-FileSafe (Join-Path $Root "floppy/win11/vsphere/autounattend.xml") "<!-- optional floppy unattend (prefer HTTP) -->"
+New-FileSafe (Join-Path $Root "floppy/win11/azure/autounattend.xml")   "<!-- optional floppy unattend (prefer HTTP) -->"
+New-FileSafe (Join-Path $Root "floppy/win2025/vsphere/autounattend.xml") "<!-- optional floppy unattend (prefer HTTP) -->"
+New-FileSafe (Join-Path $Root "floppy/win2025/azure/autounattend.xml")   "<!-- optional floppy unattend (prefer HTTP) -->"
+
+New-FileSafe (Join-Path $Root "components/isos/win11/azure/README.txt")   "Use Azure marketplace image; ISO not required."
+New-FileSafe (Join-Path $Root "components/isos/win2025/azure/README.txt") "Use Azure marketplace image; ISO not required."
+New-FileSafe (Join-Path $Root "components/isos/win11/vsphere/Win11_24H2.iso")   "placeholder"
+New-FileSafe (Join-Path $Root "components/isos/win2025/vsphere/Win2025.iso")    "placeholder"
+
+Write-Log INFO "Scaffold complete" @{ root = $Root }
+
+# Tips to run:
+#   1) Put packer.exe under .\bin\
+#   2) Set env secrets for vSphere/Azure (or create *.auto.pkrvars.hcl ignored by Git)
+#   3) Build example:
+#      .\Build-Template.ps1 -Platform vsphere -Env dev -OS windows -Image win11-enterprise
