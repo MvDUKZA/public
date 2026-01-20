@@ -1,0 +1,93 @@
+1) PSADT v4 strictness
+
+Only use PSADT v4 functions:
+
+Start-ADTProcess
+
+Start-ADTMsiProcess
+
+Never use v3 names like Execute-Process, Execute-MSI.
+
+Wrapper scripts must invoke Invoke-AppDeployToolkit.exe with -DeploymentType Install|Uninstall and -DeployMode Silent by default.
+
+2) Injection must be idempotent
+
+Tell it explicitly:
+
+Insert/replace content only between markers:
+
+### PSPackageBuilder:BEGIN AUTO-INSTALL ###
+
+### PSPackageBuilder:END AUTO-INSTALL ###
+
+### PSPackageBuilder:BEGIN AUTO-UNINSTALL ###
+
+### PSPackageBuilder:END AUTO-UNINSTALL ###
+
+If markers exist, replace block, don’t add duplicates.
+
+If missing, insert once in the correct phase.
+
+3) Detection requirements (avoid common mistakes)
+
+Detect must check both 64-bit and 32-bit uninstall keys (WOW6432Node).
+
+detect.ps1 must return:
+
+exit 0 installed
+
+exit 1 not installed
+
+Prefer MSI ProductCode detection when available.
+
+4) Handle multi-file installers
+
+Provide a “select main installer” UX but copy/operate with the whole folder option (or at least “include sibling files” toggle), because many EXEs need adjacent CAB/DLL files.
+
+5) Non-interactive fallback
+
+Even if you’ll run it interactively, tell Copilot:
+
+If Out-GridView unavailable, fall back to console selection.
+
+If WinForms unavailable, fall back to Read-Host (but still require final confirmation).
+
+6) Update package.json (Script 2)
+
+Be explicit about a schema section so it doesn’t improvise:
+
+Add/update a Wrappers object with:
+
+PayloadRelativePath
+
+PayloadType
+
+InstallLine
+
+UninstallLine
+
+DetectMethod
+
+MsiProductCode (if any)
+
+LastUpdatedUtc
+
+UpdatedBy
+
+7) Safety constraints (avoid self-inflicted pain)
+
+Use Set-StrictMode -Version Latest
+
+$ErrorActionPreference = 'Stop'
+
+Always Join-Path (no string path concatenation)
+
+Never write outside the selected package folder
+
+Confirm overwrite if install.ps1/uninstall.ps1/detect.ps1 already exist
+
+Small but important: tell Copilot what NOT to do
+
+Add one line:
+
+“Do not paste PSADT documentation text; implement based on it.”
