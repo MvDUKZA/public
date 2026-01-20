@@ -1,0 +1,173 @@
+You are an expert PowerShell engineer. Build “PSPackageBuilder – Script 1” as a production-quality PowerShell module + thin runner script. Follow the requirements exactly. Output complete code files with paths and contents.
+
+## Context
+
+Script 1 authors and materialises application package folders in a central repository. It supports **New Package** and **Clone Existing Package** modes, extracts metadata from payload files, normalises vendor/product/version, generates a standards-compliant folder name, provides an editable final-name textbox for confirmation, then creates the folder, copies PSAppDeployToolkit + payloads, and writes `package.json` + `README.md`.
+
+Script 1 MUST NOT generate install/uninstall/detection wrappers (that is Script 2 and out of scope).
+
+## Hard Requirements (Do Not Deviate)
+
+1. **Defaults only in one place**
+
+* All hardcoded paths and environment defaults MUST exist ONLY in: `src/PSPackageBuilder/Private/Defaults.ps1`
+* Defaults must include: `RepoRoot`, `SourceRoot`, `PsadtTemplateRoot`, supported extensions, `DefaultTarget = 'X'`, filenames (`package.json`, `README.md`), and any behaviour flags.
+* All other code must resolve settings using precedence:
+
+  1. Explicit parameter
+  2. Pipeline context object property
+  3. Defaults.ps1
+
+2. **Target**
+
+* Target MUST default to `X`.
+* Target MUST NOT be inferred from file type.
+* In Clone mode, inherit Target from the cloned package unless user overrides.
+
+3. **User → Team**
+
+* Resolve current user and map AD group membership to a 3-letter team code (config file `config/TeamMap.json`).
+* If no mapping found, terminate with a clear error.
+* Team is immutable unless cloning (clone inherits).
+
+4. **Modes**
+
+* Prompt user to select one mode: New or Clone.
+* In Clone mode, user selects an existing package folder under `RepoRoot` and you read existing metadata from `package.json` (do not parse folder name).
+
+5. **Payload selection**
+
+* User selects one or more payload files from `SourceRoot`.
+* Supported extensions: `.msi`, `.exe`, `.msix`, `.appx`, `.msixbundle`, `.appxbundle`, `.ps1`, `.cmd`, `.bat`
+* Use Out-GridView for selection (assume Windows PowerShell/PS 7 with Out-GridView available). Provide a CLI fallback if Out-GridView is not available.
+
+6. **Metadata extraction (best effort)**
+
+* MSI: ProductName, ProductVersion, Manufacturer (Windows Installer COM)
+* MSIX/APPX and bundles: read `AppxManifest.xml` from the package, extract Identity.Version, Properties.DisplayName, Publisher; map publisher/vendor via vendor map.
+* EXE: use FileVersionInfo fields where available.
+* Scripts: filename-based.
+* Always return a standard metadata object with Confidence (High/Med/Low) and Source fields.
+
+7. **Vendor normalisation**
+
+* Load `config/VendorMap.json` and normalise vendor strings (e.g. “Microsoft Inc”, “Microsoft Corporation” → “Microsoft”).
+* Implement case-insensitive matching and trimming.
+* Product sanitisation: safe folder-name tokens, remove illegal characters, normalise whitespace/hyphens.
+
+8. **Version + Revision rules (Authoritative)**
+
+* New package: Revision = `01`, Version = extracted or fallback.
+* Clone:
+
+  * If new payload Version != existing Version → set Version to new Version and Revision = `01`
+  * If new payload Version == existing Version → keep Version and increment Revision (`02`, `03`, …)
+* Revisions must be 2 digits, zero-padded.
+
+9. **Folder naming**
+
+* Generate a proposed folder name that follows the organisation’s naming standard (implement in a single function that takes tokens and returns name).
+* Must validate illegal characters and naming compliance.
+* Must detect collisions and duplicates:
+
+  * Identical Vendor+Product+Version and identical payload hash must be blocked.
+  * Same Vendor+Product+Version with different payload hash may create a new revision.
+* Compute SHA256 for payload files.
+
+10. **Final editable confirmation**
+
+* At the end, show the proposed folder name in an **editable textbox dialog** (WinForms).
+* User can edit, then OK/Cancel.
+* Validate the edited name before materialisation.
+* If user cancels, exit cleanly.
+
+11. **Materialisation**
+    After confirmation:
+
+* Create folder under RepoRoot with final name.
+* Copy PSAppDeployToolkit template from `PsadtTemplateRoot` into the package folder.
+* Copy selected payload files into: `Files\Source\`
+* Write `package.json` manifest and `README.md`.
+* Package structure must be: <PackageFolder>
+  README.md
+  package.json
+  (PSADT template files)
+  Files
+  Source <payload files>
+
+12. **GitHub policy**
+
+* This repo contains code only; do not include payload/binaries.
+* Include a `.gitignore` that excludes common payload extensions and staging/cache directories.
+
+## Deliverables to Output (Code Files)
+
+Create these files with full contents:
+
+Repository root:
+
+* `README.md` (repo overview and usage)
+* `.gitignore`
+
+Config templates:
+
+* `config/TeamMap.json` (template with sample mappings)
+* `config/VendorMap.json` (template with common vendors + synonyms)
+
+Module files:
+
+* `src/PSPackageBuilder/PSPackageBuilder.psd1`
+* `src/PSPackageBuilder/PSPackageBuilder.psm1`
+
+Public functions:
+
+* `src/PSPackageBuilder/Public/New-PSPBContext.ps1`
+* `src/PSPackageBuilder/Public/Invoke-PSPackageBuild.ps1`
+
+Private functions (at minimum):
+
+* `src/PSPackageBuilder/Private/Defaults.ps1`
+* `src/PSPackageBuilder/Private/Resolve-Setting.ps1`
+* `src/PSPackageBuilder/Private/Read-Config.ps1`
+* `src/PSPackageBuilder/Private/Get-UserTeam.ps1`
+* `src/PSPackageBuilder/Private/Get-CandidateFiles.ps1`
+* `src/PSPackageBuilder/Private/Select-Mode.ps1`
+* `src/PSPackageBuilder/Private/Select-Payload.ps1`
+* `src/PSPackageBuilder/Private/Select-ExistingPackage.ps1`
+* `src/PSPackageBuilder/Private/Get-PackageMetadata.ps1`
+* `src/PSPackageBuilder/Private/Get-MsiMetadata.ps1`
+* `src/PSPackageBuilder/Private/Get-AppxMetadata.ps1`
+* `src/PSPackageBuilder/Private/Get-ExeMetadata.ps1`
+* `src/PSPackageBuilder/Private/Normalize-Vendor.ps1`
+* `src/PSPackageBuilder/Private/Sanitize-Token.ps1`
+* `src/PSPackageBuilder/Private/Normalize-Version.ps1`
+* `src/PSPackageBuilder/Private/New-FolderName.ps1`
+* `src/PSPackageBuilder/Private/Find-NextRevision.ps1`
+* `src/PSPackageBuilder/Private/Test-Duplicate.ps1`
+* `src/PSPackageBuilder/Private/Show-EditableNameDialog.ps1`
+* `src/PSPackageBuilder/Private/Write-PackageManifest.ps1`
+* `src/PSPackageBuilder/Private/Write-PackageReadme.ps1`
+* `src/PSPackageBuilder/Private/New-PackageMaterialized.ps1`
+
+Runner script:
+
+* `scripts/Invoke-PSPackageBuild.ps1` that imports the module from `src` and calls `Invoke-PSPackageBuild` with optional parameter overrides.
+
+## Implementation Notes
+
+* Use strict mode and set `$ErrorActionPreference = 'Stop'` in the runner.
+* Use robust error handling with clear messages.
+* Prefer objects over strings; only format at the edge.
+* Use `Join-Path` and avoid hardcoded path concatenation.
+* Ensure all file operations create missing directories safely.
+* No external dependencies beyond Windows/PowerShell built-ins.
+
+## Output Format
+
+For each file, output:
+
+* A header line with the file path
+* Then the full file content in a code block
+  Do not omit any file. Ensure the solution runs end-to-end.
+
+Now generate the complete repository with all files described above.
