@@ -1,0 +1,143 @@
+The build order I’d use
+1) Lay down the skeleton first (no logic yet)
+
+Create empty files with headers/comments and export the two public functions.
+
+PSPackageBuilder.psd1 / .psm1
+
+Public/Invoke-NewPSPackage.ps1
+
+Public/Invoke-NewPSPackageWrappers.ps1
+
+Private/Defaults.ps1 (only place with paths)
+
+This gives you something that imports cleanly immediately.
+
+2) Shared utilities next (everything depends on these)
+
+Do these before anything else:
+
+Private/Resolve-Setting.ps1
+
+Private/Read-Config.ps1
+
+Private/Show-EditableTextDialog.ps1 (WinForms textbox)
+
+Private/Sanitize-Token.ps1
+
+Private/Normalize-Version.ps1
+
+Private/Normalize-Vendor.ps1
+
+Once these exist, every other file is simpler and Copilot stops inventing duplicates.
+
+3) Script 1 core flow (get “New package” working first)
+
+Implement in this order:
+
+Get-UserTeam.ps1
+
+Get-CandidateFiles.ps1
+
+Select-Mode.ps1
+
+Select-Payload.ps1
+
+Get-MsiMetadata.ps1 (start with MSI only — easiest to trust)
+
+Get-ExeMetadata.ps1 (best-effort)
+
+Get-AppxMetadata.ps1 (zip manifest)
+
+Get-PackageMetadata.ps1 (router)
+
+New-FolderName.ps1
+
+Find-NextRevision.ps1
+
+Test-Duplicate.ps1
+
+Write-PackageManifest.ps1
+
+Write-PackageReadme.ps1
+
+New-PackageMaterialized.ps1
+
+Then wire it all in Invoke-NewPSPackage.ps1
+
+✅ Test: create 1 MSI package end-to-end.
+
+4) Add Script 1 clone mode (after New is stable)
+
+Select-ExistingPackage.ps1
+
+Clone rule logic (version/rev)
+
+Re-test cloning same version + new version
+
+5) Script 2 (wrappers) in the safest order
+
+Start with MSI because it’s deterministic.
+
+Selection + metadata
+
+Select-PackageFolder.ps1
+
+Select-PayloadFromPackage.ps1
+
+Get-MsiProductCode.ps1
+
+Find-MstTransforms.ps1
+
+Generation
+
+Build-InstallLine.ps1 (MSI first, then EXE, then script)
+
+Update-InvokeAppDeployToolkit.ps1 (marker injection, idempotent)
+
+Write-InstallWrapper.ps1
+
+Write-UninstallWrapper.ps1
+
+Write-DetectScript.ps1
+
+Update-PackageJson.ps1
+
+Then wire it all in Invoke-NewPSPackageWrappers.ps1
+
+✅ Test: run wrappers against the MSI package, then run install.ps1 on a VM.
+
+The “best” way to use Copilot for this
+
+Use one prompt per file, and include only:
+
+File path
+
+Inputs/outputs
+
+Hard constraints
+
+Examples of expected output object shape
+
+Example prompt template you can reuse:
+
+Create src/PSPackageBuilder/Private/Find-MstTransforms.ps1.
+Input: $SourceRootInPackage path.
+Output: array of MST file objects { FullName, RelativePath }.
+Requirements: recursive search under Files\Source, prefer MSTs in same dir as MSI, no UI, no hardcoded paths, throw on missing folder.
+
+That style keeps Copilot fast and accurate.
+
+Testing cadence (so you don’t get stuck)
+
+After Step 2: Import-Module succeeds
+
+After Step 3: New package works for MSI
+
+After Step 4: Clone logic works
+
+After Step 5: Wrappers work for MSI
+
+Don’t wait until “everything is written” to test — that’s where AI-generated projects go to die.
+
+If you want, I’ll give you a copy/paste “Copilot prompt” for the first 5 files (psm1/psd1/defaults/resolve-setting/dialog) so you can start building immediately with minimal friction.
