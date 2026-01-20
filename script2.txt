@@ -1,0 +1,224 @@
+You are an expert PowerShell engineer and PSAppDeployToolkit (PSADT) v4 specialist. Implement “Script2.ps1” for the PSPackageBuilder workflow.
+
+This script generates “light wrappers” for a PSADT v4 deployment that already exists on disk (created by Script 1). Script 2 must create/update exactly three files in the selected package folder:
+
+* install.ps1
+* uninstall.ps1
+* detect.ps1
+
+The package folder follows PSADT v4 template structure (Invoke-AppDeployToolkit.ps1 / Invoke-AppDeployToolkit.exe present, PSAppDeployToolkit\ folder, Files\ folder, etc.). PSADT v4 deployment invocation supports -DeploymentType and -File custom script options; base reference is PSADT v4 docs (How to Deploy + Installing Applications + Start-ADTProcess + Start-ADTMsiProcess). Use PSADT v4 functions Start-ADTProcess and Start-ADTMsiProcess for installs/uninstalls. Do NOT use PSADT v3 functions (Execute-Process/Execute-MSI).
+
+## Objectives
+
+1. User selects an existing package folder from the repository share.
+2. User selects the installer payload to wrap (EXE, MSI, or script) from the package’s payload location.
+3. Script generates install/uninstall/detect scripts that call PSADT v4 correctly and include a best-effort silent install command for the selected payload.
+4. Script detects MST transforms for MSI and applies them automatically.
+5. At the end, Script 2 MUST show the computed “install string” in an editable textbox and allow the user to modify it before writing files.
+
+## Inputs / Assumptions
+
+* The user points Script2 to a repository root OR Script2 discovers it from the selected package location.
+* The selected package folder contains:
+
+  * package.json (created by Script 1)
+  * PSADT v4 template content (Invoke-AppDeployToolkit.ps1 and Invoke-AppDeployToolkit.exe in root)
+  * Payload(s) under Files\Source\ (from Script 1)
+* Supported payload selection for Script2 is limited to:
+
+  * MSI (.msi)
+  * EXE (.exe)
+  * Scripts: .ps1, .cmd, .bat
+* If Out-GridView is available, use it for selection; otherwise provide a CLI fallback.
+
+## Required Behaviour (High Level Flow)
+
+1. Prompt user to select a package folder:
+
+   * Default browse root = repo root; allow passing -PackagePath directly.
+   * Validate selected folder contains Invoke-AppDeployToolkit.exe or Invoke-AppDeployToolkit.ps1 and Files\ folder.
+2. Read package.json for metadata (at minimum Vendor/AppName/AppVersion/AppRevision and naming tokens).
+3. Prompt user to select the payload to wrap from Files\Source (recursive allowed):
+
+   * Show full path, size, last write time.
+4. Determine payload type and build a best-effort silent “install line” that will run inside PSADT v4:
+
+   * MSI -> Start-ADTMsiProcess
+   * EXE -> Start-ADTProcess
+   * Script -> Start-ADTProcess calling PowerShell/cmd as appropriate
+5. If MSI:
+
+   * Detect any .mst files in same directory as the MSI (or under Files\Source) and allow user selection (multi-select allowed).
+   * Prefer automatic selection if exactly 1 MST found.
+   * Build Start-ADTMsiProcess with -Transforms if any selected.
+   * Also extract MSI ProductCode for uninstall/detect where possible using WindowsInstaller COM.
+6. For EXE:
+
+   * Provide suggested silent switches list and try to infer a default (best effort; never assume perfect).
+   * Examples of suggested switches: /S, /silent, /verysilent, /qn, -s, -silent
+   * User must be able to edit the final argument list.
+7. For Script payload:
+
+   * If .ps1: build Start-ADTProcess to call powershell.exe with -ExecutionPolicy Bypass -NoProfile -File "<payload>"
+   * If .cmd/.bat: build Start-ADTProcess to call cmd.exe /c "<payload>"
+8. Show the computed “install line” in an EDITABLE textbox dialog (WinForms):
+
+   * Pre-fill with the computed line (a single PowerShell statement string).
+   * User can edit.
+   * On OK: validate it is not empty and does not contain illegal characters that would break a .ps1 file.
+   * On Cancel: exit without changes.
+9. Generate/overwrite the 3 wrapper files in the package root:
+
+   * install.ps1
+   * uninstall.ps1
+   * detect.ps1
+     Each must be self-contained and work when executed from the package root.
+
+## Wrapper Script Requirements
+
+### A) install.ps1
+
+Purpose: Kick off PSADT v4 “Install” deployment using Invoke-AppDeployToolkit.exe and run a custom script file, or (preferred) call Invoke-AppDeployToolkit.exe normally with Install deployment type and rely on a custom “Install command” injection.
+
+Implementation constraints:
+
+* Must run from the package root.
+* Must call PSADT v4 correctly using Invoke-AppDeployToolkit.exe with:
+
+  * -DeploymentType Install
+  * -DeployMode Silent (default; allow overriding via parameter)
+  * Optional: -SuppressRebootPassThru switch (configurable)
+* Must pass the final computed install line into the PSADT deployment script logic.
+
+Preferred approach:
+
+1. Script2 should update/insert a clearly delimited section in Invoke-AppDeployToolkit.ps1 (in the Install phase) with the final install line, e.g.
+
+   * Markers:
+
+     * “### PSPackageBuilder:BEGIN AUTO-INSTALL ###”
+     * “### PSPackageBuilder:END AUTO-INSTALL ###”
+2. install.ps1 should simply call:
+
+   * Invoke-AppDeployToolkit.exe -DeploymentType Install -DeployMode Silent
+3. The actual installer execution should be the generated Start-ADTProcess/Start-ADTMsiProcess line inserted between those markers.
+
+Notes:
+
+* Use Start-ADTProcess for EXE and script payloads.
+* Use Start-ADTMsiProcess for MSI payloads.
+* For MSI, if MST present, include -Transforms. For MSI properties, include -AdditionalArgumentList only if user supplies it (optional).
+* Use relative file references consistent with PSADT guidance: file is under Files\Source, so use $adtSession.DirFiles or explicit relative path as appropriate.
+
+### B) uninstall.ps1
+
+Purpose: Kick off PSADT v4 “Uninstall” deployment.
+
+Implementation constraints:
+
+* Must call Invoke-AppDeployToolkit.exe -DeploymentType Uninstall -DeployMode Silent by default.
+
+Uninstall logic generation:
+
+* If payload type MSI:
+
+  * Prefer uninstall by ProductCode if extracted successfully (Start-ADTMsiProcess -Action Uninstall -ProductCode <GUID>).
+  * If ProductCode unavailable: use Start-ADTMsiProcess -Action Uninstall -FilePath <msi> (best-effort) or uninstall via Get-ADTApplication -> Uninstall-ADTApplication with name filter as fallback.
+* If payload type EXE:
+
+  * Attempt best-effort uninstall via Get-ADTApplication on AppName from package.json and call Uninstall-ADTApplication; if ambiguous, prompt user for uninstall command and store it in the injected uninstall section.
+* If payload type Script:
+
+  * Provide placeholder uninstall (commented) and return success by default, or prompt user for uninstall script/command.
+
+Script2 must also insert/update an auto-generated uninstall block in Invoke-AppDeployToolkit.ps1 between markers:
+
+* “### PSPackageBuilder:BEGIN AUTO-UNINSTALL ###”
+* “### PSPackageBuilder:END AUTO-UNINSTALL ###”
+
+### C) detect.ps1
+
+Purpose: Provide a detection script suitable for SCCM/Intune detection, returning process exit codes:
+
+* Exit 0 = detected/installed
+* Exit 1 = not detected
+
+Detection logic:
+
+* For MSI and EXE:
+
+  * Prefer Get-ADTApplication (registry-based) if PSADT module is available; however detect.ps1 should not require PSADT to be imported (preferred). Implement detection using registry queries equivalent to Get-ADTApplication behaviour OR import PSADT if local paths are reliable.
+  * If MSI ProductCode known, detect by ProductCode in uninstall registry keys.
+  * Otherwise detect by DisplayName contains AppName from package.json; optionally validate DisplayVersion equals package.json Version.
+* For MSIX/AppX (if encountered):
+
+  * Detect via Get-AppxPackage (AllUsers handling optional).
+* For Script payload:
+
+  * Detect via existence of a marker file or registry key; if none available, provide a clear TODO and return 1 by default.
+
+detect.ps1 MUST read package.json to get AppName/AppVersion and any ProductCode stored.
+
+## package.json updates (Script2 responsibility)
+
+Script2 must update package.json with wrapper metadata so future tooling can rely on it:
+
+* SelectedPayloadPath (relative to package root)
+* PayloadType (MSI/EXE/SCRIPT)
+* InstallLine (final edited line)
+* UninstallLine (generated or placeholder)
+* DetectMethod and key properties:
+
+  * MSI ProductCode if available
+  * DisplayName/DisplayVersion used for detection
+* Timestamp and author
+
+## User Interaction Requirements
+
+* Use Out-GridView for selecting package folder and payload when possible.
+* Must show final computed Install line in an editable textbox at the end (WinForms) and allow user edits before writing.
+* For MSI MST transforms: if multiple found, allow selection (Out-GridView multi-select).
+
+## Error Handling
+
+* $ErrorActionPreference = 'Stop' in the runner; use try/catch with clear errors.
+* Fail fast if:
+
+  * Package folder missing PSADT v4 entrypoints
+  * Payload not selected
+  * User cancels final install line edit
+* Warn (do not fail) if:
+
+  * Silent switches for EXE could not be inferred; require user edit.
+
+## Deliverables (Code Files)
+
+Create:
+
+* scripts/Script2.ps1 (runner that calls functions)
+* A module folder under src/PSPackageBuilder/ or a new module src/PSPackageBuilder.Wrappers/ (choose one, but keep naming consistent) that contains:
+
+  * Public: Invoke-PSPBWrapperBuild (or similar)
+  * Private helper functions:
+
+    * Select-PackageFolder
+    * Select-PayloadFromPackage
+    * Get-MsiProductCode
+    * Find-MstTransforms
+    * Build-InstallLine (returns PowerShell statement string using Start-ADTProcess/Start-ADTMsiProcess)
+    * Show-EditableTextDialog
+    * Update-InvokeAppDeployToolkitScript (inject blocks between markers)
+    * Write-InstallWrapper / Write-UninstallWrapper / Write-DetectScript
+    * Update-PackageJson
+* Script2 must overwrite existing install.ps1/uninstall.ps1/detect.ps1 after confirmation.
+
+## References (must be consistent with PSADT v4)
+
+* Installing applications uses Start-ADTProcess and Start-ADTMsiProcess; Start-ADTMsiProcess supports -Transforms and -AdditionalArgumentList.
+* Deployment invocation uses Invoke-AppDeployToolkit.exe or Invoke-AppDeployToolkit.ps1 with -DeploymentType and -DeployMode parameters.
+
+Now generate the complete implementation with file paths and full contents for each file. Output each file with:
+
+1. A header line with the file path
+2. The full file content in a code block
+   Do not omit any required file.
