@@ -671,7 +671,8 @@ $parseScriptBlock = {
                 $postBoot = @($bootEvts | Where-Object { $_.TimeGenerated -gt $anchor })
 
                 $chosen = if ($postBoot.Count -gt 0) {
-                    ($postBoot | Where-Object { $_.EventCode -eq 1074 } | Select-Object -First 1) ?? $postBoot[0]
+                    $ev1074 = $postBoot | Where-Object { $_.EventCode -eq 1074 } | Select-Object -First 1
+                    if ($ev1074) { $ev1074 } else { $postBoot[0] }
                 }
                 else { $bootEvts | Select-Object -Last 1 }
 
