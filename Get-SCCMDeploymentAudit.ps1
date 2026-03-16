@@ -38,7 +38,7 @@
 
 .NOTES
     Author  : SCCM Deployment Audit Tool
-    Version : 2.0
+    Version : 2.1
     Requires: SCCM Admin Console installed (ConfigurationManager module), or
               WMI access to the Site Server, plus WinRM / CIM access to target machines.
               Run as an account with SCCM Read rights and local admin on targets.
@@ -61,13 +61,13 @@ $ErrorActionPreference = 'SilentlyContinue'
 Clear-Host
 Write-Host ""
 Write-Host "  ╔══════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
-Write-Host "  ║       SCCM Deployment Audit Tool  v2.0                  ║" -ForegroundColor Cyan
+Write-Host "  ║       SCCM Deployment Audit Tool  v2.1                  ║" -ForegroundColor Cyan
 Write-Host "  ║  Download · Install · Restart timestamps per machine    ║" -ForegroundColor Cyan
 Write-Host "  ╚══════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
 Write-Host ""
 #endregion
 
-#region ── Prompt for parameters if not supplied ───────────────────────────────
+#region ── Prompt for parameters – Site Server & Site Code (plain read if needed) ──
 function Read-Prompt {
     param([string]$Label, [string]$Default = "")
     $display = if ($Default) { "$Label [$Default]" } else { $Label }
@@ -76,10 +76,169 @@ function Read-Prompt {
     return $val.Trim()
 }
 
-if (-not $SiteServer)    { $SiteServer    = Read-Prompt "SCCM Site Server / MP FQDN" "SCCM-MP01.corp.local" }
-if (-not $SiteCode)      { $SiteCode      = Read-Prompt "Site Code" "PS1" }
-if (-not $CollectionName){ $CollectionName= Read-Prompt "Device Collection Name" "All Workstations - Prod" }
-if (-not $KBArticle)     { $KBArticle     = Read-Prompt "KB Article (e.g. KB5034441)" }
+if (-not $SiteServer) { $SiteServer = Read-Prompt "SCCM Site Server / MP FQDN" "SCCM-MP01.corp.local" }
+if (-not $SiteCode)   { $SiteCode   = Read-Prompt "Site Code" "PS1" }
+
+$sccmNamespace = "root\SMS\site_$SiteCode"
+#endregion
+
+#region ── Out-GridView: Collection picker ─────────────────────────────────────
+if (-not $CollectionName) {
+    Write-Host ""
+    Write-Host "  [*] Fetching device collections from $SiteServer ..." -ForegroundColor Cyan
+
+    try {
+        $allCollections = Get-WmiObject -ComputerName $SiteServer `
+                                        -Namespace $sccmNamespace `
+                                        -Class SMS_Collection `
+                                        -Filter "CollectionType = 2" `
+                                        -ErrorAction Stop |
+                          Select-Object  Name,
+                                         CollectionID,
+                                         @{N='MemberCount'; E={$_.MemberCount}},
+                                         Comment,
+                                         @{N='LastRefresh'; E={ [System.Management.ManagementDateTimeConverter]::ToDateTime($_.LastRefreshTime) }} |
+                          Sort-Object Name
+
+        if (-not $allCollections) { throw "No device collections returned." }
+
+        Write-Host "  [+] $($allCollections.Count) collections found. Select one in the grid window." -ForegroundColor Green
+
+        $selectedCollection = $allCollections |
+            Out-GridView -Title "Select Device Collection to Audit  (single-select then click OK)" `
+                         -OutputMode Single
+
+        if (-not $selectedCollection) {
+            Write-Error "No collection selected. Exiting."
+            exit 1
+        }
+
+        $CollectionName = $selectedCollection.Name
+        $CollectionID   = $selectedCollection.CollectionID
+        Write-Host "  [+] Selected collection : $CollectionName  ($CollectionID)" -ForegroundColor Green
+    }
+    catch {
+        Write-Warning "  [!] Could not retrieve collections via WMI: $_"
+        $CollectionName = Read-Prompt "Enter Collection Name manually"
+        $CollectionID   = $null
+    }
+}
+#endregion
+
+#region ── Out-GridView: KB / Deployment picker ────────────────────────────────
+if (-not $KBArticle) {
+    Write-Host ""
+    Write-Host "  [*] Fetching software update deployments from $SiteServer ..." -ForegroundColor Cyan
+
+    try {
+        # SMS_UpdatesAssignment gives us all SUG deployments; join to SMS_SoftwareUpdate for KB details
+        $deployments = Get-WmiObject -ComputerName $SiteServer `
+                                     -Namespace $sccmNamespace `
+                                     -Class SMS_UpdatesAssignment `
+                                     -ErrorAction Stop |
+                       Select-Object AssignmentName,
+                                     AssignmentID,
+                                     @{N='TargetCollection'; E={$_.TargetCollectionID}},
+                                     @{N='CreationTime';     E={ [System.Management.ManagementDateTimeConverter]::ToDateTime($_.CreationTime) }},
+                                     @{N='EnforcementDeadline'; E={
+                                         if ($_.EnforcementDeadline) {
+                                             [System.Management.ManagementDateTimeConverter]::ToDateTime($_.EnforcementDeadline)
+                                         } else { 'No deadline' }
+                                     }} |
+                       Sort-Object CreationTime -Descending
+
+        # Also fetch individual software updates so user can pick by KB if preferred
+        Write-Host "  [*] Fetching available software updates (KB list) ..." -ForegroundColor Cyan
+        $swUpdates = Get-WmiObject -ComputerName $SiteServer `
+                                   -Namespace $sccmNamespace `
+                                   -Class SMS_SoftwareUpdate `
+                                   -Filter "IsSuperseded = 0 AND IsExpired = 0" `
+                                   -ErrorAction Stop |
+                     Select-Object ArticleID,
+                                   BulletinID,
+                                   LocalizedDisplayName,
+                                   @{N='Severity';     E={
+                                       switch ($_.SeverityName) {
+                                           'Critical'  {'Critical'}
+                                           'Important' {'Important'}
+                                           'Moderate'  {'Moderate'}
+                                           'Low'       {'Low'}
+                                           default     {'None/Unknown'}
+                                       }
+                                   }},
+                                   @{N='Released';     E={ [System.Management.ManagementDateTimeConverter]::ToDateTime($_.DateRevised) }},
+                                   NumMissing |
+                     Sort-Object Released -Descending
+
+        Write-Host "  [+] $($swUpdates.Count) active updates found. Choose how to select:" -ForegroundColor Green
+        Write-Host ""
+        Write-Host "   [1] Pick from Deployments (SUG assignments)" -ForegroundColor White
+        Write-Host "   [2] Pick from individual KB / Software Update list" -ForegroundColor White
+        Write-Host ""
+        $pickMode = Read-Host "  Choice [1/2]"
+
+        if ($pickMode -eq '2') {
+            # ── Individual KB picker ──────────────────────────────────────────
+            $selectedUpdate = $swUpdates |
+                Out-GridView -Title "Select KB / Software Update to Audit  (single-select then click OK)" `
+                             -OutputMode Single
+
+            if (-not $selectedUpdate) {
+                Write-Error "No update selected. Exiting."
+                exit 1
+            }
+
+            $KBArticle = "KB$($selectedUpdate.ArticleID)"
+            Write-Host "  [+] Selected update : $KBArticle — $($selectedUpdate.LocalizedDisplayName)" -ForegroundColor Green
+        }
+        else {
+            # ── Deployment / SUG assignment picker ────────────────────────────
+            if (-not $deployments) { throw "No deployments returned." }
+
+            $selectedDeployment = $deployments |
+                Out-GridView -Title "Select Deployment (SUG Assignment) to Audit  (single-select then click OK)" `
+                             -OutputMode Single
+
+            if (-not $selectedDeployment) {
+                Write-Error "No deployment selected. Exiting."
+                exit 1
+            }
+
+            # Resolve KB articles within that assignment via SMS_UpdatesAssignment_UniqueID
+            Write-Host "  [*] Resolving updates in deployment '$($selectedDeployment.AssignmentName)' ..." -ForegroundColor Cyan
+            $assignUpdates = Get-WmiObject -ComputerName $SiteServer `
+                                           -Namespace $sccmNamespace `
+                                           -Query "SELECT * FROM SMS_SoftwareUpdate WHERE CI_ID IN (SELECT UpdateCI_ID FROM SMS_UpdatesAssignment WHERE AssignmentID = $($selectedDeployment.AssignmentID))" `
+                                           -ErrorAction SilentlyContinue |
+                             Select-Object ArticleID, BulletinID, LocalizedDisplayName,
+                                           @{N='Released'; E={ [System.Management.ManagementDateTimeConverter]::ToDateTime($_.DateRevised) }} |
+                             Sort-Object Released -Descending
+
+            if ($assignUpdates -and @($assignUpdates).Count -gt 1) {
+                Write-Host "  [+] $(@($assignUpdates).Count) updates in this deployment. Select the specific KB (or cancel to audit all)." -ForegroundColor Yellow
+                $selectedUpdate = $assignUpdates |
+                    Out-GridView -Title "Select specific KB within deployment (cancel = audit all)" `
+                                 -OutputMode Single
+
+                $KBArticle = if ($selectedUpdate) { "KB$($selectedUpdate.ArticleID)" } else { "AllInDeployment" }
+            }
+            elseif ($assignUpdates) {
+                $KBArticle = "KB$(@($assignUpdates)[0].ArticleID)"
+                Write-Host "  [+] Single update in deployment: $KBArticle" -ForegroundColor Green
+            }
+            else {
+                $KBArticle = Read-Prompt "Could not resolve KBs automatically. Enter KB Article"
+            }
+
+            Write-Host "  [+] Selected deployment : $($selectedDeployment.AssignmentName)" -ForegroundColor Green
+            Write-Host "  [+] KB Article          : $KBArticle" -ForegroundColor Green
+        }
+    }
+    catch {
+        Write-Warning "  [!] Could not retrieve deployments/updates via WMI: $_"
+        $KBArticle = Read-Prompt "Enter KB Article manually (e.g. KB5034441)"
+    }
+}
 
 $KBNumber = $KBArticle -replace '[^0-9]', ''   # strip non-numeric for WMI queries
 
@@ -94,22 +253,21 @@ Write-Host ""
 #endregion
 
 #region ── Get collection members from SCCM via WMI ───────────────────────────
-Write-Host "  [*] Connecting to SCCM Site Server..." -ForegroundColor Cyan
+Write-Host "  [*] Resolving collection members..." -ForegroundColor Cyan
 
-$sccmNamespace = "root\SMS\site_$SiteCode"
 $machines = @()
 
 try {
-    # Query SMS_FullCollectionMembership for the named collection
-    $collectionQuery = "SELECT CollectionID FROM SMS_Collection WHERE Name = '$($CollectionName -replace "'","''")'"
-    $collObj = Get-WmiObject -ComputerName $SiteServer -Namespace $sccmNamespace `
-                             -Query $collectionQuery -ErrorAction Stop
-
-    if (-not $collObj) {
-        throw "Collection '$CollectionName' not found on $SiteServer."
+    # Reuse CollectionID already fetched by the picker, or look it up now
+    if (-not $CollectionID) {
+        $collectionQuery = "SELECT CollectionID FROM SMS_Collection WHERE Name = '$($CollectionName -replace "'","''")'"
+        $collObj = Get-WmiObject -ComputerName $SiteServer -Namespace $sccmNamespace `
+                                 -Query $collectionQuery -ErrorAction Stop
+        if (-not $collObj) { throw "Collection '$CollectionName' not found on $SiteServer." }
+        $CollectionID = $collObj.CollectionID
     }
 
-    $collectionID = $collObj.CollectionID
+    $collectionID = $CollectionID
     Write-Host "  [+] Collection ID: $collectionID" -ForegroundColor Green
 
     $memberQuery = "SELECT Name, ResourceID FROM SMS_FullCollectionMembership WHERE CollectionID = '$collectionID'"
