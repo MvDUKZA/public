@@ -282,15 +282,8 @@ Set-Location $originalLocation
 
 Write-Host "[4/4] Parsing client logs on each device...`n" -ForegroundColor Cyan
 
-#
-# Log base names grouped by the events they carry.
-# We process each group with targeted patterns rather than generic regex,
-# to avoid false positives from unrelated KB mentions in the same line.
-#
-$downloadLogs = @('CAS', 'ContentTransferManager', 'DataTransferService')
-$installLogs  = @('UpdatesHandler', 'UpdatesDeployment', 'WUAHandler')
-$rebootLogs   = @('RebootCoordinator', 'UpdatesDeployment', 'UpdatesHandler')
-$allLogBases  = ($downloadLogs + $installLogs + $rebootLogs) | Select-Object -Unique
+$allLogBases = @('CAS','ContentTransferManager','DataTransferService',
+                 'UpdatesHandler','UpdatesDeployment','WUAHandler','RebootCoordinator')
 
 $results = [System.Collections.Generic.List[PSCustomObject]]::new()
 
@@ -343,38 +336,156 @@ foreach ($machine in $machines) {
     }
 
     # ════════════════════════════════════════════════════════════════════════
-    # DOWNLOAD EVENTS  —  CAS.log, ContentTransferManager.log, DataTransferService.log
+    # PHASE 1 — Build GUID → KB map from UpdatesDeployment.log
     #
-    # CAS.log:
-    #   "Requesting content <KB>.....  ContentID=..."
-    #   "Successfully retrieved content for <KB>"
-    #   "Content <id> is available in cache"
+    # Real log line format observed:
+    #   Update (Site_XXXX/SUM_<GUID>) Name (...KB5079473...) ArticleID (5079473)
+    #   added to the targeted list of deployment ({collection-GUID})
     #
-    # ContentTransferManager.log:
-    #   "CCM_CTM job {GUID} created for content <KB>"
-    #   "CCM_CTM job {GUID} (corresponding DTS job {GUID}) - Transfer completed"
-    #
-    # DataTransferService.log:
-    #   "DTS job {GUID}  started" / "DTS job {GUID}  - transfer successful"
+    # We extract the SUM_<GUID> and the ArticleID number from each such line
+    # to build a lookup table used in Phase 2.
     # ════════════════════════════════════════════════════════════════════════
 
-    foreach ($base in $downloadLogs) {
+    $guidToKB = @{}   # SUM_<guid-string> (lower) → "KB######"
+
+    $udLines = Read-LogLines -Paths $logFileMap['UpdatesDeployment'] -Verbose:$VerboseLogs
+    foreach ($entry in $udLines) {
+        $ln = $entry.Line
+        # Extract SUM GUID:  SUM_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+        $sumGuid = if ($ln -match '(?i)SUM_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})') {
+            $Matches[1].ToLower()
+        } else { $null }
+
+        # Extract ArticleID — format: ArticleID (5079473) or ArticleID=5079473
+        $articleId = if ($ln -match '(?i)ArticleID[\s\(]+(\d{5,8})') { $Matches[1] } else { $null }
+
+        if ($sumGuid -and $articleId) {
+            $kbKey = "KB$articleId"
+            if (-not $guidToKB.ContainsKey($sumGuid)) {
+                $guidToKB[$sumGuid] = $kbKey
+            }
+            # Pre-create the KB record so it exists even if install events are missing
+            Ensure-KBRecord $kbKey | Out-Null
+        }
+
+        # Also parse any direct KB mentions on the same line (belt-and-braces)
+        $ts  = Parse-SCCMTimestamp -Line $ln
+        $kbs = Get-KBsFromLine -Line $ln
+        foreach ($kb in $kbs) { Ensure-KBRecord $kb | Out-Null }
+    }
+
+    Write-Host "    GUID→KB map: $($guidToKB.Count) entries" -ForegroundColor DarkGray
+
+    # ════════════════════════════════════════════════════════════════════════
+    # PHASE 2 — Parse UpdatesHandler.log using GUID→KB map
+    #
+    # UpdatesHandler uses SUM GUIDs, not KB numbers. Key patterns:
+    #   "Update (Site_.../SUM_<guid>) - EnumeratingUpdates"       → we see this update
+    #   "Update (Site_.../SUM_<guid>) - WaitForInstall"           → queued for install
+    #   "Update (Site_.../SUM_<guid>) - Installing"               → install started
+    #   "Update (Site_.../SUM_<guid>) - Installed"                → install complete
+    #   "Update (Site_.../SUM_<guid>) - PendingReboot"            → reboot needed
+    #   "Update (Site_.../SUM_<guid>) - Failed"                   → failed
+    # ════════════════════════════════════════════════════════════════════════
+
+    $uhLines = Read-LogLines -Paths $logFileMap['UpdatesHandler'] -Verbose:$VerboseLogs
+    foreach ($entry in $uhLines) {
+        $ln = $entry.Line
+        $l  = $ln.ToLower()
+        $ts = Parse-SCCMTimestamp -Line $ln
+
+        # Extract SUM GUID from this line
+        $sumGuid = if ($ln -match '(?i)SUM_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})') {
+            $Matches[1].ToLower()
+        } else { $null }
+
+        if (-not $sumGuid) { continue }
+
+        # Resolve GUID → KB
+        $kb = if ($guidToKB.ContainsKey($sumGuid)) { $guidToKB[$sumGuid] } else { $null }
+        if (-not $kb) { continue }
+
+        $rec = Ensure-KBRecord $kb
+
+        # Install queued / starting
+        if ($ts -and (-not $rec.InstallStart) -and
+            ($l -match 'waitforinstall|- installing|- ciinstalling|cistate.*install|install.*action')) {
+            $rec.InstallStart = $ts
+        }
+        # Install complete
+        if ($ts -and (-not $rec.InstallEnd) -and
+            ($l -match '- installed\b|- succeeded|successfully installed|install.*success|ciinstalled\b')) {
+            $rec.InstallEnd = $ts
+        }
+        # Pending reboot
+        if ($l -match 'pendingreboot|- pendingreboot|reboot.*required|pending.*reboot') {
+            $rec.RebootRequired = $true
+        }
+    }
+
+    # ════════════════════════════════════════════════════════════════════════
+    # PHASE 3 — WUAHandler.log for install start/end (fallback if UpdatesHandler
+    # didn't fire — WUA does log "Adding update (KBxxxxxxx) to the installation
+    # list" and "Installation job completed" even when KB lines are sparse)
+    # ════════════════════════════════════════════════════════════════════════
+
+    $wuaLines = Read-LogLines -Paths $logFileMap['WUAHandler'] -Verbose:$VerboseLogs
+    foreach ($entry in $wuaLines) {
+        $ln  = $entry.Line
+        $l   = $ln.ToLower()
+        $ts  = Parse-SCCMTimestamp -Line $ln
+        $kbs = Get-KBsFromLine -Line $ln
+
+        foreach ($kb in $kbs) {
+            $rec = Ensure-KBRecord $kb
+            if ($ts -and (-not $rec.InstallStart) -and
+                ($l -match 'adding update|install.*list|async.*install|wua.*install')) {
+                $rec.InstallStart = $ts
+            }
+            if ($ts -and (-not $rec.InstallEnd) -and
+                ($l -match 'successfully installed|install.*complet|installation.*job.*complet')) {
+                $rec.InstallEnd = $ts
+            }
+            if ($l -match 'reboot.*required|pending.*reboot') {
+                $rec.RebootRequired = $true
+            }
+        }
+
+        # WUAHandler also logs "Installation job completed" without a KB on the line —
+        # apply as InstallEnd to all KBs that have a start but no end yet
+        if ($ts -and (-not $kbs) -and ($l -match 'installation.*job.*complet|async.*install.*complet')) {
+            foreach ($kb in $kbData.Keys) {
+                $rec = $kbData[$kb]
+                if ($rec.InstallStart -and (-not $rec.InstallEnd)) {
+                    $rec.InstallEnd = $ts
+                }
+            }
+        }
+    }
+
+    # ════════════════════════════════════════════════════════════════════════
+    # PHASE 4 — Download events from CAS / ContentTransferManager / DataTransferService
+    # On VDI these are often absent (pre-staged content) but we still try.
+    # We match on content GUIDs that appear in CAS alongside KB mentions in
+    # UpdatesDeployment — or fall back to any KB number present on the line.
+    # ════════════════════════════════════════════════════════════════════════
+
+    foreach ($base in @('CAS','ContentTransferManager','DataTransferService')) {
         $lines = Read-LogLines -Paths $logFileMap[$base] -Verbose:$VerboseLogs
         foreach ($entry in $lines) {
-            $ln = $entry.Line
-            $l  = $ln.ToLower()
-            $ts = Parse-SCCMTimestamp -Line $ln
+            $ln  = $entry.Line
+            $l   = $ln.ToLower()
+            $ts  = Parse-SCCMTimestamp -Line $ln
             $kbs = Get-KBsFromLine -Line $ln
 
             foreach ($kb in $kbs) {
                 $rec = Ensure-KBRecord $kb
-
                 if ($ts -and (-not $rec.DownloadStart) -and
-                    ($l -match 'requesting content|cas.*download|job.*created.*content|initiating download|starting download|download.*start|acquiring content')) {
+                    ($l -match 'requesting content|download.*start|initiating.*download|acquiring|job.*created')) {
                     $rec.DownloadStart = $ts
                 }
                 if ($ts -and (-not $rec.DownloadEnd) -and
-                    ($l -match 'successfully retrieved|content.*available|transfer completed|transfer successful|download.*complet|download.*success|content.*download.*done')) {
+                    ($l -match 'successfully retrieved|content.*available|transfer.*complet|transfer.*success|download.*complet')) {
                     $rec.DownloadEnd = $ts
                 }
             }
@@ -382,103 +493,27 @@ foreach ($machine in $machines) {
     }
 
     # ════════════════════════════════════════════════════════════════════════
-    # INSTALL EVENTS  —  UpdatesHandler.log, UpdatesDeployment.log, WUAHandler.log
-    #
-    # UpdatesHandler.log:
-    #   "Update (KB5079473) - WaitForInstall"
-    #   "Update (KB5079473) Status = ciStateInstalling"
-    #   "Successfully installed update KB5079473"
-    #   "Update (KB5079473) - Failed to install"
-    #
-    # WUAHandler.log:
-    #   "Adding update (KB5079473) to the installation list"
-    #   "Async installation of updates has been requested"
-    #   "Successfully installed all listed updates"
-    #   "Installation of updates completed"
-    #
-    # UpdatesDeployment.log:
-    #   "CUpdatesJob({GUID}): Install assignment action"
-    #   "Update (KB5079473) is installed"
+    # PHASE 5 — RebootCoordinator: machine-level reboot timestamp
+    # Applied to all KBs that have RebootRequired=true and no RebootTime yet.
     # ════════════════════════════════════════════════════════════════════════
 
-    foreach ($base in $installLogs) {
-        $lines = Read-LogLines -Paths $logFileMap[$base] -Verbose:$VerboseLogs
-        foreach ($entry in $lines) {
-            $ln = $entry.Line
-            $l  = $ln.ToLower()
-            $ts = Parse-SCCMTimestamp -Line $ln
-            $kbs = Get-KBsFromLine -Line $ln
+    $rcLines = Read-LogLines -Paths $logFileMap['RebootCoordinator'] -Verbose:$VerboseLogs
+    foreach ($entry in $rcLines) {
+        $ln = $entry.Line
+        $l  = $ln.ToLower()
+        $ts = Parse-SCCMTimestamp -Line $ln
 
-            foreach ($kb in $kbs) {
-                $rec = Ensure-KBRecord $kb
+        $isRebootEvent = ($l -match 'scheduled reboot|rebootby|entered schedulerebootimpl|a reboot was requested|system.*restart.*initiated|initiating.*restart')
 
-                if ($ts -and (-not $rec.InstallStart) -and
-                    ($l -match 'waitforinstall|ciinstalling|cistate.*install|adding update.*install|install.*list|async.*install.*request|install.*action|starting.*install|begin.*install|install.*start')) {
-                    $rec.InstallStart = $ts
-                }
-                if ($ts -and (-not $rec.InstallEnd) -and
-                    ($l -match 'successfully installed|install.*success|install.*complet|update.*is installed|installation.*completed|all.*updates.*install')) {
-                    $rec.InstallEnd = $ts
-                }
-                # Also catch reboot-required flags in install logs
-                if ($l -match 'reboot.*required|restart.*required|pending.*reboot|requires.*restart|reboot pending') {
+        if ($ts -and $isRebootEvent) {
+            foreach ($kb in $kbData.Keys) {
+                $rec = $kbData[$kb]
+                if (-not $rec.RebootTime) {
+                    $rec.RebootTime     = $ts
                     $rec.RebootRequired = $true
                 }
             }
-        }
-    }
-
-    # ════════════════════════════════════════════════════════════════════════
-    # REBOOT EVENTS  —  RebootCoordinator.log, UpdatesDeployment.log, UpdatesHandler.log
-    #
-    # RebootCoordinator.log:
-    #   "Reboot required! Notifying users."
-    #   "Reboot coordinator is initiating a system restart"
-    #   "System reboot has been initiated"
-    #   "Restart notification received"
-    #
-    # UpdatesHandler.log:
-    #   "Reboot for update KB5079473 is required"
-    #   "System will restart now"
-    # ════════════════════════════════════════════════════════════════════════
-
-    foreach ($base in $rebootLogs) {
-        $lines = Read-LogLines -Paths $logFileMap[$base] -Verbose:$VerboseLogs
-        foreach ($entry in $lines) {
-            $ln = $entry.Line
-            $l  = $ln.ToLower()
-            $ts = Parse-SCCMTimestamp -Line $ln
-            $kbs = Get-KBsFromLine -Line $ln
-
-            # Reboot-required flag: KB-specific if we have a KB, else machine-wide
-            $isRebootFlag = ($l -match 'reboot.*required|restart.*required|pending.*reboot|requires.*restart|reboot pending')
-            $isRebootEvent = ($l -match 'initiating.*restart|system.*restart|system reboot.*initiated|restart.*initiated|machine.*reboot|rebooting|reboot coordinator.*restart|issuing.*restart')
-
-            if ($kbs.Count -gt 0) {
-                foreach ($kb in $kbs) {
-                    $rec = Ensure-KBRecord $kb
-                    if ($isRebootFlag) { $rec.RebootRequired = $true }
-                    if ($ts -and $isRebootEvent -and (-not $rec.RebootTime)) {
-                        $rec.RebootTime     = $ts
-                        $rec.RebootRequired = $true
-                    }
-                }
-            } else {
-                # No KB on the line — apply reboot timestamp to ALL known KBs for this machine
-                # (a machine-level reboot applies to everything installed)
-                if ($ts -and $isRebootEvent) {
-                    foreach ($kb in $kbData.Keys) {
-                        $rec = $kbData[$kb]
-                        if (-not $rec.RebootTime) {
-                            $rec.RebootTime     = $ts
-                            $rec.RebootRequired = $true
-                        }
-                    }
-                }
-                if ($isRebootFlag) {
-                    foreach ($kb in $kbData.Keys) { $kbData[$kb].RebootRequired = $true }
-                }
-            }
+            break   # First reboot event per machine is enough
         }
     }
 
