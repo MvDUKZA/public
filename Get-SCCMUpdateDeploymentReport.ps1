@@ -2,7 +2,7 @@
 <#
 .SYNOPSIS
     SCCM Windows Update Deployment Log Analyser
-    Server: appsmcm101fp.iprod.local | Site: PRD
+    Server: XXXXX | Site: PRD
 
 .DESCRIPTION
     1. Connects to the SCCM site server and retrieves ADR-based deployments.
@@ -32,7 +32,7 @@
 
 [CmdletBinding()]
 param (
-    [string]$SiteServer = 'appsmcm101fp.iprod.local',
+    [string]$SiteServer = 'XXXXX',
     [string]$SiteCode   = 'PRD',
     [string]$CCMLogPath = 'C$\Windows\CCM\Logs',
     [string]$OutputCSV  = ".\SCCMUpdateReport_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv",
