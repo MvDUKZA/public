@@ -2,7 +2,7 @@
 <#
 .SYNOPSIS
     SCCM Windows Update Deployment Log Analyser
-    Server: XXXXX | Site: PRD
+    Server: appsmcm101fp.iprod.local | Site: PRD
 
 .DESCRIPTION
     1. Connects to the SCCM site server and retrieves ADR-based deployments.
@@ -32,7 +32,7 @@
 
 [CmdletBinding()]
 param (
-    [string]$SiteServer = 'XXXXX',
+    [string]$SiteServer = 'appsmcm101fp.iprod.local',
     [string]$SiteCode   = 'PRD',
     [string]$CCMLogPath = 'C$\Windows\CCM\Logs',
     [string]$OutputCSV  = ".\SCCMUpdateReport_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv",
@@ -126,9 +126,26 @@ function Read-LogLines {
         if (-not (Test-Path $p)) { continue }
         if ($Verbose) { Write-Host "      Reading: $(Split-Path $p -Leaf)" -ForegroundColor DarkGray }
         try {
-            $raw = [System.IO.File]::ReadAllLines($p)   # faster than Get-Content for large files
-            foreach ($ln in $raw) {
-                $out.Add([PSCustomObject]@{ Line = $ln; Source = $p })
+            # FileShare.ReadWrite lets us read files the CCM agent currently has open.
+            # ReadAllLines / Get-Content both request exclusive access and will fail
+            # on live log files.
+            $fs = [System.IO.File]::Open(
+                      $p,
+                      [System.IO.FileMode]::Open,
+                      [System.IO.FileAccess]::Read,
+                      [System.IO.FileShare]::ReadWrite)
+            $reader = [System.IO.StreamReader]::new(
+                          $fs,
+                          [System.Text.Encoding]::Default,
+                          $true)  # detectEncodingFromByteOrderMarks
+            try {
+                while (-not $reader.EndOfStream) {
+                    $ln = $reader.ReadLine()
+                    $out.Add([PSCustomObject]@{ Line = $ln; Source = $p })
+                }
+            } finally {
+                $reader.Dispose()
+                $fs.Dispose()
             }
         } catch {
             Write-Warning "      Could not read $p : $_"
