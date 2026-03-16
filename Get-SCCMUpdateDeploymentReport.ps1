@@ -500,10 +500,12 @@ foreach ($machine in $machines) {
     #   - Build a wuaGUID→KB map for the "finished installing" lines
     # ════════════════════════════════════════════════════════════════════════
 
-    $wuaLines   = Read-LogLines -Paths $logFileMap['WUAHandler'] -Verbose:$VerboseLogs
-    $wuaGuidToKB = @{}   # WUA GUID (lower) → KB — built from context lines
-    $lastKBs    = @()    # KB(s) seen on most recent context line
-    $lastTs     = $null  # timestamp of that context line
+    $wuaLines    = Read-LogLines -Paths $logFileMap['WUAHandler'] -Verbose:$VerboseLogs
+    $wuaGuidToKB = @{}
+    $lastKBs     = @()
+    $lastTs      = $null
+    $pendingDlStart = $null   # download start with no KB yet assigned
+    $pendingDlEnd   = $null   # download end with no KB yet assigned
 
     foreach ($entry in $wuaLines) {
         $ln  = $entry.Line
@@ -553,27 +555,32 @@ foreach ($machine in $machines) {
         }
 
         # ── InstallStart: "Async installation of updates started." ──
-        # Appears immediately after the context line(s)
         if ($ts -and $lastKBs.Count -gt 0 -and ($l -match 'async installation of updates started')) {
             foreach ($kb in $lastKBs) {
                 $rec = Ensure-KBRecord $kb
                 if (-not $rec.InstallStart) { $rec.InstallStart = $ts }
+
+                # Assign the pending anonymous download to every KB that installs
+                # after it — download and install are separate phases (download
+                # happens ahead of the maintenance window, all KBs share it)
+                if ($pendingDlStart -and $pendingDlEnd -and (-not $rec.DownloadStart)) {
+                    $rec.DownloadStart = $pendingDlStart
+                    $rec.DownloadEnd   = $pendingDlEnd
+                }
             }
-            # Don't clear $lastKBs — we still need it for the finished line
+            # Do NOT consume/clear pendingDl here — next KB in same batch also needs it
         }
 
         # ── InstallEnd: "Update 1 (<wuaGUID>) finished installing (0x...), Reboot Required? Yes/No" ──
         if ($ts -and ($l -match 'finished installing')) {
-            # Extract WUA GUID from this line
             $wuaGuid = if ($ln -match '\(([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\)') {
                 $Matches[1].ToLower()
             } else { $null }
 
-            # Resolve which KB this WUA GUID belongs to
             $targetKBs = if ($wuaGuid -and $wuaGuidToKB.ContainsKey($wuaGuid)) {
                 @($wuaGuidToKB[$wuaGuid])
             } elseif ($lastKBs.Count -gt 0) {
-                $lastKBs   # fallback to last seen KB
+                $lastKBs
             } else { @() }
 
             $rebootRequired = ($l -match 'reboot required\?\s*yes')
@@ -585,31 +592,35 @@ foreach ($machine in $machines) {
             }
         }
 
-        # ── DownloadStart: first "Download progress callback" after a context line ──
-        if ($ts -and $lastKBs.Count -gt 0 -and ($l -match 'async download.*started|download progress callback')) {
-            foreach ($kb in $lastKBs) {
-                $rec = Ensure-KBRecord $kb
-                if (-not $rec.DownloadStart) { $rec.DownloadStart = $ts }
+        # ── Anonymous download tracking ───────────────────────────────────────
+        # WUAHandler logs download progress with NO KB on the line.
+        # The download happens before the maintenance window opens, so we
+        # capture the window and assign it to ALL KBs that subsequently install.
+        # A new "Download progress callback" after a completed download = new cycle.
+        if ($ts -and ($l -match 'download progress callback')) {
+            # If previous download already completed, this is a new cycle — reset
+            if ($pendingDlEnd) {
+                $pendingDlStart = $ts
+                $pendingDlEnd   = $null
+            } elseif (-not $pendingDlStart) {
+                $pendingDlStart = $ts
             }
         }
-
-        # ── DownloadEnd: "Async download completed." ──
-        if ($ts -and $lastKBs.Count -gt 0 -and ($l -match 'async download completed')) {
-            foreach ($kb in $lastKBs) {
-                $rec = Ensure-KBRecord $kb
-                if (-not $rec.DownloadEnd) { $rec.DownloadEnd = $ts }
-            }
+        if ($ts -and ($l -match 'async download completed') -and $pendingDlStart) {
+            $pendingDlEnd = $ts
+        }
+        if ($ts -and ($l -match 'successfully canceled running content download') -and $pendingDlStart -and (-not $pendingDlEnd)) {
+            $pendingDlEnd = $ts
         }
 
-        # ── Installation of updates completed (batch-level, all KBs in batch) ──
+        # ── Installation of updates completed (batch-level) ──
         if ($ts -and ($l -match '^installation of updates completed')) {
             foreach ($kb in $kbData.Keys) {
                 $rec = $kbData[$kb]
                 if ($rec.InstallStart -and (-not $rec.InstallEnd)) { $rec.InstallEnd = $ts }
             }
-            $lastKBs = @()   # reset context after batch completes
+            $lastKBs = @()
         }
-    }
 
     # ════════════════════════════════════════════════════════════════════════
     # PHASE 4 — Download events from CAS / ContentTransferManager / DataTransferService
@@ -704,7 +715,16 @@ foreach ($machine in $machines) {
     Write-Host "    → $found KB record(s) extracted" -ForegroundColor $(if ($found -gt 0) { 'Green' } else { 'Yellow' })
 
     foreach ($kb in ($kbData.Keys | Sort-Object)) {
-        $results.Add($kbData[$kb])
+        $rec = $kbData[$kb]
+        # Annotate missing download — likely pre-staged/cached on VDI
+        if (-not $rec.DownloadStart -and -not $rec.DownloadEnd) {
+            Add-Member -InputObject $rec -NotePropertyName 'Notes' -NotePropertyValue 'No download logged (pre-staged content or BranchCache)' -Force
+        } elseif (-not $rec.InstallStart -and -not $rec.InstallEnd) {
+            Add-Member -InputObject $rec -NotePropertyName 'Notes' -NotePropertyValue 'No install logged (may already be installed)' -Force
+        } else {
+            Add-Member -InputObject $rec -NotePropertyName 'Notes' -NotePropertyValue '' -Force
+        }
+        $results.Add($rec)
     }
 }
 
@@ -721,7 +741,7 @@ if ($results.Count -eq 0) {
         Select-Object MachineName, KBArticleID, Description,
                       DownloadStart, DownloadEnd,
                       InstallStart,  InstallEnd,
-                      RebootRequired, RebootTime |
+                      RebootRequired, RebootTime, Notes |
         Export-Csv -Path $OutputCSV -NoTypeInformation -Encoding UTF8
 
     Write-Host "✔  CSV saved : $OutputCSV" -ForegroundColor Green
@@ -729,7 +749,7 @@ if ($results.Count -eq 0) {
 
     $results | Select-Object MachineName, KBArticleID, Description,
                              DownloadStart, DownloadEnd, InstallStart, InstallEnd,
-                             RebootRequired, RebootTime |
+                             RebootRequired, RebootTime, Notes |
         Out-GridView -Title "SCCM Update Report — $($selected.AssignmentName)"
 }
 
