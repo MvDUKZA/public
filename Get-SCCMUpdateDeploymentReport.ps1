@@ -36,7 +36,14 @@ param (
     [string]$SiteCode   = 'PRD',
     [string]$CCMLogPath = 'C$\Windows\CCM\Logs',
     [string]$OutputCSV  = ".\SCCMUpdateReport_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv",
-    [switch]$VerboseLogs   # Print every log file path as it is opened
+    # Only record events on or after this datetime. Defaults to deployment CreationTime - 2h.
+    [nullable[datetime]]$Since = $null,
+    # By default, Microsoft Defender definition updates (KB2267602) and Edge updates
+    # are excluded — they install continuously in the background and pollute the report.
+    # Use these switches to include them.
+    [switch]$IncludeDefender,
+    [switch]$IncludeEdge,
+    [switch]$VerboseLogs
 )
 
 Set-StrictMode -Off   # Allow unset hash keys without error
@@ -264,6 +271,14 @@ if ($selected -is [array]) { $selected = $selected[0] }
 Write-Host "  Selected : $($selected.AssignmentName)" -ForegroundColor Green
 Write-Host "  Collection: $($selected.CollectionName)" -ForegroundColor Green
 
+# Establish event cutoff — ignore log entries before this point so we don't
+# pick up stale historical installs (e.g. Defender definitions update daily).
+# Use deployment CreationTime minus 2 hours as the floor, or the -Since override.
+if (-not $Since) {
+    $Since = $selected.CreationTime.AddHours(-2)
+}
+Write-Host "  Cutoff   : events before $($Since.ToString('dd/MM/yyyy HH:mm:ss')) will be ignored" -ForegroundColor DarkGray
+
 #endregion
 
 #region ── 3. Get machines ────────────────────────────────────────────────────
@@ -317,13 +332,15 @@ foreach ($machine in $machines) {
     }
 
     # ── Per-KB event hashtable ────────────────────────────────────────────────
-    $kbData = @{}
+    $kbData    = @{}
+    $kbDescMap = @{}   # KB → friendly description (populated in Phase 1)
 
     function Ensure-KBRecord ($kb) {
         if (-not $kbData.ContainsKey($kb)) {
             $kbData[$kb] = [PSCustomObject]@{
                 MachineName    = $machine
                 KBArticleID    = $kb
+                Description    = if ($kbDescMap.ContainsKey($kb)) { $kbDescMap[$kb] } else { '' }
                 DownloadStart  = $null
                 DownloadEnd    = $null
                 InstallStart   = $null
@@ -331,8 +348,20 @@ foreach ($machine in $machines) {
                 RebootRequired = $false
                 RebootTime     = $null
             }
+        } else {
+            # Backfill description if it arrived after initial record creation
+            if (-not $kbData[$kb].Description -and $kbDescMap.ContainsKey($kb)) {
+                $kbData[$kb].Description = $kbDescMap[$kb]
+            }
         }
         return $kbData[$kb]
+    }
+
+    # Returns $ts only if it falls on or after the deployment cutoff, else $null.
+    function Valid-Ts ($ts) {
+        if ($null -eq $ts) { return $null }
+        if ($ts -ge $Since) { return $ts }
+        return $null
     }
 
     # ════════════════════════════════════════════════════════════════════════
@@ -351,27 +380,50 @@ foreach ($machine in $machines) {
     $udLines = Read-LogLines -Paths $logFileMap['UpdatesDeployment'] -Verbose:$VerboseLogs
     foreach ($entry in $udLines) {
         $ln = $entry.Line
-        # Extract SUM GUID:  SUM_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+
+        # Extract SUM GUID
         $sumGuid = if ($ln -match '(?i)SUM_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})') {
             $Matches[1].ToLower()
         } else { $null }
 
-        # Extract ArticleID — format: ArticleID (5079473) or ArticleID=5079473
+        # Extract ArticleID
         $articleId = if ($ln -match '(?i)ArticleID[\s\(]+(\d{5,8})') { $Matches[1] } else { $null }
+
+        # Extract friendly name from:  Name (2026-03 Cumulative Update for Windows 11...)
+        $friendlyName = if ($ln -match '(?i)\bName\s*\(([^)]+)\)') { $Matches[1].Trim() } else { '' }
 
         if ($sumGuid -and $articleId) {
             $kbKey = "KB$articleId"
+
+            # ── Exclusion filter ──────────────────────────────────────────────
+            # Defender definitions: KB2267602, or name contains "Security Intelligence Update"
+            $isDefender = ($kbKey -eq 'KB2267602') -or
+                          ($friendlyName -match '(?i)Security Intelligence Update|Defender.*Antivirus.*Definition')
+            # Edge: name contains "Microsoft Edge" update references
+            $isEdge     = ($friendlyName -match '(?i)Microsoft Edge')
+
+            if ($isDefender -and -not $IncludeDefender) { continue }
+            if ($isEdge     -and -not $IncludeEdge)     { continue }
+            # ─────────────────────────────────────────────────────────────────
+
             if (-not $guidToKB.ContainsKey($sumGuid)) {
                 $guidToKB[$sumGuid] = $kbKey
             }
-            # Pre-create the KB record so it exists even if install events are missing
+            # Store description (first non-empty name wins per KB)
+            if ($friendlyName -and -not $kbDescMap.ContainsKey($kbKey)) {
+                $kbDescMap[$kbKey] = $friendlyName
+            }
             Ensure-KBRecord $kbKey | Out-Null
         }
 
-        # Also parse any direct KB mentions on the same line (belt-and-braces)
-        $ts  = Parse-SCCMTimestamp -Line $ln
+        # Belt-and-braces: direct KB mentions
         $kbs = Get-KBsFromLine -Line $ln
-        foreach ($kb in $kbs) { Ensure-KBRecord $kb | Out-Null }
+        foreach ($kb in $kbs) {
+            # Apply same exclusion to any directly-mentioned KBs
+            $isDefender = ($kb -eq 'KB2267602')
+            if ($isDefender -and -not $IncludeDefender) { continue }
+            Ensure-KBRecord $kb | Out-Null
+        }
     }
 
     Write-Host "    GUID→KB map: $($guidToKB.Count) entries" -ForegroundColor DarkGray
@@ -594,6 +646,27 @@ foreach ($machine in $machines) {
         }
     }
 
+    # ── Sanity-check timestamp ordering ──────────────────────────────────────
+    # WUAHandler has many historical entries (especially KB2267602 Defender
+    # definitions which installs daily). Enforce: InstallStart must be at or
+    # after DownloadEnd (or $Since if no download). If a stored InstallStart
+    # predates those, it belongs to a prior cycle — discard it.
+    foreach ($kb in $kbData.Keys) {
+        $rec   = $kbData[$kb]
+        $floor = if ($rec.DownloadEnd) { $rec.DownloadEnd } else { $Since }
+
+        if ($rec.InstallStart -and $rec.InstallStart -lt $floor) {
+            $rec.InstallStart = $null
+            $rec.InstallEnd   = $null
+        }
+        if ($rec.InstallEnd -and $rec.InstallStart -and $rec.InstallEnd -lt $rec.InstallStart) {
+            $rec.InstallEnd = $null
+        }
+        if ($rec.DownloadEnd -and $rec.DownloadStart -and $rec.DownloadEnd -lt $rec.DownloadStart) {
+            $rec.DownloadEnd = $null
+        }
+    }
+
     # ── Collect results ───────────────────────────────────────────────────────
     $found = ($kbData.Keys | Measure-Object).Count
     Write-Host "    → $found KB record(s) extracted" -ForegroundColor $(if ($found -gt 0) { 'Green' } else { 'Yellow' })
@@ -613,7 +686,7 @@ if ($results.Count -eq 0) {
     Write-Host "Tip: Run with -VerboseLogs to see exactly which files were opened." -ForegroundColor Yellow
 } else {
     $results |
-        Select-Object MachineName, KBArticleID,
+        Select-Object MachineName, KBArticleID, Description,
                       DownloadStart, DownloadEnd,
                       InstallStart,  InstallEnd,
                       RebootRequired, RebootTime |
@@ -622,7 +695,10 @@ if ($results.Count -eq 0) {
     Write-Host "✔  CSV saved : $OutputCSV" -ForegroundColor Green
     Write-Host "   Rows      : $($results.Count)"   -ForegroundColor Green
 
-    $results | Out-GridView -Title "SCCM Update Report — $($selected.AssignmentName)"
+    $results | Select-Object MachineName, KBArticleID, Description,
+                             DownloadStart, DownloadEnd, InstallStart, InstallEnd,
+                             RebootRequired, RebootTime |
+        Out-GridView -Title "SCCM Update Report — $($selected.AssignmentName)"
 }
 
 #endregion
