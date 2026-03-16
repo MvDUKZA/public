@@ -2,7 +2,7 @@
 <#
 .SYNOPSIS
     SCCM Windows Update Deployment Log Analyser
-    Server: XXXXX | Site: PRD
+    Server: appsmcm101fp.iprod.local | Site: PRD
 
 .DESCRIPTION
     1. Connects to the SCCM site server and retrieves ADR-based deployments.
@@ -32,7 +32,7 @@
 
 [CmdletBinding()]
 param (
-    [string]$SiteServer = 'XXXXX',
+    [string]$SiteServer = 'appsmcm101fp.iprod.local',
     [string]$SiteCode   = 'PRD',
     [string]$CCMLogPath = 'C$\Windows\CCM\Logs',
     [string]$OutputCSV  = ".\SCCMUpdateReport_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv",
@@ -424,42 +424,119 @@ foreach ($machine in $machines) {
     }
 
     # ════════════════════════════════════════════════════════════════════════
-    # PHASE 3 — WUAHandler.log for install start/end (fallback if UpdatesHandler
-    # didn't fire — WUA does log "Adding update (KBxxxxxxx) to the installation
-    # list" and "Installation job completed" even when KB lines are sparse)
+    # PHASE 3 — WUAHandler.log
+    #
+    # ACTUAL log format observed:
+    #
+    #   CONTEXT line (has KB + WUA GUID):
+    #     "1. Update (Missing): ...KB5079473... (90316cb0-..., 100)"
+    #
+    #   NEXT line — InstallStart (no KB on this line):
+    #     "Async installation of updates started."
+    #
+    #   LATER line — InstallEnd (WUA GUID, no KB):
+    #     "Update 1 (90316cb0-...) finished installing (0x00000000), Reboot Required? Yes"
+    #
+    #   DOWNLOAD lines (no KB):
+    #     "Download progress callback: download result oPCode = 1"
+    #     "Async download completed."
+    #
+    # Strategy:
+    #   - Track last-seen KB(s) and WUA GUID from context lines
+    #   - Apply them to the immediately following event lines
+    #   - Build a wuaGUID→KB map for the "finished installing" lines
     # ════════════════════════════════════════════════════════════════════════
 
-    $wuaLines = Read-LogLines -Paths $logFileMap['WUAHandler'] -Verbose:$VerboseLogs
+    $wuaLines   = Read-LogLines -Paths $logFileMap['WUAHandler'] -Verbose:$VerboseLogs
+    $wuaGuidToKB = @{}   # WUA GUID (lower) → KB — built from context lines
+    $lastKBs    = @()    # KB(s) seen on most recent context line
+    $lastTs     = $null  # timestamp of that context line
+
     foreach ($entry in $wuaLines) {
         $ln  = $entry.Line
         $l   = $ln.ToLower()
         $ts  = Parse-SCCMTimestamp -Line $ln
         $kbs = Get-KBsFromLine -Line $ln
 
-        foreach ($kb in $kbs) {
-            $rec = Ensure-KBRecord $kb
-            if ($ts -and (-not $rec.InstallStart) -and
-                ($l -match 'adding update|install.*list|async.*install|wua.*install')) {
-                $rec.InstallStart = $ts
+        # ── Context line: contains KB number(s) and optionally a WUA GUID ──
+        # e.g. "1. Update (Missing): ...KB5079473... (90316cb0-9dfb-4e05-95df-3a29334d699f, 100)"
+        if ($kbs.Count -gt 0) {
+            $lastKBs = $kbs
+            $lastTs  = $ts
+
+            # Extract WUA GUID from context line (bare GUID in parentheses, no SUM_ prefix)
+            if ($ln -match '\(([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\s*,') {
+                $wuaGuid = $Matches[1].ToLower()
+                foreach ($kb in $kbs) {
+                    if (-not $wuaGuidToKB.ContainsKey($wuaGuid)) {
+                        $wuaGuidToKB[$wuaGuid] = $kb
+                    }
+                }
             }
-            if ($ts -and (-not $rec.InstallEnd) -and
-                ($l -match 'successfully installed|install.*complet|installation.*job.*complet')) {
-                $rec.InstallEnd = $ts
+
+            # Also handle "Reboot Required" on the same context line (rare but possible)
+            if ($l -match 'reboot required\?\s*yes') {
+                foreach ($kb in $kbs) { (Ensure-KBRecord $kb).RebootRequired = $true }
             }
-            if ($l -match 'reboot.*required|pending.*reboot') {
-                $rec.RebootRequired = $true
+            continue
+        }
+
+        # ── InstallStart: "Async installation of updates started." ──
+        # Appears immediately after the context line(s)
+        if ($ts -and $lastKBs.Count -gt 0 -and ($l -match 'async installation of updates started')) {
+            foreach ($kb in $lastKBs) {
+                $rec = Ensure-KBRecord $kb
+                if (-not $rec.InstallStart) { $rec.InstallStart = $ts }
+            }
+            # Don't clear $lastKBs — we still need it for the finished line
+        }
+
+        # ── InstallEnd: "Update 1 (<wuaGUID>) finished installing (0x...), Reboot Required? Yes/No" ──
+        if ($ts -and ($l -match 'finished installing')) {
+            # Extract WUA GUID from this line
+            $wuaGuid = if ($ln -match '\(([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\)') {
+                $Matches[1].ToLower()
+            } else { $null }
+
+            # Resolve which KB this WUA GUID belongs to
+            $targetKBs = if ($wuaGuid -and $wuaGuidToKB.ContainsKey($wuaGuid)) {
+                @($wuaGuidToKB[$wuaGuid])
+            } elseif ($lastKBs.Count -gt 0) {
+                $lastKBs   # fallback to last seen KB
+            } else { @() }
+
+            $rebootRequired = ($l -match 'reboot required\?\s*yes')
+
+            foreach ($kb in $targetKBs) {
+                $rec = Ensure-KBRecord $kb
+                if (-not $rec.InstallEnd) { $rec.InstallEnd = $ts }
+                if ($rebootRequired)      { $rec.RebootRequired = $true }
             }
         }
 
-        # WUAHandler also logs "Installation job completed" without a KB on the line —
-        # apply as InstallEnd to all KBs that have a start but no end yet
-        if ($ts -and (-not $kbs) -and ($l -match 'installation.*job.*complet|async.*install.*complet')) {
+        # ── DownloadStart: first "Download progress callback" after a context line ──
+        if ($ts -and $lastKBs.Count -gt 0 -and ($l -match 'async download.*started|download progress callback')) {
+            foreach ($kb in $lastKBs) {
+                $rec = Ensure-KBRecord $kb
+                if (-not $rec.DownloadStart) { $rec.DownloadStart = $ts }
+            }
+        }
+
+        # ── DownloadEnd: "Async download completed." ──
+        if ($ts -and $lastKBs.Count -gt 0 -and ($l -match 'async download completed')) {
+            foreach ($kb in $lastKBs) {
+                $rec = Ensure-KBRecord $kb
+                if (-not $rec.DownloadEnd) { $rec.DownloadEnd = $ts }
+            }
+        }
+
+        # ── Installation of updates completed (batch-level, all KBs in batch) ──
+        if ($ts -and ($l -match '^installation of updates completed')) {
             foreach ($kb in $kbData.Keys) {
                 $rec = $kbData[$kb]
-                if ($rec.InstallStart -and (-not $rec.InstallEnd)) {
-                    $rec.InstallEnd = $ts
-                }
+                if ($rec.InstallStart -and (-not $rec.InstallEnd)) { $rec.InstallEnd = $ts }
             }
+            $lastKBs = @()   # reset context after batch completes
         }
     }
 
