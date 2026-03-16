@@ -396,10 +396,10 @@ foreach ($machine in $machines) {
             $kbKey = "KB$articleId"
 
             # ── Exclusion filter ──────────────────────────────────────────────
-            # Defender definitions: KB2267602, or name contains "Security Intelligence Update"
+            # Defender definitions: KB2267602 by article ID, or name contains indicator
             $isDefender = ($kbKey -eq 'KB2267602') -or
                           ($friendlyName -match '(?i)Security Intelligence Update|Defender.*Antivirus.*Definition')
-            # Edge: name contains "Microsoft Edge" update references
+            # Edge updates
             $isEdge     = ($friendlyName -match '(?i)Microsoft Edge')
 
             if ($isDefender -and -not $IncludeDefender) { continue }
@@ -419,9 +419,10 @@ foreach ($machine in $machines) {
         # Belt-and-braces: direct KB mentions
         $kbs = Get-KBsFromLine -Line $ln
         foreach ($kb in $kbs) {
-            # Apply same exclusion to any directly-mentioned KBs
-            $isDefender = ($kb -eq 'KB2267602')
+            $isDefender = ($kb -eq 'KB2267602') -or ($ln -match '(?i)Security Intelligence Update|Defender.*Definition')
+            $isEdge     = ($ln -match '(?i)Microsoft Edge')
             if ($isDefender -and -not $IncludeDefender) { continue }
+            if ($isEdge     -and -not $IncludeEdge)     { continue }
             Ensure-KBRecord $kb | Out-Null
         }
     }
@@ -513,7 +514,25 @@ foreach ($machine in $machines) {
         # ── Context line: contains KB number(s) and optionally a WUA GUID ──
         # e.g. "1. Update (Missing): ...KB5079473... (90316cb0-9dfb-4e05-95df-3a29334d699f, 100)"
         if ($kbs.Count -gt 0) {
-            $lastKBs = $kbs
+
+            # Apply exclusion filter — skip Defender/Edge context lines so they
+            # never populate $lastKBs and can't bleed into subsequent event lines
+            $filteredKBs = $kbs | Where-Object {
+                $isDefender = ($_ -eq 'KB2267602') -or ($ln -match '(?i)Security Intelligence Update|Defender.*Definition')
+                $isEdge     = ($ln -match '(?i)Microsoft Edge')
+                if ($isDefender -and -not $IncludeDefender) { return $false }
+                if ($isEdge     -and -not $IncludeEdge)     { return $false }
+                return $true
+            }
+
+            if ($filteredKBs.Count -eq 0) {
+                # This line only contains excluded KBs (Defender/Edge) — treat
+                # it as if it doesn't exist so a prior valid $lastKBs context
+                # (e.g. KB5079473) is preserved for subsequent event lines
+                continue
+            }
+
+            $lastKBs = @($filteredKBs)
             $lastTs  = $ts
 
             # Extract WUA GUID from context line (bare GUID in parentheses, no SUM_ prefix)
@@ -647,25 +666,38 @@ foreach ($machine in $machines) {
     }
 
     # ── Sanity-check timestamp ordering ──────────────────────────────────────
-    # WUAHandler has many historical entries (especially KB2267602 Defender
-    # definitions which installs daily). Enforce: InstallStart must be at or
-    # after DownloadEnd (or $Since if no download). If a stored InstallStart
-    # predates those, it belongs to a prior cycle — discard it.
-    foreach ($kb in $kbData.Keys) {
+    foreach ($kb in ($kbData.Keys | Select-Object)) {
         $rec   = $kbData[$kb]
         $floor = if ($rec.DownloadEnd) { $rec.DownloadEnd } else { $Since }
 
+        # InstallStart must be >= floor (DownloadEnd or $Since)
         if ($rec.InstallStart -and $rec.InstallStart -lt $floor) {
             $rec.InstallStart = $null
             $rec.InstallEnd   = $null
         }
+        # InstallEnd without InstallStart is meaningless — clear it
+        if ($rec.InstallEnd -and (-not $rec.InstallStart)) {
+            $rec.InstallEnd = $null
+        }
+        # InstallEnd must be >= InstallStart
         if ($rec.InstallEnd -and $rec.InstallStart -and $rec.InstallEnd -lt $rec.InstallStart) {
             $rec.InstallEnd = $null
         }
+        # DownloadEnd must be >= DownloadStart
         if ($rec.DownloadEnd -and $rec.DownloadStart -and $rec.DownloadEnd -lt $rec.DownloadStart) {
             $rec.DownloadEnd = $null
         }
     }
+
+    # ── Final exclusion purge ─────────────────────────────────────────────────
+    # Remove any KB records that slipped through (e.g. KB2267602 created from
+    # WUAHandler context lines before the exclusion filter was applied)
+    $toRemove = $kbData.Keys | Where-Object {
+        $isDefender = ($_ -eq 'KB2267602')
+        $isEdge     = ($kbData[$_].Description -match '(?i)Microsoft Edge')
+        ($isDefender -and -not $IncludeDefender) -or ($isEdge -and -not $IncludeEdge)
+    }
+    foreach ($kb in $toRemove) { $kbData.Remove($kb) }
 
     # ── Collect results ───────────────────────────────────────────────────────
     $found = ($kbData.Keys | Measure-Object).Count
