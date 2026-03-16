@@ -621,6 +621,7 @@ foreach ($machine in $machines) {
             }
             $lastKBs = @()
         }
+    }  # end foreach ($entry in $wuaLines)
 
     # ════════════════════════════════════════════════════════════════════════
     # PHASE 4 — Download events from CAS / ContentTransferManager / DataTransferService
