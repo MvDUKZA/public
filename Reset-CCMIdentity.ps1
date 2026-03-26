@@ -1,0 +1,47 @@
+# MECM Client Identity Reset
+# Run as LAST step in Task Sequence before image is sealed/rebooted
+
+$ErrorActionPreference = 'SilentlyContinue'
+
+# Stop the client
+Stop-Service -Name CcmExec -Force
+
+# Wait for it to fully stop
+$timeout = 30
+$elapsed = 0
+while ((Get-Service CcmExec).Status -ne 'Stopped' -and $elapsed -lt $timeout) {
+    Start-Sleep -Seconds 2
+    $elapsed += 2
+}
+
+# Clear identity files
+Remove-Item "C:\Windows\SMSCFG.ini" -Force
+Remove-Item "C:\Windows\System32\CCM\CcmStore.sdf" -Force
+
+# Clear SMS certificates
+Get-ChildItem Cert:\LocalMachine\SMS -ErrorAction SilentlyContinue | Remove-Item -Force
+
+# Clear registry identity
+$regPath = "HKLM:\Software\Microsoft\SMS\Mobile Client"
+if (Test-Path $regPath) {
+    Remove-ItemProperty -Path $regPath -Name "SMSCLIENTID" -Force
+}
+
+# Log it
+$logPath = "C:\Windows\Temp\CCM_Identity_Reset.log"
+"[$(Get-Date)] CCM identity cleared on $env:COMPUTERNAME" | Out-File $logPath -Append
+
+# Do NOT restart CcmExec here - let it come up fresh on next boot
+Write-Host "CCM identity reset complete. Client will re-register on next boot."
+
+
+$machines = @("VDIFSCMCM2058", "VDIFSCMCM2059") # or import from CSV
+
+foreach ($machine in $machines) {
+    Invoke-Command -ComputerName $machine -ScriptBlock {
+        Stop-Service CcmExec -Force
+        Remove-Item "C:\Windows\SMSCFG.ini" -Force -ErrorAction SilentlyContinue
+        Remove-Item "C:\Windows\System32\CCM\CcmStore.sdf" -Force -ErrorAction SilentlyContinue
+        Start-Service CcmExec
+    }
+}
