@@ -1,8 +1,9 @@
 <#
 .SYNOPSIS
-    Removes \\KAK.local\NETLOGON and \\KAK.local\SYSVOL values from 
+    Removes \\iprod.local\NETLOGON and \\iprod.local\SYSVOL values from
     HKLM\SOFTWARE\Policies\Microsoft\Windows\NetworkProvider\HardenedPaths
-    across a list of machines, without using Remote Registry service.
+    and triggers a Qualys on-demand Policy Compliance scan after cleanup.
+    Does not depend on the Remote Registry service.
 #>
 
 param(
@@ -18,59 +19,91 @@ Write-Host "Processing $($computers.Count) machines with throttle $ThrottleLimit
 $results = $computers | ForEach-Object -Parallel {
     $computer = $_
     $result = [PSCustomObject]@{
-        ComputerName = $computer
-        Online       = $false
-        NetlogonHad  = $null
-        NetlogonNow  = $null
-        SysvolHad    = $null
-        SysvolNow    = $null
-        Status       = ''
-        Error        = ''
-        Timestamp    = Get-Date -Format 's'
+        ComputerName     = $computer
+        Online           = $false
+        NetlogonHad      = $null
+        NetlogonNow      = $null
+        SysvolHad        = $null
+        SysvolNow        = $null
+        RegCleanupStatus = ''
+        QualysAgentFound = $null
+        QualysScanTrigger= ''
+        Error            = ''
+        Timestamp        = Get-Date -Format 's'
     }
 
-    # Quick reachability test — avoids long timeouts on dead machines
+    # Reachability check
     if (-not (Test-Connection -ComputerName $computer -Count 1 -Quiet -TimeoutSeconds 2)) {
-        $result.Status = 'Offline'
+        $result.RegCleanupStatus = 'Offline'
         return $result
     }
     $result.Online = $true
 
     try {
-        # Invoke-Command uses WinRM, NOT Remote Registry — works as long as WinRM is up
         $scriptResult = Invoke-Command -ComputerName $computer -ErrorAction Stop -ScriptBlock {
-            $path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\NetworkProvider\HardenedPaths"
-            $targets = @('\\KAK.local\NETLOGON', '\\KAK.local\SYSVOL')
             $out = @{}
 
+            # --- 1. HardenedPaths cleanup ---
+            $hpPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\NetworkProvider\HardenedPaths"
+            $targets = @('\\iprod.local\NETLOGON', '\\iprod.local\SYSVOL')
+
             foreach ($name in $targets) {
-                $before = (Get-ItemProperty -Path $path -Name $name -ErrorAction SilentlyContinue).$name
-                $out["$name`_Before"] = if ($null -ne $before) { $true } else { $false }
+                $before = (Get-ItemProperty -Path $hpPath -Name $name -ErrorAction SilentlyContinue).$name
+                $out["$name`_Before"] = [bool]($null -ne $before)
 
                 if ($null -ne $before) {
-                    Remove-ItemProperty -Path $path -Name $name -Force -ErrorAction Stop
+                    Remove-ItemProperty -Path $hpPath -Name $name -Force -ErrorAction Stop
                 }
 
-                $after = (Get-ItemProperty -Path $path -Name $name -ErrorAction SilentlyContinue).$name
-                $out["$name`_After"] = if ($null -ne $after) { $true } else { $false }
+                $after = (Get-ItemProperty -Path $hpPath -Name $name -ErrorAction SilentlyContinue).$name
+                $out["$name`_After"] = [bool]($null -ne $after)
             }
+
+            # --- 2. Trigger Qualys on-demand Policy Compliance scan ---
+            $qPath   = "HKLM:\SOFTWARE\Qualys\QualysAgent\ScanOnDemand\PolicyCompliance"
+            $qParent = "HKLM:\SOFTWARE\Qualys\QualysAgent"
+
+            if (Test-Path $qParent) {
+                $out['QualysAgentFound'] = $true
+                try {
+                    if (-not (Test-Path $qPath)) {
+                        New-Item -Path $qPath -Force | Out-Null
+                    }
+                    # Standard Qualys on-demand scan values
+                    New-ItemProperty -Path $qPath -Name 'ScanOnDemand'      -Value 1 -PropertyType DWord -Force | Out-Null
+                    New-ItemProperty -Path $qPath -Name 'ScanOnStartup'     -Value 0 -PropertyType DWord -Force | Out-Null
+                    New-ItemProperty -Path $qPath -Name 'CpuLimit'          -Value 50 -PropertyType DWord -Force | Out-Null
+                    New-ItemProperty -Path $qPath -Name 'ScanOnDemandTimeout' -Value 0 -PropertyType DWord -Force | Out-Null
+                    $out['QualysScanTrigger'] = 'Triggered'
+                }
+                catch {
+                    $out['QualysScanTrigger'] = "Failed: $($_.Exception.Message)"
+                }
+            }
+            else {
+                $out['QualysAgentFound'] = $false
+                $out['QualysScanTrigger'] = 'AgentNotInstalled'
+            }
+
             return $out
         }
 
-        $result.NetlogonHad = $scriptResult['\\KAK.local\NETLOGON_Before']
-        $result.NetlogonNow = $scriptResult['\\KAK.local\NETLOGON_After']
-        $result.SysvolHad   = $scriptResult['\\KAK.local\SYSVOL_Before']
-        $result.SysvolNow   = $scriptResult['\\KAK.local\SYSVOL_After']
+        $result.NetlogonHad       = $scriptResult['\\iprod.local\NETLOGON_Before']
+        $result.NetlogonNow       = $scriptResult['\\iprod.local\NETLOGON_After']
+        $result.SysvolHad         = $scriptResult['\\iprod.local\SYSVOL_Before']
+        $result.SysvolNow         = $scriptResult['\\iprod.local\SYSVOL_After']
+        $result.QualysAgentFound  = $scriptResult['QualysAgentFound']
+        $result.QualysScanTrigger = $scriptResult['QualysScanTrigger']
 
         if (-not $result.NetlogonNow -and -not $result.SysvolNow) {
-            $result.Status = 'Success'
+            $result.RegCleanupStatus = 'Success'
         } else {
-            $result.Status = 'PartialFailure'
+            $result.RegCleanupStatus = 'PartialFailure'
         }
     }
     catch {
-        $result.Status = 'Error'
-        $result.Error  = $_.Exception.Message
+        $result.RegCleanupStatus = 'Error'
+        $result.Error            = $_.Exception.Message
     }
 
     return $result
@@ -80,7 +113,10 @@ $results = $computers | ForEach-Object -Parallel {
 $results | Export-Csv -Path $LogPath -NoTypeInformation
 
 # Summary
-$summary = $results | Group-Object Status | Select-Object Name, Count
-Write-Host "`n=== Summary ===" -ForegroundColor Green
-$summary | Format-Table -AutoSize
+Write-Host "`n=== Registry Cleanup Summary ===" -ForegroundColor Green
+$results | Group-Object RegCleanupStatus | Select-Object Name, Count | Format-Table -AutoSize
+
+Write-Host "=== Qualys Scan Trigger Summary ===" -ForegroundColor Green
+$results | Group-Object QualysScanTrigger | Select-Object Name, Count | Format-Table -AutoSize
+
 Write-Host "Log: $LogPath" -ForegroundColor Cyan
