@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Removes \\iprod.local\NETLOGON and \\iprod.local\SYSVOL values from 
+    Removes \\KAK.local\NETLOGON and \\KAK.local\SYSVOL values from 
     HKLM\SOFTWARE\Policies\Microsoft\Windows\NetworkProvider\HardenedPaths
     across a list of machines, without using Remote Registry service.
 #>
@@ -40,7 +40,7 @@ $results = $computers | ForEach-Object -Parallel {
         # Invoke-Command uses WinRM, NOT Remote Registry — works as long as WinRM is up
         $scriptResult = Invoke-Command -ComputerName $computer -ErrorAction Stop -ScriptBlock {
             $path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\NetworkProvider\HardenedPaths"
-            $targets = @('\\iprod.local\NETLOGON', '\\iprod.local\SYSVOL')
+            $targets = @('\\KAK.local\NETLOGON', '\\KAK.local\SYSVOL')
             $out = @{}
 
             foreach ($name in $targets) {
@@ -57,10 +57,10 @@ $results = $computers | ForEach-Object -Parallel {
             return $out
         }
 
-        $result.NetlogonHad = $scriptResult['\\iprod.local\NETLOGON_Before']
-        $result.NetlogonNow = $scriptResult['\\iprod.local\NETLOGON_After']
-        $result.SysvolHad   = $scriptResult['\\iprod.local\SYSVOL_Before']
-        $result.SysvolNow   = $scriptResult['\\iprod.local\SYSVOL_After']
+        $result.NetlogonHad = $scriptResult['\\KAK.local\NETLOGON_Before']
+        $result.NetlogonNow = $scriptResult['\\KAK.local\NETLOGON_After']
+        $result.SysvolHad   = $scriptResult['\\KAK.local\SYSVOL_Before']
+        $result.SysvolNow   = $scriptResult['\\KAK.local\SYSVOL_After']
 
         if (-not $result.NetlogonNow -and -not $result.SysvolNow) {
             $result.Status = 'Success'
