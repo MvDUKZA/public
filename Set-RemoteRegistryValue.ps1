@@ -1,12 +1,17 @@
 <#
 .SYNOPSIS
-    Sets a registry value on a list of remote computers via PowerShell Remoting (WinRM).
+    Sets a registry value on one or more remote computers via PowerShell Remoting (WinRM).
 
 .DESCRIPTION
-    Reads a list of computer names from a text file (one per line) and sets the specified
-    registry value on each. Creates the registry key path if it does not exist. Uses
-    Invoke-Command over WinRM because Remote Registry service is disabled in the environment.
-    Runs sequentially. Logs per-host results to a timestamped CSV next to the script.
+    Targets either a single computer (or comma-separated list) passed via -ComputerName,
+    or a text file of hostnames passed via -ComputerList (one per line; blank lines and
+    lines starting with '#' are ignored). Sets the specified registry value on each target,
+    creating the registry key path if it does not exist. Uses Invoke-Command over WinRM
+    because Remote Registry service is disabled in the environment. Runs sequentially.
+    Logs per-host results to a timestamped CSV next to the script.
+
+.PARAMETER ComputerName
+    One or more hostnames passed directly. Accepts pipeline input.
 
 .PARAMETER ComputerList
     Path to a text file containing one hostname per line. Blank lines and lines starting
@@ -30,19 +35,28 @@
     Optional alternate credentials for WinRM.
 
 .EXAMPLE
-    .\Set-RemoteRegistryValue.ps1 -ComputerList .\machines.txt `
+    .\Set-RemoteRegistryValue.ps1 -ComputerName SERVER01 `
         -RegPath 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' `
         -ValueName 'NoAutoUpdate' -ValueData 1
 
 .EXAMPLE
-    .\Set-RemoteRegistryValue.ps1 -ComputerList .\machines.txt `
+    .\Set-RemoteRegistryValue.ps1 -ComputerName SERVER01,SERVER02,SERVER03 `
         -RegPath 'HKLM:\SOFTWARE\Contoso' -ValueName 'AgentMode' `
         -ValueData 'Production' -ValueType String
+
+.EXAMPLE
+    .\Set-RemoteRegistryValue.ps1 -ComputerList .\machines.txt `
+        -RegPath 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' `
+        -ValueName 'NoAutoUpdate' -ValueData 1
 #>
 
-[CmdletBinding()]
+[CmdletBinding(DefaultParameterSetName = 'ByName')]
 param(
-    [Parameter(Mandatory)]
+    [Parameter(Mandatory, ParameterSetName = 'ByName', ValueFromPipeline, ValueFromPipelineByPropertyName)]
+    [Alias('CN','Computer')]
+    [string[]]$ComputerName,
+
+    [Parameter(Mandatory, ParameterSetName = 'ByList')]
     [ValidateScript({ Test-Path $_ -PathType Leaf })]
     [string]$ComputerList,
 
@@ -76,13 +90,25 @@ $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $logPath   = Join-Path $scriptDir "RegistryUpdate-$timestamp.csv"
 
-$computers = Get-Content -Path $ComputerList |
-    ForEach-Object { $_.Trim() } |
-    Where-Object { $_ -and -not $_.StartsWith('#') }
+# Resolve target computers based on parameter set
+if ($PSCmdlet.ParameterSetName -eq 'ByList') {
+    $computers = Get-Content -Path $ComputerList |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { $_ -and -not $_.StartsWith('#') }
 
-if (-not $computers) {
-    Write-Error "No computers found in '$ComputerList'."
-    return
+    if (-not $computers) {
+        Write-Error "No computers found in '$ComputerList'."
+        return
+    }
+} else {
+    $computers = $ComputerName |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { $_ }
+
+    if (-not $computers) {
+        Write-Error "No computer names supplied via -ComputerName."
+        return
+    }
 }
 
 Write-Host ""
