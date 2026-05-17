@@ -377,6 +377,13 @@ $scanBlock = {
 
 Write-Log "--- Phase 1: scan cycles + reboot check + user detection ---"
 
+# Use Start-ThreadJob (PS7 built-in) instead of Start-Job.
+# Start-Job serialises the parent session state — including the PRD: working
+# directory — into each child process, causing "Cannot find drive PRD" errors.
+# Start-ThreadJob runs in-process threads and does NOT inherit the parent
+# working directory, eliminating that error completely.
+$initScript = { Set-Location C:\ }   # belt-and-braces: ensure clean location
+
 $jobs  = [System.Collections.Generic.List[object]]::new()
 $queue = [System.Collections.Generic.Queue[object]]::new([object[]]@($selectedMachines))
 
@@ -384,27 +391,31 @@ while ($queue.Count -gt 0 -or $jobs.Count -gt 0) {
 
     while ($queue.Count -gt 0 -and $jobs.Count -lt $MaxConcurrent) {
         $m = $queue.Dequeue()
-        $jobs.Add((Start-Job -ScriptBlock $scanBlock -ArgumentList $m, $RebootWarningSeconds))
+        $jobs.Add((Start-ThreadJob -ScriptBlock $scanBlock `
+            -ArgumentList $m, $RebootWarningSeconds `
+            -InitializationScript $initScript))
     }
 
     $done = $jobs | Where-Object { $_.State -in 'Completed','Failed' }
     foreach ($j in $done) {
         $rr = Receive-Job $j -ErrorAction SilentlyContinue
         if ($rr) { $results.Add($rr) }
-        Remove-Job $j
+        Remove-Job $j -Force
     }
     foreach ($j in $done) { $jobs.Remove($j) | Out-Null }
 
     if ($queue.Count -gt 0 -or $jobs.Count -gt 0) { Start-Sleep -Milliseconds 500 }
 }
 
-Write-Log "Phase 1 complete — $($results.Count) result(s) collected."
+# Convert ConcurrentBag to a plain array for reliable .Count and pipeline use
+$resultsList = @($results)
+Write-Log "Phase 1 complete — $($resultsList.Count) result(s) collected."
 
 #endregion
 
 #region ── Step 4: Reboot — per-machine operator prompt ─────────────────────────
 
-$rebootNeeded = @($results | Where-Object { $_.Online -and $_.RebootPending })
+$rebootNeeded = @($resultsList | Where-Object { $_.Online -and $_.RebootPending })
 
 if ($rebootNeeded.Count -gt 0) {
 
@@ -506,7 +517,7 @@ if ($rebootNeeded.Count -gt 0) {
 
 #region ── Step 5: Phase 2 Escalation ───────────────────────────────────────────
 
-$escalationCandidates = @($results | Where-Object { $_.Online -and $_.PhaseOneError })
+$escalationCandidates = @($resultsList | Where-Object { $_.Online -and $_.PhaseOneError })
 
 if ($escalationCandidates.Count -gt 0) {
 
@@ -552,14 +563,15 @@ if ($escalationCandidates.Count -gt 0) {
         }
 
         $escJobs = $escalationCandidates | ForEach-Object {
-            Start-Job -ScriptBlock $escBlock -ArgumentList $_, $choice
+            Start-ThreadJob -ScriptBlock $escBlock -ArgumentList $_, $choice `
+                -InitializationScript { Set-Location C:\ }
         }
         $escJobs | Wait-Job | Out-Null
 
         foreach ($ej in $escJobs) {
             $er = Receive-Job $ej -ErrorAction SilentlyContinue
             if ($er) {
-                $match = $results | Where-Object { $_.MachineName -eq $er.MachineName } | Select-Object -First 1
+                $match = $resultsList | Where-Object { $_.MachineName -eq $er.MachineName } | Select-Object -First 1
                 if ($match) {
                     $match.EscalationDone  = $true
                     $match.EscalationError = $er.Error
@@ -584,11 +596,11 @@ if ($escalationCandidates.Count -gt 0) {
 
 Set-Location $origLocation
 
-$results | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+$resultsList | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
 Write-Log "CSV saved: $csvPath"
 
 Write-Host "`n=== REMEDIATION SUMMARY ===" -ForegroundColor Green
-$results | Select-Object MachineName, InitialState, Online, LoggedOnUser,
+$resultsList | Select-Object MachineName, InitialState, Online, LoggedOnUser,
     RebootPending,
     @{N='RebootSources'; E={
         $s = @()
@@ -600,13 +612,13 @@ $results | Select-Object MachineName, InitialState, Online, LoggedOnUser,
     RebootAction, ScanTriggered, EscalationDone, FinalNote |
     Format-Table -AutoSize
 
-$online        = ($results | Where-Object Online).Count
-$offline       = ($results | Where-Object { -not $_.Online }).Count
-$withUser      = ($results | Where-Object { $_.Online -and $_.LoggedOnUser -ne 'None' }).Count
-$rebootInit    = ($results | Where-Object { $_.RebootAction -like 'Initiated*' }).Count
-$rebootSkipped = ($results | Where-Object { $_.RebootAction -like 'Skipped*'   }).Count
-$escalated     = ($results | Where-Object EscalationDone).Count
-$unresolved    = ($results | Where-Object {
+$online        = @($resultsList | Where-Object Online).Count
+$offline       = @($resultsList | Where-Object { -not $_.Online }).Count
+$withUser      = @($resultsList | Where-Object { $_.Online -and $_.LoggedOnUser -ne 'None' }).Count
+$rebootInit    = @($resultsList | Where-Object { $_.RebootAction -like 'Initiated*' }).Count
+$rebootSkipped = @($resultsList | Where-Object { $_.RebootAction -like 'Skipped*'   }).Count
+$escalated     = @($resultsList | Where-Object EscalationDone).Count
+$unresolved    = @($resultsList | Where-Object {
     $_.EscalationError -or ($_.Online -and $_.PhaseOneError -and -not $_.EscalationDone)
 }).Count
 
