@@ -526,33 +526,181 @@ try {
         return
     }
 
-    # ---- 8. Batched reboot -------------------------------------------
+    # ---- 8. Batched reboot — parallel per batch ----------------------
+    #
+    # Within each batch:
+    #   a) Fire ALL reboots simultaneously (runspace per machine)
+    #   b) In parallel, each runspace then waits for its machine to come
+    #      back online and fires the SCCM triggers
+    # The host thread just waits for the whole batch to finish, then
+    # pauses before kicking off the next batch.
+    # Results are collected back into $script:Report via a thread-safe bag.
+
     $batchList = for ($i = 0; $i -lt $toReboot.Count; $i += $BatchSize) {
         ,@($toReboot[$i .. [Math]::Min($i + $BatchSize - 1, $toReboot.Count - 1)])
     }
 
-    Write-Host ("`nProcessing {0} batch(es) of up to {1}." -f $batchList.Count, $BatchSize) -ForegroundColor Cyan
+    Write-Host ("`nProcessing {0} batch(es) of up to {1} in parallel." -f $batchList.Count, $BatchSize) -ForegroundColor Cyan
+
+    # Thread-safe collection for results coming back from runspaces
+    $resultBag = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
+
+    # Scriptblock executed in each runspace — one per machine
+    $workerScript = {
+        param($Computer, $ResourceID, $OnlineWaitMinutes, $WhatIf)
+
+        $results = [System.Collections.Generic.List[object]]::new()
+        function Log { param($Action,$Result,$Detail='')
+            $results.Add([pscustomobject]@{
+                Timestamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+                Computer  = $Computer
+                Action    = $Action
+                Result    = $Result
+                Detail    = $Detail
+            }) | Out-Null
+        }
+
+        # -- Reboot --
+        if (-not $WhatIf) {
+            try {
+                Restart-Computer -ComputerName $Computer -Force -ErrorAction Stop
+                Log 'Reboot' 'Issued' 'Restart-Computer'
+            }
+            catch {
+                try {
+                    $p = Start-Process shutdown.exe `
+                         -ArgumentList "/m \\$Computer /r /f /t 5 /c `"SCCM patch remediation`"" `
+                         -Wait -PassThru -NoNewWindow -ErrorAction Stop
+                    Log 'Reboot' $(if($p.ExitCode -eq 0){'Issued'}else{'Failed'}) "shutdown.exe exit $($p.ExitCode)"
+                }
+                catch { Log 'Reboot' 'Error' $_.Exception.Message }
+            }
+        } else {
+            Log 'Reboot' 'WhatIf' ''
+        }
+
+        # -- Wait online --
+        $deadline = (Get-Date).AddMinutes($OnlineWaitMinutes)
+        $online   = $false
+        while ((Get-Date) -lt $deadline) {
+            if (Test-Connection -ComputerName $Computer -Count 1 -Quiet -ErrorAction SilentlyContinue) {
+                try {
+                    $null = Get-CimInstance -ComputerName $Computer -ClassName Win32_OperatingSystem `
+                                            -ErrorAction Stop -OperationTimeoutSec 10
+                    $online = $true
+                    break
+                }
+                catch { }
+            }
+            Start-Sleep -Seconds 20
+        }
+
+        if (-not $online) {
+            Log 'WaitOnline' 'TimedOut' ''
+            return $results
+        }
+        Log 'WaitOnline' 'Online' ''
+
+        if ($WhatIf) { return $results }
+
+        # -- SCCM client-side triggers --
+        $schedules = [ordered]@{
+            'Machine Policy Retrieval'     = '{00000000-0000-0000-0000-000000000021}'
+            'Machine Policy Evaluation'    = '{00000000-0000-0000-0000-000000000022}'
+            'Software Updates Scan'        = '{00000000-0000-0000-0000-000000000113}'
+            'Software Updates Deploy Eval' = '{00000000-0000-0000-0000-000000000108}'
+            'State Message Refresh'        = '{00000000-0000-0000-0000-000000000111}'
+        }
+        foreach ($action in $schedules.Keys) {
+            try {
+                Invoke-CimMethod -ComputerName $Computer -Namespace 'root\ccm' `
+                                 -ClassName SMS_Client -MethodName TriggerSchedule `
+                                 -Arguments @{ sScheduleID = $schedules[$action] } `
+                                 -ErrorAction Stop | Out-Null
+                Log $action 'Triggered' ''
+                Start-Sleep -Seconds 2
+            }
+            catch { Log $action 'Error' $_.Exception.Message }
+        }
+
+        return $results
+    }
 
     for ($b = 0; $b -lt $batchList.Count; $b++) {
         $batch = $batchList[$b]
-        Write-Host ("`n=== Batch {0}/{1} — {2} machine(s) ===" -f ($b+1), $batchList.Count, $batch.Count) -ForegroundColor Yellow
+        Write-Host ("`n=== Batch {0}/{1} — firing {2} reboot(s) in parallel ===" `
+                    -f ($b+1), $batchList.Count, $batch.Count) -ForegroundColor Yellow
+
+        # Create a runspace pool capped at batch size
+        $pool = [RunspaceFactory]::CreateRunspacePool(1, $batch.Count)
+        $pool.Open()
+        $handles = [System.Collections.Generic.List[object]]::new()
 
         foreach ($dev in $batch) {
-            if ($PSCmdlet.ShouldProcess($dev.Computer, 'Reboot')) {
-                Write-Host "  Rebooting $($dev.Computer) ..." -ForegroundColor White
-                Invoke-VDIReboot -Computer $dev.Computer
+            $ps = [PowerShell]::Create()
+            $ps.RunspacePool = $pool
+            $null = $ps.AddScript($workerScript).AddParameters(@{
+                Computer         = $dev.Computer
+                ResourceID       = $dev.ResourceID
+                OnlineWaitMinutes = $OnlineWaitMinutes
+                WhatIf           = ($WhatIfPreference -eq 'Continue')
+            })
+            $handles.Add([pscustomobject]@{ PS = $ps; Handle = $ps.BeginInvoke(); Computer = $dev.Computer })
+            Write-Host "  [$($dev.Computer)] Reboot + monitor dispatched" -ForegroundColor White
+        }
+
+        # Site-side policy notification fires immediately from the host thread
+        # (needs the CM drive which isn't available inside runspaces)
+        foreach ($dev in $batch) {
+            try {
+                if ($PSCmdlet.ShouldProcess($dev.Computer, 'Send policy notification')) {
+                    Invoke-CMClientNotification -DeviceId $dev.ResourceID `
+                                                -NotificationType RequestMachinePolicyNow `
+                                                -ErrorAction Stop
+                    $resultBag.Add([pscustomobject]@{
+                        Timestamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+                        Computer  = $dev.Computer; Action = 'PolicyNotification'
+                        Result    = 'Sent'; Detail = ''
+                    })
+                }
+            }
+            catch {
+                $resultBag.Add([pscustomobject]@{
+                    Timestamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+                    Computer  = $dev.Computer; Action = 'PolicyNotification'
+                    Result    = 'Error'; Detail = $_.Exception.Message
+                })
             }
         }
 
-        if ($PSCmdlet.ShouldProcess("Batch $($b+1)", 'Wait online and trigger SCCM actions')) {
-            Wait-BatchOnlineAndTrigger -Devices $batch -TimeoutMinutes $OnlineWaitMinutes
+        Write-Host ("  Waiting for all {0} machine(s) in batch to complete ..." -f $batch.Count) -ForegroundColor DarkGray
+
+        # Collect results as each runspace finishes
+        foreach ($h in $handles) {
+            try {
+                $rows = $h.PS.EndInvoke($h.Handle)
+                foreach ($r in $rows) { $resultBag.Add($r) }
+                $state = if ($h.PS.HadErrors) { 'RunspaceError' } else { 'Done' }
+                Write-Host "  [$($h.Computer)] $state" -ForegroundColor $(if($h.PS.HadErrors){'Red'}else{'Green'})
+            }
+            catch {
+                Write-Warning "[$($h.Computer)] Runspace exception: $($_.Exception.Message)"
+            }
+            finally {
+                $h.PS.Dispose()
+            }
         }
+        $pool.Close()
+        $pool.Dispose()
 
         if ($b -lt $batchList.Count - 1) {
             Write-Host ("`n  Waiting {0} minute(s) before next batch ..." -f $BatchIntervalMinutes) -ForegroundColor DarkGray
             Start-Sleep -Seconds ($BatchIntervalMinutes * 60)
         }
     }
+
+    # Merge parallel results into main report
+    foreach ($r in $resultBag) { $script:Report.Add($r) | Out-Null }
 
     # ---- 9. Done ------------------------------------------------------
     Write-Host "`n============================================================" -ForegroundColor Green
