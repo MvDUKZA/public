@@ -281,6 +281,7 @@ function Add-ToMaintenanceCollection {
             if ($PSCmdlet.ShouldProcess($c, "Add to '$MaintenanceCollectionName'")) {
                 Add-CMDeviceCollectionDirectMembershipRule -CollectionId $coll.CollectionID `
                                                           -ResourceId $device.ResourceID `
+                                                          -Confirm:$false `
                                                           -ErrorAction Stop
                 Add-Report -Computer $c -Action 'AddToCollection' -Result 'Added'
             }
@@ -561,32 +562,49 @@ try {
         }
 
         try {
-            # -- Reboot --
+            # --------------------------------------------------------
+            # PRIORITY 1: REBOOT
+            # Error 1190 = shutdown already scheduled = treat as success
+            # --------------------------------------------------------
             if (-not $WhatIf) {
+                $rebootDone = $false
                 try {
                     Restart-Computer -ComputerName $Computer -Force -ErrorAction Stop
                     Log 'Reboot' 'Issued' 'Restart-Computer'
+                    $rebootDone = $true
                 }
                 catch {
+                    # Fall back to shutdown.exe
                     try {
                         $p = Start-Process shutdown.exe `
                              -ArgumentList "/m \\$Computer /r /f /t 5 /c `"SCCM patch remediation`"" `
                              -Wait -PassThru -NoNewWindow -ErrorAction Stop
-                        Log 'Reboot' $(if($p.ExitCode -eq 0){'Issued'}else{'Failed'}) "shutdown.exe exit $($p.ExitCode)"
+                        # Exit 0 = success, 1190 = already scheduled (also fine)
+                        if ($p.ExitCode -in 0, 1190) {
+                            Log 'Reboot' 'Issued' "shutdown.exe exit $($p.ExitCode)"
+                            $rebootDone = $true
+                        }
+                        else {
+                            Log 'Reboot' 'Failed' "shutdown.exe exit $($p.ExitCode)"
+                        }
                     }
                     catch { Log 'Reboot' 'Error' $_.Exception.Message }
                 }
             } else {
                 Log 'Reboot' 'WhatIf' ''
+                $rebootDone = $true
             }
 
-            # -- Wait online --
+            # --------------------------------------------------------
+            # PRIORITY 2: WAIT ONLINE
+            # --------------------------------------------------------
             $deadline = (Get-Date).AddMinutes($OnlineWaitMinutes)
             $online   = $false
             while ((Get-Date) -lt $deadline) {
                 if (Test-Connection -ComputerName $Computer -Count 1 -Quiet -ErrorAction SilentlyContinue) {
                     try {
-                        $null = Get-CimInstance -ComputerName $Computer -ClassName Win32_OperatingSystem `
+                        $null = Get-CimInstance -ComputerName $Computer `
+                                                -ClassName Win32_OperatingSystem `
                                                 -ErrorAction Stop -OperationTimeoutSec 10
                         $online = $true
                         break
@@ -604,7 +622,10 @@ try {
 
             if ($WhatIf) { return $results }
 
-            # -- SCCM client-side triggers --
+            # --------------------------------------------------------
+            # PRIORITY 3: SCCM CLIENT-SIDE TRIGGERS
+            # These are best-effort — failures do NOT affect reboot result
+            # --------------------------------------------------------
             $schedules = [ordered]@{
                 'Machine Policy Retrieval'     = '{00000000-0000-0000-0000-000000000021}'
                 'Machine Policy Evaluation'    = '{00000000-0000-0000-0000-000000000022}'
@@ -687,24 +708,32 @@ try {
                 $rows = $h.PS.EndInvoke($h.Handle)
                 foreach ($r in $rows) { $resultBag.Add($r) }
 
-                # Surface any error stream entries from the runspace
+                # Only surface error stream entries that aren't already
+                # captured by the worker's own try/catch (i.e. truly unhandled)
                 foreach ($e in $h.PS.Streams.Error) {
-                    $resultBag.Add([pscustomobject]@{
-                        Timestamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
-                        Computer  = $h.Computer
-                        Action    = 'RunspaceStream'
-                        Result    = 'Error'
-                        Detail    = $e.ToString()
-                    })
-                    Write-Warning "[$($h.Computer)] $($e.ToString())"
+                    $msg = $e.ToString()
+                    # Skip known benign messages already handled in worker
+                    if ($msg -notmatch '1190|already scheduled') {
+                        $resultBag.Add([pscustomobject]@{
+                            Timestamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+                            Computer  = $h.Computer
+                            Action    = 'RunspaceStream'
+                            Result    = 'Error'
+                            Detail    = $msg
+                        })
+                        Write-Warning "[$($h.Computer)] $msg"
+                    }
                 }
 
-                $colour = if ($h.PS.HadErrors) { 'Red' } else { 'Green' }
-                $state  = if ($h.PS.HadErrors) { 'CompletedWithErrors' } else { 'Done' }
+                # Determine status from what the worker actually logged,
+                # not from HadErrors (which fires on non-terminating errors too)
+                $workerFailed = $rows | Where-Object { $_.Action -eq 'WorkerError' }
+                $rebootResult = $rows | Where-Object { $_.Action -eq 'Reboot' } | Select-Object -Last 1
+                $colour = if ($workerFailed) { 'Red' } elseif ($rebootResult.Result -eq 'Issued') { 'Green' } else { 'Yellow' }
+                $state  = if ($workerFailed) { 'WorkerFailed' } elseif ($rebootResult.Result -eq 'Issued') { 'RebootOK' } else { "Reboot-$($rebootResult.Result)" }
                 Write-Host "  [$($h.Computer)] $state" -ForegroundColor $colour
             }
             catch {
-                # EndInvoke itself threw — log the exception
                 $resultBag.Add([pscustomobject]@{
                     Timestamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
                     Computer  = $h.Computer
