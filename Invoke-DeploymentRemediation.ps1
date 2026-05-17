@@ -129,7 +129,7 @@ if ($DeploymentName) {
     }
 }
 
-$allDeployments = $allRaw | Select-Object `
+[object[]]$allDeployments = @($allRaw | Select-Object `
     @{N='DeploymentID';        E={$_.DeploymentID}},
     @{N='Name';                E={$_.SoftwareName}},
     @{N='Collection';          E={$_.CollectionName}},
@@ -138,7 +138,7 @@ $allDeployments = $allRaw | Select-Object `
     @{N='Error';               E={$_.NumberErrors}},
     @{N='Unknown';             E={$_.NumberUnknown}},
     @{N='Total';               E={$_.NumberTargeted}},
-    @{N='DeploymentTime';      E={$_.DeploymentTime}}
+    @{N='DeploymentTime';      E={$_.DeploymentTime}})
 
 Write-Log "Found $($allDeployments.Count) deployment(s). Opening picker..."
 
@@ -204,11 +204,11 @@ try {
     }
 
     # Deduplicate — one row per machine, keeping most recent status
-    $machineStates = @($rawRows) |
+    [object[]]$machineStates = @(@($rawRows) |
         Where-Object { $_.MachineName } |
         Sort-Object MachineName, LastStatusTime -Descending |
         Group-Object MachineName |
-        ForEach-Object { $_.Group | Select-Object -First 1 }
+        ForEach-Object { $_.Group | Select-Object -First 1 })
 
     Write-Log "Returned $($machineStates.Count) unique machine record(s) across $ciCount CI(s)."
 
@@ -227,7 +227,7 @@ Write-Log "$($machineStates.Count) machine record(s) total."
 
 # Pre-filter to actionable states only — Success machines are excluded by default
 # StateID: 4=Unknown  5=Error. Show the picker pre-filtered; operator can deselect any.
-$actionable = @($machineStates | Where-Object { $_.StateID -in 4, 5 })
+[object[]]$actionable = @($machineStates | Where-Object { $_.StateID -in 4, 5 })
 $successCount = @($machineStates | Where-Object { $_.StateID -eq 1 }).Count
 Write-Log "Pre-filtered to $($actionable.Count) actionable (Error/Unknown). Excluded $successCount Success machine(s)."
 
@@ -236,7 +236,7 @@ if ($actionable.Count -eq 0) {
     Set-Location $origLocation; Stop-Transcript; exit 0
 }
 
-$selectedMachines = @($actionable | Sort-Object State, MachineName |
+[object[]]$selectedMachines = @($actionable | Sort-Object State, MachineName |
     Out-GridView -Title "Select machines to remediate  [Error/Unknown pre-filtered — Ctrl+Click → OK]" -OutputMode Multiple)
 
 if ($selectedMachines.Count -eq 0) {
@@ -378,7 +378,7 @@ $scanBlock = {
 Write-Log "--- Phase 1: scan cycles + reboot check + user detection ---"
 
 $initScript  = { Set-Location C:\ }
-$totalP1     = $selectedMachines.Count
+$totalP1     = $selectedMachines.Length   # .Length is reliable on [object[]]
 $completedP1 = 0
 
 $jobs  = [System.Collections.Generic.List[object]]::new()
@@ -421,7 +421,7 @@ Write-Log "Phase 1 complete — $($resultsList.Count) result(s) collected."
 
 #region ── Step 4: Reboot — per-machine operator prompt ─────────────────────────
 
-$rebootNeeded = @($resultsList | Where-Object { $_.Online -and $_.RebootPending })
+[object[]]$rebootNeeded = @($resultsList | Where-Object { $_.Online -and $_.RebootPending })
 
 if ($rebootNeeded.Count -gt 0) {
 
@@ -523,7 +523,7 @@ if ($rebootNeeded.Count -gt 0) {
 
 #region ── Step 5: Phase 2 Escalation ───────────────────────────────────────────
 
-$escalationCandidates = @($resultsList | Where-Object { $_.Online -and $_.PhaseOneError })
+[object[]]$escalationCandidates = @($resultsList | Where-Object { $_.Online -and $_.PhaseOneError })
 
 if ($escalationCandidates.Count -gt 0) {
 
