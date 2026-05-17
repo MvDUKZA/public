@@ -142,75 +142,91 @@ if ($DeploymentName) {
 
 Write-Log "Found $($allDeployments.Count) deployment(s). Opening picker..."
 
-$sel = $allDeployments | Sort-Object DeploymentTime -Descending |
-    Out-GridView -Title "Select a deployment to remediate  [single-select → OK]" -OutputMode Single
+[object[]]$selDeployments = @($allDeployments | Sort-Object DeploymentTime -Descending |
+    Out-GridView -Title "Select deployments to remediate  [Ctrl+Click multi-select → OK]" -OutputMode Multiple)
 
-if (-not $sel) {
-    Write-Log "No deployment selected. Exiting." WARN
+if ($selDeployments.Count -eq 0) {
+    Write-Log "No deployments selected. Exiting." WARN
     Set-Location $origLocation; Stop-Transcript; exit 0
 }
 
-# Keep reference to the raw CM object for the query chain in Step 2
-
-Write-Log "Deployment selected: '$($sel.Name)'  ID: $($sel.DeploymentID)  Collection: '$($sel.Collection)'"
+foreach ($s in $selDeployments) {
+    Write-Log "Selected: '$($s.Name)'  ID: $($s.DeploymentID)  Collection: '$($s.Collection)'"
+}
 
 #endregion
 
 #region ── Step 2: Machine State Query & Picker ──────────────────────────────────
 
-Write-Log "Querying per-machine states for deployment $($sel.DeploymentID)..."
+Write-Log "Querying per-machine states across $($selDeployments.Count) deployment(s)..."
 
-# Proven chain (mirrors Invoke-VDIPatchRemediation.ps1):
-#   Get-CMSoftwareUpdateDeployment -DeploymentId <GUID>
-#     -> Get-CMSoftwareUpdateDeploymentStatus -InputObject   (one row per CI)
-#       -> Get-CMDeploymentStatusDetails -InputObject        (one row per device per CI)
+# Proven chain per deployment, all results merged and deduped at the end.
 # StatusType: 1=Success  2=InProgress  4=Unknown  5=Error/Failed
-# All CIs are iterated and results deduped by machine (most recent row wins).
+
+$allRawRows = [System.Collections.Generic.List[object]]::new()
+$totalCiCount = 0
+
+foreach ($sel in $selDeployments) {
+
+    Write-Log "--- Deployment: '$($sel.Name)' ---"
+
+    try {
+        Write-Log "  Step 1/3 — Get-CMSoftwareUpdateDeployment (DeploymentId: $($sel.DeploymentID))..."
+        $suDeployment = Get-CMSoftwareUpdateDeployment -DeploymentId $sel.DeploymentID -ErrorAction Stop
+        if (-not $suDeployment) { Write-Log "  Returned nothing — skipping." WARN; continue }
+
+        Write-Log "  Step 2/3 — Get-CMSoftwareUpdateDeploymentStatus..."
+        $statusSummaries = Get-CMSoftwareUpdateDeploymentStatus -InputObject $suDeployment -ErrorAction Stop
+        if (-not $statusSummaries) { Write-Log "  No CI summaries returned — skipping." WARN; continue }
+
+        $ciCount = @($statusSummaries).Count
+        $totalCiCount += $ciCount
+        Write-Log "  Got $ciCount CI(s). Step 3/3 — expanding per-device details..."
+
+        foreach ($summary in @($statusSummaries)) {
+            $details = Get-CMDeploymentStatusDetails -InputObject $summary -ErrorAction SilentlyContinue
+            if (-not $details) { continue }
+            foreach ($d in @($details)) {
+                $allRawRows.Add([PSCustomObject]@{
+                    MachineName       = $d.DeviceName
+                    ResourceID        = $d.ResourceID
+                    StateID           = $d.StatusType
+                    State             = switch ($d.StatusType) {
+                                            1 { 'Success'    }
+                                            2 { 'InProgress' }
+                                            4 { 'Unknown'    }
+                                            5 { 'Error'      }
+                                            default { "StateType_$($d.StatusType)" }
+                                        }
+                    IsCompliant       = $d.IsCompliant
+                    StatusDescription = $d.StatusDescription
+                    LastStatusTime    = if ($d.StatusTime) { $d.StatusTime } else { 'Never' }
+                    Deployment        = $sel.Name
+                })
+            }
+        }
+
+        Write-Log "  Done — running total: $($allRawRows.Count) rows."
+
+    } catch {
+        Write-Log "  Failed to query '$($sel.Name)': $($_.Exception.Message)" WARN
+    }
+}
 
 $machineStates = $null
 
 try {
-    Write-Log "Step 1/3 — Get-CMSoftwareUpdateDeployment (DeploymentId: $($sel.DeploymentID))..."
-    $suDeployment = Get-CMSoftwareUpdateDeployment -DeploymentId $sel.DeploymentID -ErrorAction Stop
-    if (-not $suDeployment) { throw "Get-CMSoftwareUpdateDeployment returned nothing for ID $($sel.DeploymentID)" }
+    if ($allRawRows.Count -eq 0) { throw "No machine records returned from any selected deployment." }
 
-    Write-Log "Step 2/3 — Get-CMSoftwareUpdateDeploymentStatus..."
-    $statusSummaries = Get-CMSoftwareUpdateDeploymentStatus -InputObject $suDeployment -ErrorAction Stop
-    if (-not $statusSummaries) { throw "Get-CMSoftwareUpdateDeploymentStatus returned nothing" }
-
-    $ciCount = @($statusSummaries).Count
-    Write-Log "Got $ciCount CI status row(s). Step 3/3 — expanding per-device details..."
-
-    # Iterate ALL CI summaries — some deployments have many CIs, each may cover different machines
-    $rawRows = foreach ($summary in @($statusSummaries)) {
-        $details = Get-CMDeploymentStatusDetails -InputObject $summary -ErrorAction SilentlyContinue
-        if (-not $details) { continue }
-        $details | Select-Object `
-            @{N='MachineName';       E={$_.DeviceName}},
-            @{N='ResourceID';        E={$_.ResourceID}},
-            @{N='StateID';           E={$_.StatusType}},
-            @{N='State';             E={
-                switch ($_.StatusType) {
-                    1 { 'Success'        }
-                    2 { 'InProgress'     }
-                    4 { 'Unknown'        }
-                    5 { 'Error'          }
-                    default { "StateType_$($_.StatusType)" }
-                }
-            }},
-            @{N='IsCompliant';       E={$_.IsCompliant}},
-            @{N='StatusDescription'; E={$_.StatusDescription}},
-            @{N='LastStatusTime';    E={ if ($_.StatusTime) { $_.StatusTime } else { 'Never' } }}
-    }
-
-    # Deduplicate — one row per machine, keeping most recent status
-    [object[]]$machineStates = @(@($rawRows) |
+    # Deduplicate across deployments — one row per machine, worst state wins
+    # Priority: Error(5) > Unknown(4) > InProgress(2) > Success(1)
+    [object[]]$machineStates = @(@($allRawRows) |
         Where-Object { $_.MachineName } |
-        Sort-Object MachineName, LastStatusTime -Descending |
+        Sort-Object MachineName, @{E={$_.StateID}; Descending=$true}, LastStatusTime |
         Group-Object MachineName |
         ForEach-Object { $_.Group | Select-Object -First 1 })
 
-    Write-Log "Returned $($machineStates.Count) unique machine record(s) across $ciCount CI(s)."
+    Write-Log "Returned $($machineStates.Count) unique machine record(s) across $totalCiCount CI(s) from $($selDeployments.Count) deployment(s)."
 
 } catch {
     Write-Log "Machine state query failed: $($_.Exception.Message)" ERROR
