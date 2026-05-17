@@ -158,20 +158,80 @@ Write-Log "Deployment selected: '$($sel.Name)'  ID: $($sel.DeploymentID)  Collec
 
 Write-Log "Querying per-machine states for deployment $($sel.DeploymentID)..."
 
-$machineStates = Get-CimInstance -ComputerName $SiteServer `
-    -Namespace "root/sms/site_$SiteCode" `
-    -Query "SELECT * FROM SMS_DeploymentAssetDetails WHERE DeploymentID = '$($sel.DeploymentID)'" |
-    Select-Object `
-        @{N='MachineName';               E={$_.MachineName}},
-        @{N='ResourceID';                E={$_.ResourceID}},
-        @{N='StateID';                   E={$_.StateType}},
-        @{N='State';                     E={ $StateMap[[int]$_.StateType] ?? "State_$($_.StateType)" }},
-        @{N='LastComplianceMessage';     E={
+# SMS_DeploymentAssetDetails is a console-layer view class not exposed via CIM.
+# Primary: Get-CMDeploymentStatusDetails via the CM PSDrive (requires console).
+# Fallback: SMS_ClientAdvertisementStatus WQL via CIM — broader but always available.
+
+$machineStates = $null
+
+try {
+    Write-Log "Trying Get-CMDeploymentStatusDetails (CM PSDrive method)..."
+    $rawStates = Get-CMDeploymentStatusDetails -InputObject (
+        Get-CMSoftwareUpdateDeployment -DeploymentId $sel.DeploymentID -ErrorAction Stop
+    ) -ErrorAction Stop
+
+    $machineStates = $rawStates | Select-Object `
+        @{N='MachineName';          E={$_.DeviceName}},
+        @{N='ResourceID';           E={$_.ResourceID}},
+        @{N='StateID';              E={$_.StatusType}},
+        @{N='State';                E={ $StateMap[[int]$_.StatusType] ?? "State_$($_.StatusType)" }},
+        @{N='LastComplianceMessage';E={
             if ($_.LastComplianceMessageTime) { $_.LastComplianceMessageTime } else { 'Never' }
         }},
-        @{N='LastEnforcementMessage';    E={
+        @{N='LastEnforcementMessage';E={
             if ($_.LastEnforcementMessageTime) { $_.LastEnforcementMessageTime } else { 'Never' }
         }}
+
+    Write-Log "CM PSDrive method returned $($machineStates.Count) record(s)."
+
+} catch {
+    Write-Log "CM PSDrive method failed ($($_.Exception.Message)) — falling back to SMS_ClientAdvertisementStatus." WARN
+
+    # Fallback: query SMS_ClientAdvertisementStatus which IS in the CIM SMS namespace.
+    # Maps AdvertisementID (old) or we join via SMS_UpdatesAssignment for the deployment.
+    # For Software Update deployments the DeploymentID maps to AssignmentID in
+    # SMS_UpdatesAssignment; StatusType maps to our StateMap.
+    try {
+        $assignment = Get-CimInstance -ComputerName $SiteServer `
+            -Namespace "root/sms/site_$SiteCode" `
+            -Query "SELECT AssignmentID, AssignmentName FROM SMS_UpdatesAssignment WHERE AssignmentID = '$($sel.DeploymentID)'" `
+            -ErrorAction Stop
+
+        if (-not $assignment) {
+            # DeploymentID may be in the UniqueID field instead
+            $assignment = Get-CimInstance -ComputerName $SiteServer `
+                -Namespace "root/sms/site_$SiteCode" `
+                -Query "SELECT AssignmentID, AssignmentName, AssignmentUniqueID FROM SMS_UpdatesAssignment WHERE AssignmentUniqueID = '$($sel.DeploymentID)'" `
+                -ErrorAction Stop
+        }
+
+        $assignID = if ($assignment) { $assignment.AssignmentID } else { $sel.DeploymentID }
+        Write-Log "Using AssignmentID: $assignID for status query."
+
+        $rawFallback = Get-CimInstance -ComputerName $SiteServer `
+            -Namespace "root/sms/site_$SiteCode" `
+            -Query "SELECT * FROM SMS_ClientAdvertisementStatus WHERE AdvertisementID = '$assignID'" `
+            -ErrorAction Stop
+
+        $machineStates = $rawFallback | Select-Object `
+            @{N='MachineName';          E={$_.MachineName}},
+            @{N='ResourceID';           E={$_.ResourceID}},
+            @{N='StateID';              E={$_.LastStatusID}},
+            @{N='State';                E={ $StateMap[[int]$_.LastStatusID] ?? "State_$($_.LastStatusID)" }},
+            @{N='LastComplianceMessage';E={
+                if ($_.LastAcceptanceMessageIDTime) { $_.LastAcceptanceMessageIDTime } else { 'Never' }
+            }},
+            @{N='LastEnforcementMessage';E={
+                if ($_.LastStatusTime) { $_.LastStatusTime } else { 'Never' }
+            }}
+
+        Write-Log "Fallback method returned $($machineStates.Count) record(s)."
+
+    } catch {
+        Write-Log "Both query methods failed: $($_.Exception.Message)" ERROR
+        Set-Location $origLocation; Stop-Transcript; exit 1
+    }
+}
 
 if (-not $machineStates) {
     Write-Log "No machine records returned." WARN
