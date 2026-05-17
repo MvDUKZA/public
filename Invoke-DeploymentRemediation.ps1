@@ -377,12 +377,9 @@ $scanBlock = {
 
 Write-Log "--- Phase 1: scan cycles + reboot check + user detection ---"
 
-# Use Start-ThreadJob (PS7 built-in) instead of Start-Job.
-# Start-Job serialises the parent session state — including the PRD: working
-# directory — into each child process, causing "Cannot find drive PRD" errors.
-# Start-ThreadJob runs in-process threads and does NOT inherit the parent
-# working directory, eliminating that error completely.
-$initScript = { Set-Location C:\ }   # belt-and-braces: ensure clean location
+$initScript  = { Set-Location C:\ }
+$totalP1     = $selectedMachines.Count
+$completedP1 = 0
 
 $jobs  = [System.Collections.Generic.List[object]]::new()
 $queue = [System.Collections.Generic.Queue[object]]::new([object[]]@($selectedMachines))
@@ -399,13 +396,22 @@ while ($queue.Count -gt 0 -or $jobs.Count -gt 0) {
     $done = $jobs | Where-Object { $_.State -in 'Completed','Failed' }
     foreach ($j in $done) {
         $rr = Receive-Job $j -ErrorAction SilentlyContinue
-        if ($rr) { $results.Add($rr) }
+        if ($rr) {
+            $results.Add($rr)
+            $completedP1++
+            $pct = [int](($completedP1 / $totalP1) * 100)
+            $status = "Completed $completedP1 of $totalP1  |  Active threads: $($jobs.Count - $done.Count)  |  Queue remaining: $($queue.Count)"
+            Write-Progress -Activity "Phase 1 — Scan + Reboot Check + User Detection" `
+                           -Status $status -PercentComplete $pct
+        }
         Remove-Job $j -Force
     }
     foreach ($j in $done) { $jobs.Remove($j) | Out-Null }
 
     if ($queue.Count -gt 0 -or $jobs.Count -gt 0) { Start-Sleep -Milliseconds 500 }
 }
+
+Write-Progress -Activity "Phase 1 — Scan + Reboot Check + User Detection" -Completed
 
 # Convert ConcurrentBag to a plain array for reliable .Count and pipeline use
 $resultsList = @($results)
@@ -522,65 +528,186 @@ $escalationCandidates = @($resultsList | Where-Object { $_.Online -and $_.PhaseO
 if ($escalationCandidates.Count -gt 0) {
 
     Write-Host ""
-    Write-Host "══════════════════════════════════════════════════════" -ForegroundColor Magenta
+    Write-Host "══════════════════════════════════════════════════════════════" -ForegroundColor Magenta
     Write-Host "  $($escalationCandidates.Count) machine(s) failed Phase 1 WMI triggers." -ForegroundColor Yellow
-    Write-Host "  [1] WUA cache clear + service restart (recommended)" -ForegroundColor White
-    Write-Host "  [2] Full CCM client repair (ccmrepair.exe)"          -ForegroundColor White
-    Write-Host "  [S] Skip — save results and exit"                    -ForegroundColor White
-    Write-Host "══════════════════════════════════════════════════════" -ForegroundColor Magenta
+    Write-Host "  [1] WUA cache clear + reboot + re-trigger (recommended)" -ForegroundColor White
+    Write-Host "  [2] CCM client repair (ccmrepair.exe)"                 -ForegroundColor White
+    Write-Host "  [3] Reboot + CCM client repair (nuclear option)"       -ForegroundColor White
+    Write-Host "  [S] Skip — save results and exit"                      -ForegroundColor White
+    Write-Host "══════════════════════════════════════════════════════════" -ForegroundColor Magenta
 
     $choice = (Read-Host "Choice").Trim().ToUpper()
 
-    if ($choice -in '1','2') {
+    if ($choice -in '1','2','3') {
 
-        $actionLabel = if ($choice -eq '1') { 'WUA cache clear' } else { 'CCM repair' }
+        $actionLabel = switch ($choice) {
+            '1' { 'WUA cache clear + reboot' }
+            '2' { 'CCM repair' }
+            '3' { 'Reboot + CCM repair' }
+        }
         Write-Log "--- Phase 2: $actionLabel on $($escalationCandidates.Count) machine(s) ---"
 
         $escBlock = {
             param($machine, $ch)
+            $ErrorActionPreference = 'Continue'
             $e = [PSCustomObject]@{ MachineName = $machine.MachineName; Action = ''; Error = $null }
             try {
                 if ($ch -eq '1') {
-                    $e.Action = 'WUA cache clear'
+                    # ── WUA cache clear + reboot + re-trigger ────────────
+                    $e.Action = 'WUA cache clear + reboot'
+
+                    # Step A: stop services, clear cache, reset WU auth
                     Invoke-Command -ComputerName $machine.MachineName -ErrorAction Stop -ScriptBlock {
                         Stop-Service wuauserv,bits,ccmexec -Force -ErrorAction SilentlyContinue
                         Remove-Item 'C:\Windows\SoftwareDistribution\*' -Recurse -Force -ErrorAction SilentlyContinue
                         & wuauclt /resetauthorization
-                        Start-Service wuauserv,bits,ccmexec -ErrorAction SilentlyContinue
-                        Start-Sleep 20
-                        $null = Invoke-CimMethod -Namespace root/ccm -ClassName SMS_Client `
-                            -MethodName TriggerSchedule -Arguments @{ sScheduleID = '{00000000-0000-0000-0000-000000000113}' }
                     }
-                } else {
+
+                    # Step B: reboot so WU agent starts completely fresh
+                    try {
+                        Restart-Computer -ComputerName $machine.MachineName -Force -ErrorAction Stop
+                    } catch {
+                        $p = Start-Process shutdown.exe `
+                             -ArgumentList "/m \\$($machine.MachineName) /r /f /t 10 /c `"WUA cache clear reboot`"" `
+                             -Wait -PassThru -NoNewWindow -ErrorAction Stop
+                        if ($p.ExitCode -notin 0,1190) { throw "shutdown.exe exited $($p.ExitCode)" }
+                    }
+
+                    # Step C: wait up to 10 min for machine to come back
+                    $deadline = (Get-Date).AddMinutes(10)
+                    $back = $false
+                    while ((Get-Date) -lt $deadline) {
+                        if (Test-Connection -ComputerName $machine.MachineName -Count 1 -Quiet -ErrorAction SilentlyContinue) {
+                            try {
+                                $null = Get-CimInstance -ComputerName $machine.MachineName `
+                                        -ClassName Win32_OperatingSystem -OperationTimeoutSec 15 -ErrorAction Stop
+                                $back = $true; break
+                            } catch {}
+                        }
+                        Start-Sleep -Seconds 20
+                    }
+                    if (-not $back) { throw "Machine did not come back online within 10 minutes after reboot" }
+
+                    # Step D: re-trigger scan cycles post-reboot
+                    $cim = New-CimSession -ComputerName $machine.MachineName -ErrorAction Stop
+                    foreach ($guid in @(
+                        '{00000000-0000-0000-0000-000000000021}',   # Machine Policy
+                        '{00000000-0000-0000-0000-000000000113}',   # SU Scan
+                        '{00000000-0000-0000-0000-000000000114}'    # SU Deploy Eval
+                    )) {
+                        try {
+                            Invoke-CimMethod -CimSession $cim -Namespace root/ccm `
+                                -ClassName SMS_Client -MethodName TriggerSchedule `
+                                -Arguments @{ sScheduleID = $guid } -ErrorAction Stop | Out-Null
+                            Start-Sleep -Seconds 2
+                        } catch {}
+                    }
+                    Remove-CimSession $cim -ErrorAction SilentlyContinue
+
+                } elseif ($ch -eq '2') {
+                    # ── CCM repair only ──────────────────────────────────
                     $e.Action = 'CCM repair'
                     Invoke-Command -ComputerName $machine.MachineName -ErrorAction Stop -ScriptBlock {
-                        $r = "$env:WinDir\CCM\ccmrepair.exe"
-                        if (Test-Path $r) { Start-Process $r -Wait } else { throw "ccmrepair.exe not found" }
+                        $exe = "$env:WinDir\CCM\ccmrepair.exe"
+                        if (Test-Path $exe) { Start-Process $exe -Wait }
+                        else { throw "ccmrepair.exe not found at $exe" }
                     }
+
+                } elseif ($ch -eq '3') {
+                    # ── Reboot then CCM repair ────────────────────────────
+                    # Step A: reboot the machine
+                    $e.Action = 'Reboot+CCM repair'
+                    try {
+                        Restart-Computer -ComputerName $machine.MachineName -Force -ErrorAction Stop
+                    } catch {
+                        # Fallback to shutdown.exe
+                        $p = Start-Process shutdown.exe `
+                             -ArgumentList "/m \\$($machine.MachineName) /r /f /t 10 /c `"SCCM CCM repair reboot`"" `
+                             -Wait -PassThru -NoNewWindow -ErrorAction Stop
+                        if ($p.ExitCode -notin 0,1190) {
+                            throw "shutdown.exe exited $($p.ExitCode)"
+                        }
+                    }
+
+                    # Step B: wait up to 10 min for machine to come back
+                    $deadline = (Get-Date).AddMinutes(10)
+                    $back = $false
+                    while ((Get-Date) -lt $deadline) {
+                        if (Test-Connection -ComputerName $machine.MachineName -Count 1 -Quiet -ErrorAction SilentlyContinue) {
+                            try {
+                                $null = Get-CimInstance -ComputerName $machine.MachineName `
+                                        -ClassName Win32_OperatingSystem -OperationTimeoutSec 15 -ErrorAction Stop
+                                $back = $true; break
+                            } catch {}
+                        }
+                        Start-Sleep -Seconds 20
+                    }
+                    if (-not $back) { throw "Machine did not come back online within 10 minutes after reboot" }
+
+                    # Step C: run CCM repair
+                    Invoke-Command -ComputerName $machine.MachineName -ErrorAction Stop -ScriptBlock {
+                        $exe = "$env:WinDir\CCM\ccmrepair.exe"
+                        if (Test-Path $exe) { Start-Process $exe -Wait }
+                        else { throw "ccmrepair.exe not found at $exe" }
+                    }
+
+                    # Step D: re-trigger scan cycles post-repair
+                    $cim = New-CimSession -ComputerName $machine.MachineName -ErrorAction Stop
+                    foreach ($guid in @(
+                        '{00000000-0000-0000-0000-000000000021}',   # Machine Policy
+                        '{00000000-0000-0000-0000-000000000113}',   # SU Scan
+                        '{00000000-0000-0000-0000-000000000114}'    # SU Deploy Eval
+                    )) {
+                        try {
+                            Invoke-CimMethod -CimSession $cim -Namespace root/ccm `
+                                -ClassName SMS_Client -MethodName TriggerSchedule `
+                                -Arguments @{ sScheduleID = $guid } -ErrorAction Stop | Out-Null
+                            Start-Sleep -Seconds 2
+                        } catch {}
+                    }
+                    Remove-CimSession $cim -ErrorAction SilentlyContinue
                 }
+
             } catch { $e.Error = $_.Exception.Message }
             return $e
         }
 
-        $escJobs = $escalationCandidates | ForEach-Object {
-            Start-ThreadJob -ScriptBlock $escBlock -ArgumentList $_, $choice `
-                -InitializationScript { Set-Location C:\ }
-        }
-        $escJobs | Wait-Job | Out-Null
+        # ── Dispatch Phase 2 jobs with progress bar ──────────────────────
+        $totalP2     = $escalationCandidates.Count
+        $completedP2 = 0
 
-        foreach ($ej in $escJobs) {
-            $er = Receive-Job $ej -ErrorAction SilentlyContinue
-            if ($er) {
-                $match = $resultsList | Where-Object { $_.MachineName -eq $er.MachineName } | Select-Object -First 1
-                if ($match) {
-                    $match.EscalationDone  = $true
-                    $match.EscalationError = $er.Error
-                    $match.FinalNote = if ($er.Error) { "Escalation FAILED: $($er.Error)" }
-                                       else           { "Escalation ($($er.Action)) OK" }
-                }
-            }
-            Remove-Job $ej
+        $escJobs = [System.Collections.Generic.List[object]]::new()
+        foreach ($cand in $escalationCandidates) {
+            $escJobs.Add((Start-ThreadJob -ScriptBlock $escBlock -ArgumentList $cand, $choice `
+                -InitializationScript { Set-Location C:\ }))
         }
+
+        $remaining = [System.Collections.Generic.List[object]]::new($escJobs)
+        while ($remaining.Count -gt 0) {
+            $done2 = @($remaining | Where-Object { $_.State -in 'Completed','Failed' })
+            foreach ($ej in $done2) {
+                $er = Receive-Job $ej -ErrorAction SilentlyContinue
+                if ($er) {
+                    $match = $resultsList | Where-Object { $_.MachineName -eq $er.MachineName } | Select-Object -First 1
+                    if ($match) {
+                        $match.EscalationDone  = $true
+                        $match.EscalationError = $er.Error
+                        $match.FinalNote = if ($er.Error) { "Escalation FAILED: $($er.Error)" }
+                                           else           { "Escalation ($($er.Action)) OK" }
+                    }
+                }
+                Remove-Job $ej -Force
+                $remaining.Remove($ej) | Out-Null
+                $completedP2++
+                $pct2   = [int](($completedP2 / $totalP2) * 100)
+                $label2 = if ($ch -eq '3') { "Reboot + CCM repair" } else { $actionLabel }
+                Write-Progress -Activity "Phase 2 — $actionLabel" `
+                               -Status "Completed $completedP2 of $totalP2  |  Active: $($remaining.Count)" `
+                               -PercentComplete $pct2
+            }
+            if ($remaining.Count -gt 0) { Start-Sleep -Milliseconds 500 }
+        }
+        Write-Progress -Activity "Phase 2 — $actionLabel" -Completed
         Write-Log "Phase 2 complete."
     } else {
         Write-Log "Escalation skipped by operator." WARN
