@@ -393,14 +393,14 @@ while ($queue.Count -gt 0 -or $jobs.Count -gt 0) {
             -InitializationScript $initScript))
     }
 
-    $done = $jobs | Where-Object { $_.State -in 'Completed','Failed' }
+    [object[]]$done = @($jobs | Where-Object { $_.State -in 'Completed','Failed' })
     foreach ($j in $done) {
         $rr = Receive-Job $j -ErrorAction SilentlyContinue
         if ($rr) {
             $results.Add($rr)
             $completedP1++
             $pct = [int](($completedP1 / $totalP1) * 100)
-            $status = "Completed $completedP1 of $totalP1  |  Active threads: $($jobs.Count - $done.Count)  |  Queue remaining: $($queue.Count)"
+            $activeNow = $jobs.Count - $done.Count; $status = "Completed $completedP1 of $totalP1  |  Active: $activeNow  |  Queued: $($queue.Count)"
             Write-Progress -Activity "Phase 1 — Scan + Reboot Check + User Detection" `
                            -Status $status -PercentComplete $pct
         }
@@ -684,7 +684,7 @@ if ($escalationCandidates.Count -gt 0) {
 
         $remaining = [System.Collections.Generic.List[object]]::new($escJobs)
         while ($remaining.Count -gt 0) {
-            $done2 = @($remaining | Where-Object { $_.State -in 'Completed','Failed' })
+            [object[]]$done2 = @($remaining | Where-Object { $_.State -in 'Completed','Failed' })
             foreach ($ej in $done2) {
                 $er = Receive-Job $ej -ErrorAction SilentlyContinue
                 if ($er) {
