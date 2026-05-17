@@ -1,4 +1,4 @@
-#Requires -Modules ConfigurationManager
+# ConfigurationManager module loaded dynamically below
 <#
 .SYNOPSIS
     Interactive SCCM deployment remediation tool.
@@ -94,10 +94,19 @@ try {
 }
 
 $origLocation = Get-Location
-if (-not (Get-PSDrive -Name $SiteCode -ErrorAction SilentlyContinue)) {
-    New-PSDrive -Name $SiteCode -PSProvider CMSite -Root $SiteServer | Out-Null
+try {
+    if (-not (Get-PSDrive -Name $SiteCode -ErrorAction SilentlyContinue)) {
+        New-PSDrive -Name $SiteCode -PSProvider CMSite -Root $SiteServer -ErrorAction Stop | Out-Null
+        Write-Log "PSDrive $SiteCode created successfully."
+    } else {
+        Write-Log "PSDrive $SiteCode already exists."
+    }
+    Set-Location "$SiteCode`:\"
+} catch {
+    Write-Log "Failed to create PSDrive for site $SiteCode on $SiteServer : $($_.Exception.Message)" ERROR
+    Write-Log "Ensure the ConfigurationManager console is installed and the site server is reachable." ERROR
+    Stop-Transcript; exit 1
 }
-Set-Location "$SiteCode`:\"
 
 #endregion
 
@@ -111,8 +120,8 @@ if ($DeploymentName) {
     $dQuery += " AND SoftwareName LIKE '$($e.Replace('*','%'))'"
 }
 
-$allDeployments = Get-WmiObject -ComputerName $SiteServer `
-    -Namespace "root\sms\site_$SiteCode" -Query $dQuery |
+$allDeployments = Get-CimInstance -ComputerName $SiteServer `
+    -Namespace "root/sms/site_$SiteCode" -Query $dQuery |
     Select-Object `
         @{N='DeploymentID';        E={$_.DeploymentID}},
         @{N='Name';                E={$_.SoftwareName}},
@@ -123,9 +132,7 @@ $allDeployments = Get-WmiObject -ComputerName $SiteServer `
         @{N='Unknown';             E={$_.NumberUnknown}},
         @{N='Total';               E={$_.NumberTotal}},
         @{N='EnforcementDeadline'; E={
-            if ($_.EnforcementDeadline) {
-                [Management.ManagementDateTimeConverter]::ToDateTime($_.EnforcementDeadline)
-            } else { 'N/A' }
+            if ($_.EnforcementDeadline) { $_.EnforcementDeadline } else { 'N/A' }
         }}
 
 if (-not $allDeployments) {
@@ -151,8 +158,8 @@ Write-Log "Deployment selected: '$($sel.Name)'  ID: $($sel.DeploymentID)  Collec
 
 Write-Log "Querying per-machine states for deployment $($sel.DeploymentID)..."
 
-$machineStates = Get-WmiObject -ComputerName $SiteServer `
-    -Namespace "root\sms\site_$SiteCode" `
+$machineStates = Get-CimInstance -ComputerName $SiteServer `
+    -Namespace "root/sms/site_$SiteCode" `
     -Query "SELECT * FROM SMS_DeploymentAssetDetails WHERE DeploymentID = '$($sel.DeploymentID)'" |
     Select-Object `
         @{N='MachineName';               E={$_.MachineName}},
@@ -160,14 +167,10 @@ $machineStates = Get-WmiObject -ComputerName $SiteServer `
         @{N='StateID';                   E={$_.StateType}},
         @{N='State';                     E={ $StateMap[[int]$_.StateType] ?? "State_$($_.StateType)" }},
         @{N='LastComplianceMessage';     E={
-            if ($_.LastComplianceMessageTime) {
-                [Management.ManagementDateTimeConverter]::ToDateTime($_.LastComplianceMessageTime)
-            } else { 'Never' }
+            if ($_.LastComplianceMessageTime) { $_.LastComplianceMessageTime } else { 'Never' }
         }},
         @{N='LastEnforcementMessage';    E={
-            if ($_.LastEnforcementMessageTime) {
-                [Management.ManagementDateTimeConverter]::ToDateTime($_.LastEnforcementMessageTime)
-            } else { 'Never' }
+            if ($_.LastEnforcementMessageTime) { $_.LastEnforcementMessageTime } else { 'Never' }
         }}
 
 if (-not $machineStates) {
@@ -239,7 +242,7 @@ $scanBlock = {
 
     # ── Logged-on user ──────────────────────────────────────────────────────
     try {
-        $cs = Get-WmiObject -ComputerName $machine.MachineName -Class Win32_ComputerSystem -ErrorAction Stop
+        $cs = Get-CimInstance -ComputerName $machine.MachineName -ClassName Win32_ComputerSystem -ErrorAction Stop
         if ($cs.UserName) { $r.LoggedOnUser = $cs.UserName }
     } catch {
         $r.LoggedOnUser = "QueryFailed: $($_.Exception.Message)"
@@ -262,8 +265,7 @@ $scanBlock = {
 
             # 3. CCM client SDK
             try {
-                $util  = [wmiclass]'\\.\root\ccm\clientsdk:CCM_ClientUtilities'
-                $state = $util.DetermineIfRebootPending()
+                $state = Invoke-CimMethod -Namespace root/ccm/clientsdk -ClassName CCM_ClientUtilities -MethodName DetermineIfRebootPending -ErrorAction Stop
                 if ($state.RebootPending -or $state.IsHardRebootPending) { $out.CCM = $true }
             } catch {}
 
@@ -287,17 +289,13 @@ $scanBlock = {
 
     # ── Scan cycles ─────────────────────────────────────────────────────────
     try {
-        $wmi = @{
-            ComputerName = $machine.MachineName
-            Namespace    = 'root\ccm'
-            Class        = 'SMS_Client'
-            Name         = 'TriggerSchedule'
-            ErrorAction  = 'Stop'
-        }
-        $null = Invoke-WmiMethod @wmi -ArgumentList '{00000000-0000-0000-0000-000000000113}'; $r.ScanTriggered           = $true
-        $null = Invoke-WmiMethod @wmi -ArgumentList '{00000000-0000-0000-0000-000000000114}'; $r.DeploymentEvalTriggered = $true
-        $null = Invoke-WmiMethod @wmi -ArgumentList '{00000000-0000-0000-0000-000000000021}'; $r.MachinePolicyTriggered  = $true
-        $null = Invoke-WmiMethod @wmi -ArgumentList '{00000000-0000-0000-0000-000000000001}'; $r.HardwareInvTriggered    = $true
+        $cimSession = New-CimSession -ComputerName $machine.MachineName -ErrorAction Stop
+        $cimArgs = @{ CimSession = $cimSession; Namespace = 'root/ccm'; ClassName = 'SMS_Client'; MethodName = 'TriggerSchedule'; ErrorAction = 'Stop' }
+        $null = Invoke-CimMethod @cimArgs -Arguments @{ sScheduleID = '{00000000-0000-0000-0000-000000000113}' }; $r.ScanTriggered           = $true
+        $null = Invoke-CimMethod @cimArgs -Arguments @{ sScheduleID = '{00000000-0000-0000-0000-000000000114}' }; $r.DeploymentEvalTriggered = $true
+        $null = Invoke-CimMethod @cimArgs -Arguments @{ sScheduleID = '{00000000-0000-0000-0000-000000000021}' }; $r.MachinePolicyTriggered  = $true
+        $null = Invoke-CimMethod @cimArgs -Arguments @{ sScheduleID = '{00000000-0000-0000-0000-000000000001}' }; $r.HardwareInvTriggered    = $true
+        Remove-CimSession $cimSession -ErrorAction SilentlyContinue
         $r.FinalNote = 'Phase 1 scan cycles OK'
     } catch {
         $r.PhaseOneError = $_.Exception.Message
@@ -469,8 +467,8 @@ if ($escalationCandidates.Count -gt 0) {
                         & wuauclt /resetauthorization
                         Start-Service wuauserv,bits,ccmexec -ErrorAction SilentlyContinue
                         Start-Sleep 20
-                        $null = Invoke-WmiMethod -Namespace root\ccm -Class SMS_Client `
-                            -Name TriggerSchedule '{00000000-0000-0000-0000-000000000113}'
+                        $null = Invoke-CimMethod -Namespace root/ccm -ClassName SMS_Client `
+                            -MethodName TriggerSchedule -Arguments @{ sScheduleID = '{00000000-0000-0000-0000-000000000113}' }
                     }
                 } else {
                     $e.Action = 'CCM repair'
