@@ -486,11 +486,17 @@ try {
     Write-Host "`nAdding machines to '$MaintenanceCollectionName' ..." -ForegroundColor Cyan
     Add-ToMaintenanceCollection -Computers $devices.Computer
 
-    # ---- 7. Logged-on user check -------------------------------------
+    # ---- 7. Logged-on user check (opt-in only via -SkipLoggedOnCheck:$false) ----
     $toReboot = [System.Collections.Generic.List[object]]::new()
     $skipped  = [System.Collections.Generic.List[object]]::new()
 
-    if (-not $SkipLoggedOnCheck) {
+    if ($SkipLoggedOnCheck) {
+        # Default: reboot all machines regardless of logged-on state.
+        # VDIs in a patch remediation window are rebooted unconditionally.
+        $toReboot.AddRange($devices)
+        Write-Host "`nSkipping logged-on check — all $($devices.Count) machine(s) queued for reboot." -ForegroundColor Cyan
+    }
+    else {
         Write-Host "`nChecking for logged-on users ..." -ForegroundColor Cyan
         foreach ($dev in $devices) {
             if (Test-Connection -ComputerName $dev.Computer -Count 1 -Quiet -ErrorAction SilentlyContinue) {
@@ -505,19 +511,14 @@ try {
                 }
             }
             else {
-                # Offline machines — include in reboot list (likely needs the kick)
                 Add-Report -Computer $dev.Computer -Action 'LoggedOnCheck' -Result 'Offline-QueuedForReboot'
                 $toReboot.Add($dev)
             }
         }
+        Write-Host ""
+        Write-Host ("  {0,3}  machine(s) queued for reboot" -f $toReboot.Count) -ForegroundColor Cyan
+        Write-Host ("  {0,3}  machine(s) skipped (user logged on)" -f $skipped.Count) -ForegroundColor Magenta
     }
-    else {
-        $toReboot.AddRange($devices)
-    }
-
-    Write-Host ""
-    Write-Host ("  {0,3}  machine(s) queued for reboot" -f $toReboot.Count) -ForegroundColor Cyan
-    Write-Host ("  {0,3}  machine(s) skipped (user logged on)" -f $skipped.Count) -ForegroundColor Magenta
 
     if ($toReboot.Count -eq 0) {
         Write-Warning "No machines to reboot after logged-on check."
