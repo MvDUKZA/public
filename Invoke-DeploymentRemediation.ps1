@@ -400,7 +400,8 @@ while ($queue.Count -gt 0 -or $jobs.Count -gt 0) {
             $results.Add($rr)
             $completedP1++
             $pct = [int](($completedP1 / $totalP1) * 100)
-            $activeNow = $jobs.Count - $done.Count; $status = "Completed $completedP1 of $totalP1  |  Active: $activeNow  |  Queued: $($queue.Count)"
+            $activeNow = $jobs.Count - $done.Count
+            $status = "Done: $completedP1/$totalP1  |  Active threads: $activeNow  |  Queued: $($queue.Count)  |  Last: $($rr.MachineName) [$($rr.FinalNote.Split('|')[0].Trim())]"
             Write-Progress -Activity "Phase 1 — Scan + Reboot Check + User Detection" `
                            -Status $status -PercentComplete $pct
         }
@@ -557,13 +558,18 @@ if ($escalationCandidates.Count -gt 0) {
                     $e.Action = 'WUA cache clear + reboot'
 
                     # Step A: stop services, clear cache, reset WU auth
-                    Invoke-Command -ComputerName $machine.MachineName -ErrorAction Stop -ScriptBlock {
+                    # Short SessionOption timeouts ensure WSMan drops cleanly before reboot
+                    # preventing the "WSManNetworkFailureDetected / reconnect" spam
+                    $sessionOpt = New-PSSessionOption -OpenTimeout 5000 -OperationTimeout 15000 -CancelTimeout 3000
+                    Invoke-Command -ComputerName $machine.MachineName -SessionOption $sessionOpt `
+                                   -ErrorAction Stop -ScriptBlock {
                         Stop-Service wuauserv,bits,ccmexec -Force -ErrorAction SilentlyContinue
                         Remove-Item 'C:\Windows\SoftwareDistribution\*' -Recurse -Force -ErrorAction SilentlyContinue
                         & wuauclt /resetauthorization
                     }
 
-                    # Step B: reboot so WU agent starts completely fresh
+                    # Step B: reboot — suppress WSMan reconnect warnings (machine going down intentionally)
+                    $WarningPreference = 'SilentlyContinue'
                     try {
                         Restart-Computer -ComputerName $machine.MachineName -Force -ErrorAction Stop
                     } catch {
@@ -607,7 +613,9 @@ if ($escalationCandidates.Count -gt 0) {
                 } elseif ($ch -eq '2') {
                     # ── CCM repair only ──────────────────────────────────
                     $e.Action = 'CCM repair'
-                    Invoke-Command -ComputerName $machine.MachineName -ErrorAction Stop -ScriptBlock {
+                    $sessionOpt = New-PSSessionOption -OpenTimeout 5000 -OperationTimeout 300000 -CancelTimeout 3000
+                    Invoke-Command -ComputerName $machine.MachineName -SessionOption $sessionOpt `
+                                   -ErrorAction Stop -ScriptBlock {
                         $exe = "$env:WinDir\CCM\ccmrepair.exe"
                         if (Test-Path $exe) { Start-Process $exe -Wait }
                         else { throw "ccmrepair.exe not found at $exe" }
@@ -617,6 +625,8 @@ if ($escalationCandidates.Count -gt 0) {
                     # ── Reboot then CCM repair ────────────────────────────
                     # Step A: reboot the machine
                     $e.Action = 'Reboot+CCM repair'
+                    # Suppress WSMan reconnect warnings — machine is intentionally going down
+                    $WarningPreference = 'SilentlyContinue'
                     try {
                         Restart-Computer -ComputerName $machine.MachineName -Force -ErrorAction Stop
                     } catch {
@@ -678,13 +688,19 @@ if ($escalationCandidates.Count -gt 0) {
 
         $escJobs = [System.Collections.Generic.List[object]]::new()
         foreach ($cand in $escalationCandidates) {
-            $escJobs.Add((Start-ThreadJob -ScriptBlock $escBlock -ArgumentList $cand, $choice `
+            $escJobs.Add((Start-ThreadJob -Name $cand.MachineName -ScriptBlock $escBlock `
+                -ArgumentList $cand, $choice `
                 -InitializationScript { Set-Location C:\ }))
         }
 
-        $remaining = [System.Collections.Generic.List[object]]::new($escJobs)
+        $remaining   = [System.Collections.Generic.List[object]]::new($escJobs)
+        $p2StartTime = Get-Date
+        $p2Elapsed   = [System.Diagnostics.Stopwatch]::StartNew()
+
         while ($remaining.Count -gt 0) {
+
             [object[]]$done2 = @($remaining | Where-Object { $_.State -in 'Completed','Failed' })
+
             foreach ($ej in $done2) {
                 $er = Receive-Job $ej -ErrorAction SilentlyContinue
                 if ($er) {
@@ -695,20 +711,53 @@ if ($escalationCandidates.Count -gt 0) {
                         $match.FinalNote = if ($er.Error) { "Escalation FAILED: $($er.Error)" }
                                            else           { "Escalation ($($er.Action)) OK" }
                     }
+                    Write-Host "  [$($er.MachineName)] $(if ($er.Error) { "FAILED: $($er.Error)" } else { "$($er.Action) — OK" })" `
+                               -ForegroundColor $(if ($er.Error) { 'Red' } else { 'Green' })
                 }
                 Remove-Job $ej -Force
                 $remaining.Remove($ej) | Out-Null
                 $completedP2++
-                $pct2   = [int](($completedP2 / $totalP2) * 100)
-                $label2 = if ($ch -eq '3') { "Reboot + CCM repair" } else { $actionLabel }
-                Write-Progress -Activity "Phase 2 — $actionLabel" `
-                               -Status "Completed $completedP2 of $totalP2  |  Active: $($remaining.Count)" `
-                               -PercentComplete $pct2
             }
-            if ($remaining.Count -gt 0) { Start-Sleep -Milliseconds 500 }
+
+            # ── Heartbeat progress — updates every loop tick regardless of completions ──
+            $pct2    = if ($totalP2 -gt 0) { [int](($completedP2 / $totalP2) * 100) } else { 0 }
+            $elapsed = [int]$p2Elapsed.Elapsed.TotalSeconds
+            $etaStr  = if ($completedP2 -gt 0) {
+                $secPerMachine = $elapsed / $completedP2
+                $secLeft       = [int]($secPerMachine * ($totalP2 - $completedP2))
+                "ETA ~$([math]::Ceiling($secLeft / 60))m $($secLeft % 60)s"
+            } else { "Calculating..." }
+
+            # Build a mini per-job state summary for the status line
+            $running  = @($remaining | Where-Object { $_.State -eq 'Running' }).Count
+            $notStart = @($remaining | Where-Object { $_.State -eq 'NotStarted' }).Count
+
+            Write-Progress -Id 2 -Activity "Phase 2 — $actionLabel" `
+                -Status ("Done: $completedP2/$totalP2  |  Running: $running  |  Waiting: $notStart  |  Elapsed: ${elapsed}s  |  $etaStr") `
+                -PercentComplete $pct2
+
+            # ── Per-job child progress bars (one per active machine) ──────────────
+            $activeSlot = 0
+            foreach ($rj in @($remaining | Where-Object { $_.State -eq 'Running' } | Select-Object -First 8)) {
+                $activeSlot++
+                $jobAge = [int]((Get-Date) - $rj.PSBeginTime).TotalSeconds
+                Write-Progress -Id (10 + $activeSlot) -ParentId 2 `
+                    -Activity "  $($rj.Name)" `
+                    -Status "Running — ${jobAge}s elapsed" `
+                    -PercentComplete -1   # indeterminate
+            }
+            # Clear child bars for slots that are no longer needed
+            for ($s = $activeSlot + 1; $s -le 8; $s++) {
+                Write-Progress -Id (10 + $s) -Activity " " -Completed
+            }
+
+            if ($remaining.Count -gt 0) { Start-Sleep -Milliseconds 800 }
         }
-        Write-Progress -Activity "Phase 2 — $actionLabel" -Completed
-        Write-Log "Phase 2 complete."
+
+        # Clear all progress bars
+        for ($s = 1; $s -le 8; $s++) { Write-Progress -Id (10 + $s) -Activity " " -Completed }
+        Write-Progress -Id 2 -Activity "Phase 2 — $actionLabel" -Completed
+        Write-Log "Phase 2 complete. Total time: $([int]$p2Elapsed.Elapsed.TotalSeconds)s"
     } else {
         Write-Log "Escalation skipped by operator." WARN
     }
