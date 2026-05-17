@@ -59,15 +59,13 @@ function Write-Log {
     }
 }
 
+# StatusType values per SMS_SUMDeploymentAssetDetails docs
 $StateMap = @{
-    0 = 'Unknown'
-    1 = 'Compliant'
-    2 = 'Non-Compliant'
-    3 = 'Error'
-    4 = 'Compliant (Pending Reboot)'
-    5 = 'Non-Compliant (Pending Reboot)'
-    6 = 'Missing'
-    7 = 'In Progress'
+    1 = 'Success'
+    2 = 'InProgress'
+    3 = 'RebootRequired'
+    4 = 'Unknown'
+    5 = 'Error'
 }
 
 #endregion
@@ -112,43 +110,47 @@ try {
 
 #region ── Step 1: Deployment Selection ─────────────────────────────────────────
 
-Write-Log "Querying software update deployments from $SiteServer..."
+Write-Log "Querying software update deployments..."
 
-$dQuery = "SELECT * FROM SMS_DeploymentSummary WHERE FeatureType = 5"
-if ($DeploymentName) {
-    $e = $DeploymentName.Replace("'","''")
-    $dQuery += " AND SoftwareName LIKE '$($e.Replace('*','%'))'"
-}
+# Get-CMDeployment returns SMS_DeploymentSummary objects via the CM PSDrive — no CIM needed here
+$allRaw = Get-CMDeployment -FeatureType SoftwareUpdate | Sort-Object DeploymentTime -Descending
 
-$allDeployments = Get-CimInstance -ComputerName $SiteServer `
-    -Namespace "root/sms/site_$SiteCode" -Query $dQuery |
-    Select-Object `
-        @{N='DeploymentID';        E={$_.DeploymentID}},
-        @{N='Name';                E={$_.SoftwareName}},
-        @{N='Collection';          E={$_.CollectionName}},
-        @{N='Compliant';           E={$_.NumberSuccess}},
-        @{N='NonCompliant';        E={$_.NumberNonCompliant}},
-        @{N='Error';               E={$_.NumberErrors}},
-        @{N='Unknown';             E={$_.NumberUnknown}},
-        @{N='Total';               E={$_.NumberTotal}},
-        @{N='EnforcementDeadline'; E={
-            if ($_.EnforcementDeadline) { $_.EnforcementDeadline } else { 'N/A' }
-        }}
-
-if (-not $allDeployments) {
-    Write-Log "No deployments found." ERROR
+if (-not $allRaw) {
+    Write-Log "No software update deployments found." ERROR
     Set-Location $origLocation; Stop-Transcript; exit 1
 }
 
+# Apply optional name filter
+if ($DeploymentName) {
+    $allRaw = @($allRaw | Where-Object { $_.SoftwareName -like $DeploymentName })
+    if (-not $allRaw) {
+        Write-Log "No deployments matched filter '$DeploymentName'." ERROR
+        Set-Location $origLocation; Stop-Transcript; exit 1
+    }
+}
+
+$allDeployments = $allRaw | Select-Object `
+    @{N='DeploymentID';        E={$_.DeploymentID}},
+    @{N='Name';                E={$_.SoftwareName}},
+    @{N='Collection';          E={$_.CollectionName}},
+    @{N='Compliant';           E={$_.NumberSuccess}},
+    @{N='NonCompliant';        E={$_.NumberNonCompliant}},
+    @{N='Error';               E={$_.NumberErrors}},
+    @{N='Unknown';             E={$_.NumberUnknown}},
+    @{N='Total';               E={$_.NumberTargeted}},
+    @{N='DeploymentTime';      E={$_.DeploymentTime}}
+
 Write-Log "Found $($allDeployments.Count) deployment(s). Opening picker..."
 
-$sel = $allDeployments | Sort-Object EnforcementDeadline |
+$sel = $allDeployments | Sort-Object DeploymentTime -Descending |
     Out-GridView -Title "Select a deployment to remediate  [single-select → OK]" -OutputMode Single
 
 if (-not $sel) {
     Write-Log "No deployment selected. Exiting." WARN
     Set-Location $origLocation; Stop-Transcript; exit 0
 }
+
+# Keep reference to the raw CM object for the query chain in Step 2
 
 Write-Log "Deployment selected: '$($sel.Name)'  ID: $($sel.DeploymentID)  Collection: '$($sel.Collection)'"
 
@@ -158,79 +160,62 @@ Write-Log "Deployment selected: '$($sel.Name)'  ID: $($sel.DeploymentID)  Collec
 
 Write-Log "Querying per-machine states for deployment $($sel.DeploymentID)..."
 
-# SMS_DeploymentAssetDetails is a console-layer view class not exposed via CIM.
-# Primary: Get-CMDeploymentStatusDetails via the CM PSDrive (requires console).
-# Fallback: SMS_ClientAdvertisementStatus WQL via CIM — broader but always available.
+# Proven chain (mirrors Invoke-VDIPatchRemediation.ps1):
+#   Get-CMSoftwareUpdateDeployment -DeploymentId <GUID>
+#     -> Get-CMSoftwareUpdateDeploymentStatus -InputObject   (one row per CI)
+#       -> Get-CMDeploymentStatusDetails -InputObject        (one row per device per CI)
+# StatusType: 1=Success  2=InProgress  4=Unknown  5=Error/Failed
+# All CIs are iterated and results deduped by machine (most recent row wins).
 
 $machineStates = $null
 
 try {
-    Write-Log "Trying Get-CMDeploymentStatusDetails (CM PSDrive method)..."
-    $rawStates = Get-CMDeploymentStatusDetails -InputObject (
-        Get-CMSoftwareUpdateDeployment -DeploymentId $sel.DeploymentID -ErrorAction Stop
-    ) -ErrorAction Stop
+    Write-Log "Step 1/3 — Get-CMSoftwareUpdateDeployment (DeploymentId: $($sel.DeploymentID))..."
+    $suDeployment = Get-CMSoftwareUpdateDeployment -DeploymentId $sel.DeploymentID -ErrorAction Stop
+    if (-not $suDeployment) { throw "Get-CMSoftwareUpdateDeployment returned nothing for ID $($sel.DeploymentID)" }
 
-    $machineStates = $rawStates | Select-Object `
-        @{N='MachineName';          E={$_.DeviceName}},
-        @{N='ResourceID';           E={$_.ResourceID}},
-        @{N='StateID';              E={$_.StatusType}},
-        @{N='State';                E={ $StateMap[[int]$_.StatusType] ?? "State_$($_.StatusType)" }},
-        @{N='LastComplianceMessage';E={
-            if ($_.LastComplianceMessageTime) { $_.LastComplianceMessageTime } else { 'Never' }
-        }},
-        @{N='LastEnforcementMessage';E={
-            if ($_.LastEnforcementMessageTime) { $_.LastEnforcementMessageTime } else { 'Never' }
-        }}
+    Write-Log "Step 2/3 — Get-CMSoftwareUpdateDeploymentStatus..."
+    $statusSummaries = Get-CMSoftwareUpdateDeploymentStatus -InputObject $suDeployment -ErrorAction Stop
+    if (-not $statusSummaries) { throw "Get-CMSoftwareUpdateDeploymentStatus returned nothing" }
 
-    Write-Log "CM PSDrive method returned $($machineStates.Count) record(s)."
+    $ciCount = @($statusSummaries).Count
+    Write-Log "Got $ciCount CI status row(s). Step 3/3 — expanding per-device details..."
+
+    # Iterate ALL CI summaries — some deployments have many CIs, each may cover different machines
+    $rawRows = foreach ($summary in @($statusSummaries)) {
+        $details = Get-CMDeploymentStatusDetails -InputObject $summary -ErrorAction SilentlyContinue
+        if (-not $details) { continue }
+        $details | Select-Object `
+            @{N='MachineName';       E={$_.DeviceName}},
+            @{N='ResourceID';        E={$_.ResourceID}},
+            @{N='StateID';           E={$_.StatusType}},
+            @{N='State';             E={
+                switch ($_.StatusType) {
+                    1 { 'Success'        }
+                    2 { 'InProgress'     }
+                    4 { 'Unknown'        }
+                    5 { 'Error'          }
+                    default { "StateType_$($_.StatusType)" }
+                }
+            }},
+            @{N='IsCompliant';       E={$_.IsCompliant}},
+            @{N='StatusDescription'; E={$_.StatusDescription}},
+            @{N='LastStatusTime';    E={ if ($_.StatusTime) { $_.StatusTime } else { 'Never' } }}
+    }
+
+    # Deduplicate — one row per machine, keeping most recent status
+    $machineStates = @($rawRows) |
+        Where-Object { $_.MachineName } |
+        Sort-Object MachineName, LastStatusTime -Descending |
+        Group-Object MachineName |
+        ForEach-Object { $_.Group | Select-Object -First 1 }
+
+    Write-Log "Returned $($machineStates.Count) unique machine record(s) across $ciCount CI(s)."
 
 } catch {
-    Write-Log "CM PSDrive method failed ($($_.Exception.Message)) — falling back to SMS_ClientAdvertisementStatus." WARN
-
-    # Fallback: query SMS_ClientAdvertisementStatus which IS in the CIM SMS namespace.
-    # Maps AdvertisementID (old) or we join via SMS_UpdatesAssignment for the deployment.
-    # For Software Update deployments the DeploymentID maps to AssignmentID in
-    # SMS_UpdatesAssignment; StatusType maps to our StateMap.
-    try {
-        $assignment = Get-CimInstance -ComputerName $SiteServer `
-            -Namespace "root/sms/site_$SiteCode" `
-            -Query "SELECT AssignmentID, AssignmentName FROM SMS_UpdatesAssignment WHERE AssignmentID = '$($sel.DeploymentID)'" `
-            -ErrorAction Stop
-
-        if (-not $assignment) {
-            # DeploymentID may be in the UniqueID field instead
-            $assignment = Get-CimInstance -ComputerName $SiteServer `
-                -Namespace "root/sms/site_$SiteCode" `
-                -Query "SELECT AssignmentID, AssignmentName, AssignmentUniqueID FROM SMS_UpdatesAssignment WHERE AssignmentUniqueID = '$($sel.DeploymentID)'" `
-                -ErrorAction Stop
-        }
-
-        $assignID = if ($assignment) { $assignment.AssignmentID } else { $sel.DeploymentID }
-        Write-Log "Using AssignmentID: $assignID for status query."
-
-        $rawFallback = Get-CimInstance -ComputerName $SiteServer `
-            -Namespace "root/sms/site_$SiteCode" `
-            -Query "SELECT * FROM SMS_ClientAdvertisementStatus WHERE AdvertisementID = '$assignID'" `
-            -ErrorAction Stop
-
-        $machineStates = $rawFallback | Select-Object `
-            @{N='MachineName';          E={$_.MachineName}},
-            @{N='ResourceID';           E={$_.ResourceID}},
-            @{N='StateID';              E={$_.LastStatusID}},
-            @{N='State';                E={ $StateMap[[int]$_.LastStatusID] ?? "State_$($_.LastStatusID)" }},
-            @{N='LastComplianceMessage';E={
-                if ($_.LastAcceptanceMessageIDTime) { $_.LastAcceptanceMessageIDTime } else { 'Never' }
-            }},
-            @{N='LastEnforcementMessage';E={
-                if ($_.LastStatusTime) { $_.LastStatusTime } else { 'Never' }
-            }}
-
-        Write-Log "Fallback method returned $($machineStates.Count) record(s)."
-
-    } catch {
-        Write-Log "Both query methods failed: $($_.Exception.Message)" ERROR
-        Set-Location $origLocation; Stop-Transcript; exit 1
-    }
+    Write-Log "Machine state query failed: $($_.Exception.Message)" ERROR
+    Write-Log "Ensure you are running from the PRD:\ drive and the CM console is installed." ERROR
+    Set-Location $origLocation; Stop-Transcript; exit 1
 }
 
 if (-not $machineStates) {
