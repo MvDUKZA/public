@@ -82,20 +82,31 @@ function Connect-CMSite {
 
 function Select-UpdateDeployment {
     # FeatureType 5 = Software Updates
-    $deployments = Get-CMDeployment -FeatureType SoftwareUpdate |
-        Select-Object @{N='DeploymentID';        E={$_.DeploymentID}},            # numeric AssignmentID
-                      @{N='AssignmentUniqueID';  E={$_.AssignmentUniqueID}},      # GUID — what Get-CMDeploymentStatus actually wants
-                      @{N='Name';                E={$_.SoftwareName}},
-                      @{N='Collection';          E={$_.CollectionName}},
-                      @{N='NumberTargeted';      E={$_.NumberTargeted}},
-                      @{N='NumberErrors';        E={$_.NumberErrors}},
-                      @{N='NumberUnknown';       E={$_.NumberUnknown}},
-                      @{N='DeploymentTime';      E={$_.DeploymentTime}} |
+    $raw = Get-CMDeployment -FeatureType SoftwareUpdate
+
+    if (-not $raw) { throw "No software update deployments found." }
+
+    # One-time diagnostic: what properties does this object actually expose?
+    Write-Verbose "Available properties on Get-CMDeployment result:"
+    $raw[0].PSObject.Properties |
+        Where-Object { $_.Name -match 'ID|Unique|Offer|Assign' } |
+        ForEach-Object { Write-Verbose ("  {0,-30} = {1}" -f $_.Name, $_.Value) }
+
+    $deployments = $raw |
+        Select-Object *,                                    # keep everything; we'll pick the right ID later
+                      @{N='Name';           E={$_.SoftwareName}},
+                      @{N='Collection';     E={$_.CollectionName}} |
         Sort-Object DeploymentTime -Descending
 
-    if (-not $deployments) { throw "No software update deployments found." }
+    # Show the user a clean view, but pass the full objects through
+    $picked = $deployments |
+        Select-Object Name, Collection, NumberTargeted, NumberErrors, NumberUnknown, DeploymentTime, DeploymentID, AssignmentID, OfferID |
+        Out-GridView -Title 'Select one or more update deployments to remediate' -OutputMode Multiple
 
-    $deployments | Out-GridView -Title 'Select one or more update deployments to remediate' -OutputMode Multiple
+    if (-not $picked) { return $null }
+
+    # Map the picks back to the full objects (match on DeploymentID which is always populated)
+    $deployments | Where-Object { $_.DeploymentID -in $picked.DeploymentID }
 }
 
 # ============================================================================
@@ -104,60 +115,103 @@ function Select-UpdateDeployment {
 
 function Get-FailedAndUnknownAssets {
     <#
-        Get-CMDeploymentStatus returns per-bucket summary rows for a
-        deployment. StatusType:
-            1 = Success
-            2 = In Progress
-            3 = Requirements Not Met / Not Applicable
-            4 = Unknown
-            5 = Error / Failed
-        Pipe each bucket row to Get-CMDeploymentStatusDetails for the
-        per-asset list.
+        Tries Get-CMDeploymentStatus first; if that returns nothing, falls
+        back to a direct WMI query against SMS_StatusMessage (which always
+        works on every site version).
     #>
     param(
         [Parameter(Mandatory)] $Deployments,
+        [Parameter(Mandatory)] [string] $SiteCode,
+        [Parameter(Mandatory)] [string] $SiteServer,
         [switch] $IncludeUnknown
     )
 
-    $wantedTypes = @(5)                       # Error
-    if ($IncludeUnknown) { $wantedTypes += 4 } # Unknown
+    $wantedTypes = @(5)
+    if ($IncludeUnknown) { $wantedTypes += 4 }
 
     $rows = foreach ($d in $Deployments) {
-        Write-Verbose "Querying status for '$($d.Name)' (GUID $($d.AssignmentUniqueID))"
 
-        # Re-fetch the deployment as a full object so the pipeline binds
-        # cleanly to Get-CMDeploymentStatus (its parameter sets are picky).
-        $dep = Get-CMDeployment -DeploymentId $d.AssignmentUniqueID -ErrorAction SilentlyContinue
-        if (-not $dep) {
-            Write-Warning "Could not re-fetch deployment $($d.AssignmentUniqueID)"
-            continue
-        }
+        # Find the GUID — try every known property name
+        $guid = $d.AssignmentUniqueID, $d.OfferID, $d.DeploymentID |
+                Where-Object { $_ -match '^\{?[0-9a-fA-F-]{36}\}?$' } |
+                Select-Object -First 1
 
-        $buckets = $dep | Get-CMDeploymentStatus -ErrorAction Stop |
-                   Where-Object { $_.StatusType -in $wantedTypes }
+        # Numeric AssignmentID for the WMI fallback
+        $numericId = if ($d.AssignmentID -match '^\d+$') { [int]$d.AssignmentID }
+                     elseif ($d.DeploymentID -match '^\d+$') { [int]$d.DeploymentID }
+                     else { $null }
 
-        Write-Verbose ("  {0} bucket(s) match Failed/Unknown filter" -f @($buckets).Count)
+        Write-Verbose "Deployment '$($d.Name)'  GUID=$guid  AssignmentID=$numericId"
 
-        foreach ($b in $buckets) {
-            $label = switch ($b.StatusType) {
-                4 { 'Unknown' }
-                5 { 'Failed'  }
-                default { "Type$($b.StatusType)" }
+        # ---- Strategy A: Get-CMDeploymentStatus via piped object ----------
+        $found = $null
+        if ($guid) {
+            try {
+                $dep = Get-CMUpdateGroupDeployment -DeploymentId $guid -ErrorAction SilentlyContinue
+                if (-not $dep) {
+                    $dep = Get-CMDeployment -DeploymentId $guid -ErrorAction SilentlyContinue
+                }
+                if ($dep) {
+                    $buckets = $dep | Get-CMDeploymentStatus -ErrorAction SilentlyContinue |
+                               Where-Object { $_.StatusType -in $wantedTypes }
+                    Write-Verbose ("  Strategy A: {0} bucket(s)" -f @($buckets).Count)
+                    $found = foreach ($b in $buckets) {
+                        $label = if ($b.StatusType -eq 4) { 'Unknown' } else { 'Failed' }
+                        $details = Get-CMDeploymentStatusDetails -InputObject $b -ErrorAction SilentlyContinue
+                        Write-Verbose ("    StatusType $($b.StatusType) [$label] => $(@($details).Count) asset(s)")
+                        $details | Select-Object @{N='Deployment';E={$d.Name}},
+                                                 @{N='Computer';E={$_.DeviceName}},
+                                                 @{N='StatusType';E={$label}},
+                                                 @{N='LastStatusTime';E={$_.StatusTime}}
+                    }
+                }
+            } catch {
+                Write-Verbose "  Strategy A failed: $($_.Exception.Message)"
             }
-            $details = Get-CMDeploymentStatusDetails -InputObject $b -ErrorAction SilentlyContinue
-            Write-Verbose ("    StatusType $($b.StatusType) [$label] => $(@($details).Count) asset(s)")
-
-            $details |
-                Select-Object @{N='DeploymentID';   E={$d.DeploymentID}},
-                              @{N='Deployment';     E={$d.Name}},
-                              @{N='Computer';       E={$_.DeviceName}},
-                              @{N='StatusType';     E={$label}},
-                              @{N='LastStatusTime'; E={$_.StatusTime}}
         }
+
+        # ---- Strategy B: direct WMI on the site server --------------------
+        if (-not $found -and $numericId) {
+            Write-Verbose "  Strategy B: WMI on site server"
+            $stateFilter = ($wantedTypes | ForEach-Object {
+                if ($_ -eq 5) { 'StateType = 5' }      # Error
+                elseif ($_ -eq 4) { 'StateType = 4' }  # Unknown
+            }) -join ' OR '
+
+            # SMS_UpdateComplianceStatus — the per-asset compliance table
+            $ns = "root\sms\site_$SiteCode"
+            try {
+                $q = "SELECT * FROM SMS_UpdateComplianceStatus WHERE AssignmentID = $numericId AND ($stateFilter)"
+                Write-Verbose "    WQL: $q"
+                $wmi = Get-CimInstance -ComputerName $SiteServer -Namespace $ns -Query $q -ErrorAction Stop
+                Write-Verbose ("    {0} row(s) from SMS_UpdateComplianceStatus" -f @($wmi).Count)
+
+                $found = $wmi | ForEach-Object {
+                    # Resolve MachineID -> Netbios name
+                    $resource = Get-CimInstance -ComputerName $SiteServer -Namespace $ns `
+                                -Query "SELECT Name FROM SMS_R_System WHERE ResourceID = $($_.MachineID)" `
+                                -ErrorAction SilentlyContinue
+                    [pscustomobject]@{
+                        Deployment     = $d.Name
+                        Computer       = $resource.Name
+                        StatusType     = if ($_.StateType -eq 4) { 'Unknown' } else { 'Failed' }
+                        LastStatusTime = $_.LastStatusChangeTime
+                    }
+                } | Where-Object Computer
+            } catch {
+                Write-Verbose "  Strategy B failed: $($_.Exception.Message)"
+            }
+        }
+
+        if (-not $found) {
+            Write-Warning "No assets retrieved for deployment '$($d.Name)' via any method."
+        }
+        $found
     }
 
-    # Dedupe across deployments — keep most recent per machine
-    $rows | Sort-Object Computer, LastStatusTime -Descending |
+    # Dedupe — keep most recent per machine
+    $rows | Where-Object Computer |
+            Sort-Object Computer, LastStatusTime -Descending |
             Group-Object Computer |
             ForEach-Object { $_.Group | Select-Object -First 1 }
 }
@@ -257,7 +311,10 @@ try {
     Write-Host ("Querying failed{0} assets across {1} deployment(s) ..." `
                 -f $(if ($IncludeUnknown) {' + unknown'}), $selected.Count) -ForegroundColor Cyan
 
-    $assets = Get-FailedAndUnknownAssets -Deployments $selected -IncludeUnknown:$IncludeUnknown
+    $assets = Get-FailedAndUnknownAssets -Deployments $selected `
+                                         -SiteCode $SiteCode `
+                                         -SiteServer $SiteServer `
+                                         -IncludeUnknown:$IncludeUnknown
 
     if (-not $assets) {
         Write-Warning 'No failed or unknown assets found in the selected deployment(s). Nothing to do.'
