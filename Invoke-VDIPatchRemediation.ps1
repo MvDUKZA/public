@@ -115,9 +115,9 @@ function Select-UpdateDeployment {
 
 function Get-FailedAndUnknownAssets {
     <#
-        Tries Get-CMDeploymentStatus first; if that returns nothing, falls
-        back to a direct WMI query against SMS_StatusMessage (which always
-        works on every site version).
+        Strategy A: Get-CMUpdateGroupDeployment | Get-CMDeploymentStatus | Get-CMDeploymentStatusDetails
+        Strategy B: Invoke-Command on the site server to query SMS_UpdateComplianceStatus
+                    locally (avoids WMI remote permission issues — 0x80041001).
     #>
     param(
         [Parameter(Mandatory)] $Deployments,
@@ -131,73 +131,66 @@ function Get-FailedAndUnknownAssets {
 
     $rows = foreach ($d in $Deployments) {
 
-        # Find the GUID — try every known property name
-        $guid = $d.AssignmentUniqueID, $d.OfferID, $d.DeploymentID |
-                Where-Object { $_ -match '^\{?[0-9a-fA-F-]{36}\}?$' } |
-                Select-Object -First 1
-
-        # Numeric AssignmentID for the WMI fallback
-        $numericId = if ($d.AssignmentID -match '^\d+$') { [int]$d.AssignmentID }
-                     elseif ($d.DeploymentID -match '^\d+$') { [int]$d.DeploymentID }
-                     else { $null }
+        # DeploymentID is the GUID, AssignmentID is the integer — confirmed from verbose dump
+        $guid      = $d.DeploymentID   # e.g. {2c9b4f52-3919-453d-bd51-e38b6dc867d3}
+        $numericId = $d.AssignmentID   # e.g. 16777747
 
         Write-Verbose "Deployment '$($d.Name)'  GUID=$guid  AssignmentID=$numericId"
 
-        # ---- Strategy A: Get-CMDeploymentStatus via piped object ----------
+        # ---- Strategy A: cmdlet pipeline -----------------------------------
         $found = $null
-        if ($guid) {
-            try {
-                $dep = Get-CMUpdateGroupDeployment -DeploymentId $guid -ErrorAction SilentlyContinue
-                if (-not $dep) {
-                    $dep = Get-CMDeployment -DeploymentId $guid -ErrorAction SilentlyContinue
-                }
-                if ($dep) {
-                    $buckets = $dep | Get-CMDeploymentStatus -ErrorAction SilentlyContinue |
-                               Where-Object { $_.StatusType -in $wantedTypes }
-                    Write-Verbose ("  Strategy A: {0} bucket(s)" -f @($buckets).Count)
+        try {
+            $dep = Get-CMUpdateGroupDeployment -DeploymentId $guid -ErrorAction SilentlyContinue
+            if ($dep) {
+                $buckets = $dep | Get-CMDeploymentStatus -ErrorAction SilentlyContinue |
+                           Where-Object { $_.StatusType -in $wantedTypes }
+                Write-Verbose ("  Strategy A: {0} bucket(s)" -f @($buckets).Count)
+
+                if ($buckets) {
                     $found = foreach ($b in $buckets) {
-                        $label = if ($b.StatusType -eq 4) { 'Unknown' } else { 'Failed' }
+                        $label   = if ($b.StatusType -eq 4) { 'Unknown' } else { 'Failed' }
                         $details = Get-CMDeploymentStatusDetails -InputObject $b -ErrorAction SilentlyContinue
-                        Write-Verbose ("    StatusType $($b.StatusType) [$label] => $(@($details).Count) asset(s)")
-                        $details | Select-Object @{N='Deployment';E={$d.Name}},
-                                                 @{N='Computer';E={$_.DeviceName}},
-                                                 @{N='StatusType';E={$label}},
+                        Write-Verbose ("    [$label] => $(@($details).Count) asset(s)")
+                        $details | Select-Object @{N='Deployment';    E={$d.Name}},
+                                                 @{N='Computer';      E={$_.DeviceName}},
+                                                 @{N='StatusType';    E={$label}},
                                                  @{N='LastStatusTime';E={$_.StatusTime}}
                     }
                 }
-            } catch {
-                Write-Verbose "  Strategy A failed: $($_.Exception.Message)"
             }
+        } catch {
+            Write-Verbose "  Strategy A failed: $($_.Exception.Message)"
         }
 
-        # ---- Strategy B: direct WMI on the site server --------------------
-        if (-not $found -and $numericId) {
-            Write-Verbose "  Strategy B: WMI on site server"
-            $stateFilter = ($wantedTypes | ForEach-Object {
-                if ($_ -eq 5) { 'StateType = 5' }      # Error
-                elseif ($_ -eq 4) { 'StateType = 4' }  # Unknown
-            }) -join ' OR '
-
-            # SMS_UpdateComplianceStatus — the per-asset compliance table
-            $ns = "root\sms\site_$SiteCode"
+        # ---- Strategy B: Invoke-Command on site server (local WMI) --------
+        if (-not $found) {
+            Write-Verbose "  Strategy B: Invoke-Command to $SiteServer"
             try {
-                $q = "SELECT * FROM SMS_UpdateComplianceStatus WHERE AssignmentID = $numericId AND ($stateFilter)"
-                Write-Verbose "    WQL: $q"
-                $wmi = Get-CimInstance -ComputerName $SiteServer -Namespace $ns -Query $q -ErrorAction Stop
-                Write-Verbose ("    {0} row(s) from SMS_UpdateComplianceStatus" -f @($wmi).Count)
+                $found = Invoke-Command -ComputerName $SiteServer -ErrorAction Stop -ScriptBlock {
+                    param($ns, $assignmentId, $wantedTypes, $deploymentName)
 
-                $found = $wmi | ForEach-Object {
-                    # Resolve MachineID -> Netbios name
-                    $resource = Get-CimInstance -ComputerName $SiteServer -Namespace $ns `
-                                -Query "SELECT Name FROM SMS_R_System WHERE ResourceID = $($_.MachineID)" `
-                                -ErrorAction SilentlyContinue
-                    [pscustomobject]@{
-                        Deployment     = $d.Name
-                        Computer       = $resource.Name
-                        StatusType     = if ($_.StateType -eq 4) { 'Unknown' } else { 'Failed' }
-                        LastStatusTime = $_.LastStatusChangeTime
+                    $stateFilter = ($wantedTypes | ForEach-Object { "StateType = $_" }) -join ' OR '
+                    $query = "SELECT * FROM SMS_UpdateComplianceStatus WHERE AssignmentID = $assignmentId AND ($stateFilter)"
+
+                    $rows = Get-CimInstance -Namespace $ns -Query $query -ErrorAction Stop
+
+                    foreach ($r in $rows) {
+                        # Resolve ResourceID to machine name locally
+                        $res = Get-CimInstance -Namespace $ns `
+                               -Query "SELECT Name FROM SMS_R_System WHERE ResourceID = $($r.MachineID)" `
+                               -ErrorAction SilentlyContinue
+                        if ($res.Name) {
+                            [pscustomobject]@{
+                                Deployment     = $deploymentName
+                                Computer       = $res.Name
+                                StatusType     = if ($r.StateType -eq 4) { 'Unknown' } else { 'Failed' }
+                                LastStatusTime = $r.LastStatusChangeTime
+                            }
+                        }
                     }
-                } | Where-Object Computer
+                } -ArgumentList "root\sms\site_$SiteCode", $numericId, $wantedTypes, $d.Name
+
+                Write-Verbose ("  Strategy B: {0} asset(s)" -f @($found).Count)
             } catch {
                 Write-Verbose "  Strategy B failed: $($_.Exception.Message)"
             }
