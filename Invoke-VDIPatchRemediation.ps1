@@ -1,75 +1,45 @@
 <#
 .SYNOPSIS
-    Remediates VDIs that failed or are in unknown state for one or more SCCM
-    software update deployments.
+    Remediates VDIs that failed (or are unknown) for one or more SCCM
+    software update deployments. Cmdlet-driven version.
 
 .DESCRIPTION
-    1.  Prompts for a Software Update Group / Deployment (multi-select).
-    2.  Pulls assets with EnforcementState matching the selected buckets
-        (Failed / Unknown / both).
-    3.  Adds them as direct members to the "VDI Maintenance Anytime"
-        collection and updates the collection.
-    4.  Reboots the machines in batches (default 20, 5 min apart) using
-        shutdown.exe (reliable on locked-down VDIs); falls back gracefully.
-    5.  Waits for each batch to come back online, then triggers:
-            - Machine Policy Retrieval + Evaluation
-            - Software Updates Scan
-            - Software Updates Deployment Evaluation
-            - State Message Refresh
-    6.  Writes a CSV report to $LogPath.
-
-.PARAMETER SiteCode
-    SCCM site code. Defaults to PRD.
-
-.PARAMETER SiteServer
-    SCCM site server FQDN. Defaults to appsmcm101fp.iprod.local.
-
-.PARAMETER MaintenanceCollectionName
-    Collection that grants Anytime maintenance window. Defaults to
-    "VDI Maintenance Anytime".
-
-.PARAMETER BatchSize
-    How many machines to reboot per wave. Default 20.
-
-.PARAMETER BatchIntervalMinutes
-    Minutes between waves. Default 5.
-
-.PARAMETER IncludeUnknown
-    Switch. If set, machines with EnforcementState = Unknown are remediated
-    alongside Failed. You will also be prompted interactively.
-
-.PARAMETER OnlineWaitMinutes
-    How long to wait for a rebooted machine to come back up before
-    skipping its post-reboot triggers. Default 15.
-
-.PARAMETER LogPath
-    Output CSV. Defaults to C:\Temp\VDIPatchRemediation_<timestamp>.csv.
-
-.PARAMETER WhatIf
-    Standard. Plans the run, makes no changes.
+    1.  Lists software update deployments via Get-CMDeployment, lets you
+        pick one or many in Out-GridView.
+    2.  Pulls per-asset status with Get-CMDeploymentStatus + 
+        Get-CMDeploymentStatusDetails and filters to Failed and 
+        (optionally) Unknown buckets.
+    3.  Adds the affected machines as direct members of the maintenance
+        collection using Add-CMDeviceCollectionDirectMembershipRule,
+        then refreshes with Invoke-CMCollectionUpdate.
+    4.  Reboots them in batches (default 20, 5 min apart) using
+        Restart-Computer; falls back to shutdown.exe if WinRM is blocked.
+    5.  Waits for each batch to come back online, then triggers Machine
+        Policy + Software Updates Scan/Eval via Invoke-CMClientNotification
+        (site-side cmdlet) and Invoke-CimMethod on the client itself
+        (no cmdlet exists for client-side TriggerSchedule).
+    6.  Writes a CSV report.
 
 .EXAMPLE
-    .\Invoke-VDIPatchRemediation.ps1 -IncludeUnknown -Verbose
-
-.NOTES
-    Run on a workstation/jumpbox with the ConfigMgr console installed and
-    the active user holding rights on the collection + remote restart on
-    the VDIs.
+    .\Invoke-VDIPatchRemediation.ps1 -WhatIf -Verbose
+    .\Invoke-VDIPatchRemediation.ps1 -IncludeUnknown
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
 param(
-    [string] $SiteCode                 = 'PRD',
-    [string] $SiteServer               = 'appsmcm101fp.iprod.local',
+    [string] $SiteCode                  = 'PRD',
+    [string] $SiteServer                = 'appsmcm101fp.iprod.local',
     [string] $MaintenanceCollectionName = 'VDI Maintenance Anytime',
-    [int]    $BatchSize                = 20,
-    [int]    $BatchIntervalMinutes     = 5,
+    [int]    $BatchSize                 = 20,
+    [int]    $BatchIntervalMinutes      = 5,
     [switch] $IncludeUnknown,
-    [int]    $OnlineWaitMinutes        = 15,
-    [string] $LogPath                  = "C:\Temp\VDIPatchRemediation_$(Get-Date -Format yyyyMMdd_HHmmss).csv"
+    [int]    $OnlineWaitMinutes         = 15,
+    [string] $LogPath                   = "C:\Temp\VDIPatchRemediation_$(Get-Date -Format yyyyMMdd_HHmmss).csv"
 )
 
-# ---------- helpers ---------------------------------------------------------
+# ============================================================================
+# Helpers
+# ============================================================================
 
 $script:Log = New-Object System.Collections.Generic.List[object]
 
@@ -80,20 +50,22 @@ function Write-Log {
         [string] $Result,
         [string] $Detail = ''
     )
-    $entry = [pscustomobject]@{
+    $script:Log.Add([pscustomobject]@{
         Timestamp = (Get-Date).ToString('s')
         Computer  = $Computer
         Action    = $Action
         Result    = $Result
         Detail    = $Detail
-    }
-    $script:Log.Add($entry) | Out-Null
+    }) | Out-Null
     Write-Verbose "[$Computer] $Action => $Result $Detail"
 }
 
 function Connect-CMSite {
     param([string] $SiteCode, [string] $SiteServer)
 
+    if (-not $env:SMS_ADMIN_UI_PATH) {
+        throw "SMS_ADMIN_UI_PATH not set — install the ConfigMgr console on this host."
+    }
     $modulePath = Join-Path $env:SMS_ADMIN_UI_PATH '..\ConfigurationManager.psd1'
     if (-not (Get-Module ConfigurationManager)) {
         Import-Module $modulePath -ErrorAction Stop
@@ -104,40 +76,81 @@ function Connect-CMSite {
     Set-Location ("{0}:\" -f $SiteCode)
 }
 
+# ============================================================================
+# 1. Deployment selection
+# ============================================================================
+
+function Select-UpdateDeployment {
+    # FeatureType 5 = Software Updates
+    $deployments = Get-CMDeployment -FeatureType SoftwareUpdate |
+        Select-Object @{N='DeploymentID';   E={$_.DeploymentID}},
+                      @{N='Name';           E={$_.SoftwareName}},
+                      @{N='Collection';     E={$_.CollectionName}},
+                      @{N='NumberTargeted'; E={$_.NumberTargeted}},
+                      @{N='NumberErrors';   E={$_.NumberErrors}},
+                      @{N='NumberUnknown';  E={$_.NumberUnknown}},
+                      @{N='DeploymentTime'; E={$_.DeploymentTime}} |
+        Sort-Object DeploymentTime -Descending
+
+    if (-not $deployments) { throw "No software update deployments found." }
+
+    $deployments | Out-GridView -Title 'Select one or more update deployments to remediate' -OutputMode Multiple
+}
+
+# ============================================================================
+# 2. Per-asset status
+# ============================================================================
+
 function Get-FailedAndUnknownAssets {
     <#
-        Pulls compliance status straight from WMI on the site server.
-        SMS_UpdateComplianceStatus is the per-asset/per-update view but it's
-        huge; we instead use the deployment summarizer per-asset class
-        SMS_StatMsg / SMS_SUMDeploymentAsset which is keyed by AssignmentID
-        (deployment) and gives a per-resource roll-up.
+        Get-CMDeploymentStatus returns per-bucket summary rows for a
+        deployment. StatusType:
+            1 = Success
+            2 = In Progress
+            3 = Requirements Not Met / Not Applicable
+            4 = Unknown
+            5 = Error / Failed
+        Pipe each bucket row to Get-CMDeploymentStatusDetails for the
+        per-asset list.
     #>
     param(
-        [Parameter(Mandatory)] [int[]] $AssignmentIDs,
-        [Parameter(Mandatory)] [string] $SiteCode,
-        [Parameter(Mandatory)] [string] $SiteServer,
+        [Parameter(Mandatory)] $Deployments,
         [switch] $IncludeUnknown
     )
 
-    # StatusType: 1=Compliant 2=InProgress 3=RequirementsNotMet 4=Unknown 5=Error
-    $wantedStatusTypes = @(5)            # Error / Failed
-    if ($IncludeUnknown) { $wantedStatusTypes += 4 }
+    $wantedTypes = @(5)                       # Error
+    if ($IncludeUnknown) { $wantedTypes += 4 } # Unknown
 
-    $filter = ($wantedStatusTypes | ForEach-Object { "StatusType = $_" }) -join ' OR '
-    $ns     = "root\sms\site_$SiteCode"
+    $rows = foreach ($d in $Deployments) {
+        Write-Verbose "Querying status for '$($d.Name)' (ID $($d.DeploymentID))"
 
-    $all = foreach ($id in $AssignmentIDs) {
-        $query = "SELECT * FROM SMS_SUMDeploymentAssetDetails WHERE AssignmentID = $id AND ($filter)"
-        Get-CimInstance -ComputerName $SiteServer -Namespace $ns -Query $query -ErrorAction Stop |
-            Select-Object @{N='AssignmentID';E={$id}},
-                          @{N='Computer';   E={$_.MachineName}},
-                          @{N='StatusType'; E={$_.StatusType}},
-                          @{N='LastStatus'; E={$_.LastStatusChangeTime}}
+        $buckets = Get-CMDeploymentStatus -DeploymentId $d.DeploymentID -ErrorAction Stop |
+                   Where-Object { $_.StatusType -in $wantedTypes }
+
+        foreach ($b in $buckets) {
+            $label = switch ($b.StatusType) {
+                4 { 'Unknown' }
+                5 { 'Failed'  }
+                default { "Type$($b.StatusType)" }
+            }
+            Get-CMDeploymentStatusDetails -InputObject $b -ErrorAction SilentlyContinue |
+                Select-Object @{N='DeploymentID';   E={$d.DeploymentID}},
+                              @{N='Deployment';     E={$d.Name}},
+                              @{N='Computer';       E={$_.DeviceName}},
+                              @{N='StatusType';     E={$label}},
+                              @{N='LastStatusTime'; E={$_.StatusTime}}
+        }
     }
 
-    # Dedupe across deployments — one machine may be failing several deployments
-    $all | Sort-Object Computer -Unique
+    # Dedupe across deployments — keep most recent per machine
+    $rows | Sort-Object Computer, LastStatusTime -Descending |
+            Group-Object Computer |
+            ForEach-Object { $_.Group | Select-Object -First 1 }
 }
+
+# ============================================================================
+# 3. Collection membership
+# ============================================================================
 
 function Add-ToMaintenanceCollection {
     param(
@@ -146,13 +159,10 @@ function Add-ToMaintenanceCollection {
     )
 
     $coll = Get-CMDeviceCollection -Name $CollectionName -ErrorAction Stop
-    if (-not $coll) {
-        throw "Collection '$CollectionName' not found."
-    }
+    if (-not $coll) { throw "Collection '$CollectionName' not found." }
 
-    # Existing direct-rule members so we don't try to add duplicates
-    $existing = (Get-CMCollectionDirectMembershipRule -CollectionId $coll.CollectionID |
-                    Select-Object -ExpandProperty RuleName) -as [string[]]
+    $existing = Get-CMDeviceCollectionDirectMembershipRule -CollectionId $coll.CollectionID |
+                Select-Object -ExpandProperty RuleName
     if (-not $existing) { $existing = @() }
 
     foreach ($c in $Computers) {
@@ -161,14 +171,14 @@ function Add-ToMaintenanceCollection {
             continue
         }
         try {
-            $res = Get-CMDevice -Name $c -Fast
-            if (-not $res) {
+            $device = Get-CMDevice -Name $c -Fast -ErrorAction Stop
+            if (-not $device) {
                 Write-Log -Computer $c -Action 'AddToCollection' -Result 'NotInSCCM'
                 continue
             }
             if ($PSCmdlet.ShouldProcess($c, "Add to $CollectionName")) {
                 Add-CMDeviceCollectionDirectMembershipRule -CollectionId $coll.CollectionID `
-                                                          -ResourceId $res.ResourceID `
+                                                          -ResourceId $device.ResourceID `
                                                           -ErrorAction Stop
                 Write-Log -Computer $c -Action 'AddToCollection' -Result 'Added'
             }
@@ -179,88 +189,40 @@ function Add-ToMaintenanceCollection {
 
     if ($PSCmdlet.ShouldProcess($CollectionName, 'Update collection membership')) {
         Invoke-CMCollectionUpdate -CollectionId $coll.CollectionID -ErrorAction SilentlyContinue
-        # Give the collection eval a head start before we start rebooting
-        Start-Sleep -Seconds 30
+        Start-Sleep -Seconds 30   # let eval propagate before reboots start
     }
 }
+
+# ============================================================================
+# 4. Reboot
+# ============================================================================
 
 function Restart-VDI {
     param([string] $Computer)
 
-    # shutdown.exe is more forgiving than Restart-Computer on locked-down VDIs
-    $args = "/m \\$Computer /r /f /t 5 /c `"SCCM patch remediation - automated reboot`""
     try {
-        $p = Start-Process -FilePath shutdown.exe -ArgumentList $args -Wait -PassThru -NoNewWindow
-        if ($p.ExitCode -eq 0) {
-            Write-Log -Computer $Computer -Action 'Reboot' -Result 'Issued'
-        } else {
-            Write-Log -Computer $Computer -Action 'Reboot' -Result 'Failed' -Detail "shutdown.exe exit $($p.ExitCode)"
-        }
+        Restart-Computer -ComputerName $Computer -Force -ErrorAction Stop
+        Write-Log -Computer $Computer -Action 'Reboot' -Result 'Issued' -Detail 'Restart-Computer'
     } catch {
-        Write-Log -Computer $Computer -Action 'Reboot' -Result 'Error' -Detail $_.Exception.Message
-    }
-}
-
-function Wait-Online {
-    param(
-        [string[]] $Computers,
-        [int]      $TimeoutMinutes
-    )
-    $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
-    $pending  = [System.Collections.Generic.HashSet[string]]::new([string[]]$Computers, [System.StringComparer]::OrdinalIgnoreCase)
-    $online   = New-Object System.Collections.Generic.List[string]
-
-    # Wait until pingable AND WMI responds (latter means the SCCM client service is likely up)
-    while ($pending.Count -and (Get-Date) -lt $deadline) {
-        foreach ($c in @($pending)) {
-            if (Test-Connection -ComputerName $c -Count 1 -Quiet -ErrorAction SilentlyContinue) {
-                try {
-                    $null = Get-CimInstance -ComputerName $c -ClassName Win32_OperatingSystem -ErrorAction Stop -OperationTimeoutSec 5
-                    $online.Add($c)
-                    $pending.Remove($c) | Out-Null
-                } catch {
-                    # pingable but WMI not ready — try again next loop
-                }
-            }
-        }
-        if ($pending.Count) { Start-Sleep -Seconds 20 }
-    }
-
-    foreach ($c in $online)  { Write-Log -Computer $c -Action 'WaitOnline' -Result 'Online' }
-    foreach ($c in $pending) { Write-Log -Computer $c -Action 'WaitOnline' -Result 'TimedOut' }
-
-    [pscustomobject]@{ Online = $online; Offline = @($pending) }
-}
-
-function Invoke-ClientActions {
-    param([string] $Computer)
-
-    $actions = [ordered]@{
-        'Machine Policy Retrieval'          = '{00000000-0000-0000-0000-000000000021}'
-        'Machine Policy Evaluation'         = '{00000000-0000-0000-0000-000000000022}'
-        'Software Updates Scan'             = '{00000000-0000-0000-0000-000000000113}'
-        'Software Updates Deployment Eval'  = '{00000000-0000-0000-0000-000000000108}'
-        'State Message Refresh'             = '{00000000-0000-0000-0000-000000000111}'
-    }
-
-    foreach ($name in $actions.Keys) {
-        $sched = $actions[$name]
+        Write-Verbose "[$Computer] Restart-Computer failed, falling back to shutdown.exe: $($_.Exception.Message)"
         try {
-            Invoke-CimMethod -ComputerName $Computer `
-                             -Namespace 'root\ccm' `
-                             -ClassName 'SMS_Client' `
-                             -MethodName 'TriggerSchedule' `
-                             -Arguments @{ sScheduleID = $sched } `
-                             -ErrorAction Stop | Out-Null
-            Write-Log -Computer $Computer -Action $name -Result 'Triggered'
-            Start-Sleep -Seconds 2     # small space between triggers so the client doesn't coalesce them
+            $p = Start-Process -FilePath shutdown.exe `
+                               -ArgumentList "/m \\$Computer /r /f /t 5 /c `"SCCM patch remediation`"" `
+                               -Wait -PassThru -NoNewWindow -ErrorAction Stop
+            if ($p.ExitCode -eq 0) {
+                Write-Log -Computer $Computer -Action 'Reboot' -Result 'Issued' -Detail 'shutdown.exe'
+            } else {
+                Write-Log -Computer $Computer -Action 'Reboot' -Result 'Failed' -Detail "shutdown.exe exit $($p.ExitCode)"
+            }
         } catch {
-            Write-Log -Computer $Computer -Action $name -Result 'Error' -Detail $_.Exception.Message
+            Write-Log -Computer $Computer -Action 'Reboot' -Result 'Error' -Detail $_.Exception.Message
         }
     }
 }
 
-# ---------- main ------------------------------------------------------------
+# ============================================================================
+# Main
+# ============================================================================
 
 try {
     Write-Host "Connecting to site $SiteCode on $SiteServer ..." -ForegroundColor Cyan
@@ -268,99 +230,137 @@ try {
 
     # ---- 1. choose deployment(s) ------------------------------------------
     Write-Host "Loading software update deployments ..." -ForegroundColor Cyan
-    $deployments = Get-CMUpdateGroupDeployment |
-        Select-Object AssignmentID, AssignmentName, TargetCollectionID, StartTime,
-                      @{N='Collection';E={(Get-CMDeviceCollection -Id $_.TargetCollectionID).Name}} |
-        Sort-Object StartTime -Descending
-
-    if (-not $deployments) { throw "No update deployments found." }
-
-    $selected = $deployments | Out-GridView -Title 'Select one or more update deployments to remediate' -OutputMode Multiple
+    $selected = Select-UpdateDeployment
     if (-not $selected) { Write-Warning 'No deployment selected. Exiting.'; return }
 
-    # ---- 2. ask about Unknown bucket --------------------------------------
+    # ---- 2. Unknown bucket prompt -----------------------------------------
     if (-not $PSBoundParameters.ContainsKey('IncludeUnknown')) {
         $ans = Read-Host "Also include machines in 'Unknown' state? (Y/N)"
         $IncludeUnknown = ($ans -match '^[Yy]')
     }
 
     # ---- 3. pull failed/unknown assets ------------------------------------
-    Write-Host "Querying failed$(if($IncludeUnknown){' + unknown'}) assets across $($selected.Count) deployment(s) ..." -ForegroundColor Cyan
-    $assets = Get-FailedAndUnknownAssets -AssignmentIDs $selected.AssignmentID `
-                                         -SiteCode      $SiteCode `
-                                         -SiteServer    $SiteServer `
-                                         -IncludeUnknown:$IncludeUnknown
+    Write-Host ("Querying failed{0} assets across {1} deployment(s) ..." `
+                -f $(if ($IncludeUnknown) {' + unknown'}), $selected.Count) -ForegroundColor Cyan
 
-    if (-not $assets) { Write-Warning 'No matching assets found. Exiting.'; return }
+    $assets = Get-FailedAndUnknownAssets -Deployments $selected -IncludeUnknown:$IncludeUnknown
+
+    if (-not $assets) {
+        Write-Warning 'No failed or unknown assets found in the selected deployment(s). Nothing to do.'
+        return
+    }
 
     $computers = $assets.Computer | Sort-Object -Unique
-    Write-Host ("Found {0} unique machines to remediate." -f $computers.Count) -ForegroundColor Green
+    Write-Host ("Found {0} unique machine(s) to remediate." -f $computers.Count) -ForegroundColor Green
+    $assets | Group-Object StatusType | Format-Table Count, Name -AutoSize
 
-    # Confirmation gate
+    # ---- 4. confirm -------------------------------------------------------
     if (-not $PSCmdlet.ShouldContinue(
-            ("About to add {0} machines to '{1}', reboot in batches of {2} every {3} min, and trigger policy/updates. Proceed?" `
+            ("About to add {0} machine(s) to '{1}', reboot in batches of {2} every {3} min, and trigger policy/updates. Proceed?" `
                 -f $computers.Count, $MaintenanceCollectionName, $BatchSize, $BatchIntervalMinutes),
             'Confirm VDI remediation')) {
         Write-Warning 'Aborted by user.'
         return
     }
 
-    # ---- 4. add to maintenance collection ---------------------------------
-    Add-ToMaintenanceCollection -Computers $computers -CollectionName $MaintenanceCollectionName
+    # Resolve ResourceIDs once — needed for Invoke-CMClientNotification later
+    Write-Host "Resolving device records ..." -ForegroundColor Cyan
+    $devices = foreach ($c in $computers) {
+        $d = Get-CMDevice -Name $c -Fast -ErrorAction SilentlyContinue
+        if ($d) {
+            [pscustomobject]@{ Computer = $c; ResourceID = $d.ResourceID }
+        } else {
+            Write-Log -Computer $c -Action 'ResolveDevice' -Result 'NotInSCCM'
+        }
+    }
+    if (-not $devices) {
+        Write-Warning 'None of the failed machines resolved to a device record. Exiting.'
+        return
+    }
 
-    # ---- 5. batched reboot + post-reboot triggers -------------------------
-    $batches = for ($i = 0; $i -lt $computers.Count; $i += $BatchSize) {
-        ,@($computers[$i..([Math]::Min($i + $BatchSize - 1, $computers.Count - 1))])
+    # ---- 5. add to maintenance collection ---------------------------------
+    Add-ToMaintenanceCollection -Computers $devices.Computer -CollectionName $MaintenanceCollectionName
+
+    # ---- 6. batched reboot + post-reboot triggers -------------------------
+    $batches = for ($i = 0; $i -lt $devices.Count; $i += $BatchSize) {
+        ,@($devices[$i..([Math]::Min($i + $BatchSize - 1, $devices.Count - 1))])
     }
     Write-Host ("Processing {0} batch(es) of up to {1}." -f $batches.Count, $BatchSize) -ForegroundColor Cyan
+
+    $jobs = New-Object System.Collections.Generic.List[object]
 
     for ($b = 0; $b -lt $batches.Count; $b++) {
         $batch = $batches[$b]
         Write-Host ("`n--- Batch {0}/{1} : {2} machine(s) ---" -f ($b+1), $batches.Count, $batch.Count) -ForegroundColor Yellow
 
-        foreach ($c in $batch) {
-            if ($PSCmdlet.ShouldProcess($c, 'Reboot')) { Restart-VDI -Computer $c }
+        foreach ($dev in $batch) {
+            if ($PSCmdlet.ShouldProcess($dev.Computer, 'Reboot')) {
+                Restart-VDI -Computer $dev.Computer
+            }
         }
 
-        # Wait for THIS batch to come back, then trigger policy/scan on it.
-        # We do this in parallel with kicking off the next batch's wait window
-        # so the 5-minute pacing is preserved.
-        $waitJob = Start-Job -ScriptBlock {
-            param($comp, $timeout, $logPath)
-            # Inline minimal wait + trigger inside the job so we don't need module import here.
-            $pending = [System.Collections.Generic.HashSet[string]]::new([string[]]$comp, [System.StringComparer]::OrdinalIgnoreCase)
+        # Post-reboot wait + triggers as a background job so the 5-min
+        # pacing isn't blocked by waiting for this batch to come back.
+        $job = Start-Job -Name "PostReboot_Batch$($b+1)" -ScriptBlock {
+            param($devList, $timeout)
+
+            $pending = @{}
+            foreach ($d in $devList) { $pending[$d.Computer] = $d.ResourceID }
             $deadline = (Get-Date).AddMinutes($timeout)
+            $results  = New-Object System.Collections.Generic.List[object]
+
+            $schedules = @(
+                @{ Name='Machine Policy Retrieval';    ID='{00000000-0000-0000-0000-000000000021}' },
+                @{ Name='Machine Policy Evaluation';   ID='{00000000-0000-0000-0000-000000000022}' },
+                @{ Name='Software Updates Scan';       ID='{00000000-0000-0000-0000-000000000113}' },
+                @{ Name='Software Updates Deploy Eval';ID='{00000000-0000-0000-0000-000000000108}' },
+                @{ Name='State Message Refresh';       ID='{00000000-0000-0000-0000-000000000111}' }
+            )
+
             while ($pending.Count -and (Get-Date) -lt $deadline) {
-                foreach ($x in @($pending)) {
-                    if (Test-Connection -ComputerName $x -Count 1 -Quiet -ErrorAction SilentlyContinue) {
+                foreach ($name in @($pending.Keys)) {
+                    if (Test-Connection -ComputerName $name -Count 1 -Quiet -ErrorAction SilentlyContinue) {
                         try {
-                            $null = Get-CimInstance -ComputerName $x -ClassName Win32_OperatingSystem -ErrorAction Stop -OperationTimeoutSec 5
-                            $pending.Remove($x) | Out-Null
-                            $schedules = @(
-                                '{00000000-0000-0000-0000-000000000021}',
-                                '{00000000-0000-0000-0000-000000000022}',
-                                '{00000000-0000-0000-0000-000000000113}',
-                                '{00000000-0000-0000-0000-000000000108}',
-                                '{00000000-0000-0000-0000-000000000111}'
-                            )
+                            $null = Get-CimInstance -ComputerName $name -ClassName Win32_OperatingSystem `
+                                                    -ErrorAction Stop -OperationTimeoutSec 5
+                            $results.Add([pscustomobject]@{ Computer=$name; Action='WaitOnline'; Result='Online' })
+
                             foreach ($s in $schedules) {
                                 try {
-                                    Invoke-CimMethod -ComputerName $x -Namespace 'root\ccm' `
-                                                     -ClassName 'SMS_Client' -MethodName 'TriggerSchedule' `
-                                                     -Arguments @{ sScheduleID = $s } -ErrorAction Stop | Out-Null
+                                    Invoke-CimMethod -ComputerName $name -Namespace 'root\ccm' `
+                                                     -ClassName SMS_Client -MethodName TriggerSchedule `
+                                                     -Arguments @{ sScheduleID = $s.ID } -ErrorAction Stop | Out-Null
+                                    $results.Add([pscustomobject]@{ Computer=$name; Action=$s.Name; Result='Triggered' })
                                     Start-Sleep -Seconds 2
-                                } catch { }
+                                } catch {
+                                    $results.Add([pscustomobject]@{ Computer=$name; Action=$s.Name; Result='Error'; Detail=$_.Exception.Message })
+                                }
                             }
-                            [pscustomobject]@{ Computer=$x; Result='Triggered' }
+                            $pending.Remove($name) | Out-Null
                         } catch { }
                     }
                 }
                 if ($pending.Count) { Start-Sleep -Seconds 20 }
             }
-            foreach ($x in $pending) { [pscustomobject]@{ Computer=$x; Result='TimedOut' } }
-        } -ArgumentList (,$batch), $OnlineWaitMinutes, $LogPath
+            foreach ($name in $pending.Keys) {
+                $results.Add([pscustomobject]@{ Computer=$name; Action='WaitOnline'; Result='TimedOut' })
+            }
+            $results
+        } -ArgumentList (,$batch), $OnlineWaitMinutes
 
-        $waitJob | Add-Member -NotePropertyName BatchIndex -NotePropertyValue $b -Force
+        # Site-side push via cmdlet — best effort, fires immediately
+        foreach ($dev in $batch) {
+            try {
+                Invoke-CMClientNotification -DeviceId $dev.ResourceID `
+                                            -NotificationType RequestMachinePolicyNow `
+                                            -ErrorAction Stop
+                Write-Log -Computer $dev.Computer -Action 'ClientNotify' -Result 'Sent'
+            } catch {
+                Write-Log -Computer $dev.Computer -Action 'ClientNotify' -Result 'Error' -Detail $_.Exception.Message
+            }
+        }
+
+        $jobs.Add($job)
 
         if ($b -lt $batches.Count - 1) {
             Write-Host ("Waiting {0} minute(s) before next batch ..." -f $BatchIntervalMinutes) -ForegroundColor DarkGray
@@ -369,22 +369,24 @@ try {
     }
 
     Write-Host "`nAll reboots issued. Waiting for outstanding post-reboot jobs ..." -ForegroundColor Cyan
-    Get-Job | Where-Object State -in 'Running','NotStarted' | Wait-Job | Out-Null
-    foreach ($j in Get-Job) {
+    $jobs | Wait-Job | Out-Null
+    foreach ($j in $jobs) {
         $results = Receive-Job -Job $j -ErrorAction SilentlyContinue
         foreach ($r in $results) {
-            Write-Log -Computer $r.Computer -Action 'PostRebootTriggers' -Result $r.Result
+            Write-Log -Computer $r.Computer -Action $r.Action -Result $r.Result -Detail ($r.Detail -as [string])
         }
         Remove-Job -Job $j -Force
     }
 
-    # ---- 6. report --------------------------------------------------------
+    # ---- 7. report --------------------------------------------------------
     $null = New-Item -ItemType Directory -Path (Split-Path $LogPath) -Force -ErrorAction SilentlyContinue
     $script:Log | Export-Csv -Path $LogPath -NoTypeInformation -Encoding UTF8
     Write-Host "`nDone. Log: $LogPath" -ForegroundColor Green
 
-    $summary = $script:Log | Group-Object Action, Result | Select-Object Count, Name | Sort-Object Name
-    $summary | Format-Table -AutoSize
+    $script:Log | Group-Object Action, Result |
+        Select-Object Count, Name |
+        Sort-Object Name |
+        Format-Table -AutoSize
 }
 catch {
     Write-Error $_
