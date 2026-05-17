@@ -223,12 +223,23 @@ if (-not $machineStates) {
     Set-Location $origLocation; Stop-Transcript; exit 0
 }
 
-Write-Log "$($machineStates.Count) machine record(s). Opening machine picker..."
+Write-Log "$($machineStates.Count) machine record(s) total."
 
-$selectedMachines = $machineStates | Sort-Object State, MachineName |
-    Out-GridView -Title "Select machines to remediate  [Ctrl+Click multi-select → OK]" -OutputMode Multiple
+# Pre-filter to actionable states only — Success machines are excluded by default
+# StateID: 4=Unknown  5=Error. Show the picker pre-filtered; operator can deselect any.
+$actionable = @($machineStates | Where-Object { $_.StateID -in 4, 5 })
+$successCount = @($machineStates | Where-Object { $_.StateID -eq 1 }).Count
+Write-Log "Pre-filtered to $($actionable.Count) actionable (Error/Unknown). Excluded $successCount Success machine(s)."
 
-if (-not $selectedMachines) {
+if ($actionable.Count -eq 0) {
+    Write-Log "No Error or Unknown machines found in this deployment — nothing to remediate." WARN
+    Set-Location $origLocation; Stop-Transcript; exit 0
+}
+
+$selectedMachines = @($actionable | Sort-Object State, MachineName |
+    Out-GridView -Title "Select machines to remediate  [Error/Unknown pre-filtered — Ctrl+Click → OK]" -OutputMode Multiple)
+
+if ($selectedMachines.Count -eq 0) {
     Write-Log "No machines selected. Exiting." WARN
     Set-Location $origLocation; Stop-Transcript; exit 0
 }
@@ -243,6 +254,10 @@ $results = [System.Collections.Concurrent.ConcurrentBag[PSCustomObject]]::new()
 
 $scanBlock = {
     param($machine, $RebootWarnSecs)
+
+    # NOTE: This block runs in a background job — no CM PSDrive, no parent-scope variables.
+    # ErrorActionPreference is set locally to avoid runspace bleed from parent scope.
+    $ErrorActionPreference = 'Continue'
 
     $r = [PSCustomObject]@{
         MachineName                  = $machine.MachineName
@@ -278,16 +293,26 @@ $scanBlock = {
         Timestamp                    = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     }
 
-    # Reachability
-    if (-not (Test-Connection -ComputerName $machine.MachineName -Count 1 -Quiet)) {
-        $r.FinalNote = 'Offline / unreachable'
+    # ── Gate 1: ICMP reachability ────────────────────────────────────────────
+    if (-not (Test-Connection -ComputerName $machine.MachineName -Count 2 -Quiet -ErrorAction SilentlyContinue)) {
+        $r.FinalNote = 'Offline / unreachable (ICMP)'
+        return $r
+    }
+
+    # ── Gate 2: WinRM / CIM reachability — confirm OS is responsive ─────────
+    try {
+        $null = Get-CimInstance -ComputerName $machine.MachineName -ClassName Win32_OperatingSystem `
+                                -OperationTimeoutSec 15 -ErrorAction Stop
+    } catch {
+        $r.FinalNote = "Unreachable (CIM/WinRM): $($_.Exception.Message)"
         return $r
     }
     $r.Online = $true
 
     # ── Logged-on user ──────────────────────────────────────────────────────
     try {
-        $cs = Get-CimInstance -ComputerName $machine.MachineName -ClassName Win32_ComputerSystem -ErrorAction Stop
+        $cs = Get-CimInstance -ComputerName $machine.MachineName -ClassName Win32_ComputerSystem `
+                              -OperationTimeoutSec 15 -ErrorAction Stop
         if ($cs.UserName) { $r.LoggedOnUser = $cs.UserName }
     } catch {
         $r.LoggedOnUser = "QueryFailed: $($_.Exception.Message)"
@@ -353,7 +378,7 @@ $scanBlock = {
 Write-Log "--- Phase 1: scan cycles + reboot check + user detection ---"
 
 $jobs  = [System.Collections.Generic.List[object]]::new()
-$queue = [System.Collections.Generic.Queue[object]]::new($selectedMachines)
+$queue = [System.Collections.Generic.Queue[object]]::new([object[]]@($selectedMachines))
 
 while ($queue.Count -gt 0 -or $jobs.Count -gt 0) {
 
@@ -379,7 +404,7 @@ Write-Log "Phase 1 complete — $($results.Count) result(s) collected."
 
 #region ── Step 4: Reboot — per-machine operator prompt ─────────────────────────
 
-$rebootNeeded = $results | Where-Object { $_.Online -and $_.RebootPending }
+$rebootNeeded = @($results | Where-Object { $_.Online -and $_.RebootPending })
 
 if ($rebootNeeded.Count -gt 0) {
 
@@ -481,7 +506,7 @@ if ($rebootNeeded.Count -gt 0) {
 
 #region ── Step 5: Phase 2 Escalation ───────────────────────────────────────────
 
-$escalationCandidates = $results | Where-Object { $_.Online -and $_.PhaseOneError }
+$escalationCandidates = @($results | Where-Object { $_.Online -and $_.PhaseOneError })
 
 if ($escalationCandidates.Count -gt 0) {
 
