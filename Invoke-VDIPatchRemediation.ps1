@@ -83,13 +83,14 @@ function Connect-CMSite {
 function Select-UpdateDeployment {
     # FeatureType 5 = Software Updates
     $deployments = Get-CMDeployment -FeatureType SoftwareUpdate |
-        Select-Object @{N='DeploymentID';   E={$_.DeploymentID}},
-                      @{N='Name';           E={$_.SoftwareName}},
-                      @{N='Collection';     E={$_.CollectionName}},
-                      @{N='NumberTargeted'; E={$_.NumberTargeted}},
-                      @{N='NumberErrors';   E={$_.NumberErrors}},
-                      @{N='NumberUnknown';  E={$_.NumberUnknown}},
-                      @{N='DeploymentTime'; E={$_.DeploymentTime}} |
+        Select-Object @{N='DeploymentID';        E={$_.DeploymentID}},            # numeric AssignmentID
+                      @{N='AssignmentUniqueID';  E={$_.AssignmentUniqueID}},      # GUID — what Get-CMDeploymentStatus actually wants
+                      @{N='Name';                E={$_.SoftwareName}},
+                      @{N='Collection';          E={$_.CollectionName}},
+                      @{N='NumberTargeted';      E={$_.NumberTargeted}},
+                      @{N='NumberErrors';        E={$_.NumberErrors}},
+                      @{N='NumberUnknown';       E={$_.NumberUnknown}},
+                      @{N='DeploymentTime';      E={$_.DeploymentTime}} |
         Sort-Object DeploymentTime -Descending
 
     if (-not $deployments) { throw "No software update deployments found." }
@@ -122,10 +123,20 @@ function Get-FailedAndUnknownAssets {
     if ($IncludeUnknown) { $wantedTypes += 4 } # Unknown
 
     $rows = foreach ($d in $Deployments) {
-        Write-Verbose "Querying status for '$($d.Name)' (ID $($d.DeploymentID))"
+        Write-Verbose "Querying status for '$($d.Name)' (GUID $($d.AssignmentUniqueID))"
 
-        $buckets = Get-CMDeploymentStatus -DeploymentId $d.DeploymentID -ErrorAction Stop |
+        # Re-fetch the deployment as a full object so the pipeline binds
+        # cleanly to Get-CMDeploymentStatus (its parameter sets are picky).
+        $dep = Get-CMDeployment -DeploymentId $d.AssignmentUniqueID -ErrorAction SilentlyContinue
+        if (-not $dep) {
+            Write-Warning "Could not re-fetch deployment $($d.AssignmentUniqueID)"
+            continue
+        }
+
+        $buckets = $dep | Get-CMDeploymentStatus -ErrorAction Stop |
                    Where-Object { $_.StatusType -in $wantedTypes }
+
+        Write-Verbose ("  {0} bucket(s) match Failed/Unknown filter" -f @($buckets).Count)
 
         foreach ($b in $buckets) {
             $label = switch ($b.StatusType) {
@@ -133,7 +144,10 @@ function Get-FailedAndUnknownAssets {
                 5 { 'Failed'  }
                 default { "Type$($b.StatusType)" }
             }
-            Get-CMDeploymentStatusDetails -InputObject $b -ErrorAction SilentlyContinue |
+            $details = Get-CMDeploymentStatusDetails -InputObject $b -ErrorAction SilentlyContinue
+            Write-Verbose ("    StatusType $($b.StatusType) [$label] => $(@($details).Count) asset(s)")
+
+            $details |
                 Select-Object @{N='DeploymentID';   E={$d.DeploymentID}},
                               @{N='Deployment';     E={$d.Name}},
                               @{N='Computer';       E={$_.DeviceName}},
