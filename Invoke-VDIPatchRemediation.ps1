@@ -560,67 +560,73 @@ try {
             }) | Out-Null
         }
 
-        # -- Reboot --
-        if (-not $WhatIf) {
-            try {
-                Restart-Computer -ComputerName $Computer -Force -ErrorAction Stop
-                Log 'Reboot' 'Issued' 'Restart-Computer'
-            }
-            catch {
+        try {
+            # -- Reboot --
+            if (-not $WhatIf) {
                 try {
-                    $p = Start-Process shutdown.exe `
-                         -ArgumentList "/m \\$Computer /r /f /t 5 /c `"SCCM patch remediation`"" `
-                         -Wait -PassThru -NoNewWindow -ErrorAction Stop
-                    Log 'Reboot' $(if($p.ExitCode -eq 0){'Issued'}else{'Failed'}) "shutdown.exe exit $($p.ExitCode)"
+                    Restart-Computer -ComputerName $Computer -Force -ErrorAction Stop
+                    Log 'Reboot' 'Issued' 'Restart-Computer'
                 }
-                catch { Log 'Reboot' 'Error' $_.Exception.Message }
+                catch {
+                    try {
+                        $p = Start-Process shutdown.exe `
+                             -ArgumentList "/m \\$Computer /r /f /t 5 /c `"SCCM patch remediation`"" `
+                             -Wait -PassThru -NoNewWindow -ErrorAction Stop
+                        Log 'Reboot' $(if($p.ExitCode -eq 0){'Issued'}else{'Failed'}) "shutdown.exe exit $($p.ExitCode)"
+                    }
+                    catch { Log 'Reboot' 'Error' $_.Exception.Message }
+                }
+            } else {
+                Log 'Reboot' 'WhatIf' ''
             }
-        } else {
-            Log 'Reboot' 'WhatIf' ''
-        }
 
-        # -- Wait online --
-        $deadline = (Get-Date).AddMinutes($OnlineWaitMinutes)
-        $online   = $false
-        while ((Get-Date) -lt $deadline) {
-            if (Test-Connection -ComputerName $Computer -Count 1 -Quiet -ErrorAction SilentlyContinue) {
+            # -- Wait online --
+            $deadline = (Get-Date).AddMinutes($OnlineWaitMinutes)
+            $online   = $false
+            while ((Get-Date) -lt $deadline) {
+                if (Test-Connection -ComputerName $Computer -Count 1 -Quiet -ErrorAction SilentlyContinue) {
+                    try {
+                        $null = Get-CimInstance -ComputerName $Computer -ClassName Win32_OperatingSystem `
+                                                -ErrorAction Stop -OperationTimeoutSec 10
+                        $online = $true
+                        break
+                    }
+                    catch { }
+                }
+                Start-Sleep -Seconds 20
+            }
+
+            if (-not $online) {
+                Log 'WaitOnline' 'TimedOut' ''
+                return $results
+            }
+            Log 'WaitOnline' 'Online' ''
+
+            if ($WhatIf) { return $results }
+
+            # -- SCCM client-side triggers --
+            $schedules = [ordered]@{
+                'Machine Policy Retrieval'     = '{00000000-0000-0000-0000-000000000021}'
+                'Machine Policy Evaluation'    = '{00000000-0000-0000-0000-000000000022}'
+                'Software Updates Scan'        = '{00000000-0000-0000-0000-000000000113}'
+                'Software Updates Deploy Eval' = '{00000000-0000-0000-0000-000000000108}'
+                'State Message Refresh'        = '{00000000-0000-0000-0000-000000000111}'
+            }
+            foreach ($action in $schedules.Keys) {
                 try {
-                    $null = Get-CimInstance -ComputerName $Computer -ClassName Win32_OperatingSystem `
-                                            -ErrorAction Stop -OperationTimeoutSec 10
-                    $online = $true
-                    break
+                    Invoke-CimMethod -ComputerName $Computer -Namespace 'root\ccm' `
+                                     -ClassName SMS_Client -MethodName TriggerSchedule `
+                                     -Arguments @{ sScheduleID = $schedules[$action] } `
+                                     -ErrorAction Stop | Out-Null
+                    Log $action 'Triggered' ''
+                    Start-Sleep -Seconds 2
                 }
-                catch { }
+                catch { Log $action 'Error' $_.Exception.Message }
             }
-            Start-Sleep -Seconds 20
         }
-
-        if (-not $online) {
-            Log 'WaitOnline' 'TimedOut' ''
-            return $results
-        }
-        Log 'WaitOnline' 'Online' ''
-
-        if ($WhatIf) { return $results }
-
-        # -- SCCM client-side triggers --
-        $schedules = [ordered]@{
-            'Machine Policy Retrieval'     = '{00000000-0000-0000-0000-000000000021}'
-            'Machine Policy Evaluation'    = '{00000000-0000-0000-0000-000000000022}'
-            'Software Updates Scan'        = '{00000000-0000-0000-0000-000000000113}'
-            'Software Updates Deploy Eval' = '{00000000-0000-0000-0000-000000000108}'
-            'State Message Refresh'        = '{00000000-0000-0000-0000-000000000111}'
-        }
-        foreach ($action in $schedules.Keys) {
-            try {
-                Invoke-CimMethod -ComputerName $Computer -Namespace 'root\ccm' `
-                                 -ClassName SMS_Client -MethodName TriggerSchedule `
-                                 -Arguments @{ sScheduleID = $schedules[$action] } `
-                                 -ErrorAction Stop | Out-Null
-                Log $action 'Triggered' ''
-                Start-Sleep -Seconds 2
-            }
-            catch { Log $action 'Error' $_.Exception.Message }
+        catch {
+            # Top-level catch — something unexpected blew up the whole worker
+            Log 'WorkerError' 'UnhandledException' $_.Exception.Message
         }
 
         return $results
@@ -655,7 +661,7 @@ try {
             try {
                 if ($PSCmdlet.ShouldProcess($dev.Computer, 'Send policy notification')) {
                     Invoke-CMClientNotification -DeviceId $dev.ResourceID `
-                                                -NotificationType RequestMachinePolicyNow `
+                                                -ActionType ClientNotificationRequestMachinePolicyNow `
                                                 -ErrorAction Stop
                     $resultBag.Add([pscustomobject]@{
                         Timestamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
@@ -680,11 +686,33 @@ try {
             try {
                 $rows = $h.PS.EndInvoke($h.Handle)
                 foreach ($r in $rows) { $resultBag.Add($r) }
-                $state = if ($h.PS.HadErrors) { 'RunspaceError' } else { 'Done' }
-                Write-Host "  [$($h.Computer)] $state" -ForegroundColor $(if($h.PS.HadErrors){'Red'}else{'Green'})
+
+                # Surface any error stream entries from the runspace
+                foreach ($e in $h.PS.Streams.Error) {
+                    $resultBag.Add([pscustomobject]@{
+                        Timestamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+                        Computer  = $h.Computer
+                        Action    = 'RunspaceStream'
+                        Result    = 'Error'
+                        Detail    = $e.ToString()
+                    })
+                    Write-Warning "[$($h.Computer)] $($e.ToString())"
+                }
+
+                $colour = if ($h.PS.HadErrors) { 'Red' } else { 'Green' }
+                $state  = if ($h.PS.HadErrors) { 'CompletedWithErrors' } else { 'Done' }
+                Write-Host "  [$($h.Computer)] $state" -ForegroundColor $colour
             }
             catch {
-                Write-Warning "[$($h.Computer)] Runspace exception: $($_.Exception.Message)"
+                # EndInvoke itself threw — log the exception
+                $resultBag.Add([pscustomobject]@{
+                    Timestamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+                    Computer  = $h.Computer
+                    Action    = 'RunspaceInvoke'
+                    Result    = 'Exception'
+                    Detail    = $_.Exception.Message
+                })
+                Write-Warning "[$($h.Computer)] EndInvoke exception: $($_.Exception.Message)"
             }
             finally {
                 $h.PS.Dispose()
