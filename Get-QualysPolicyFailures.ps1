@@ -202,7 +202,7 @@ Write-Host "    '$EXCLUDE_TAG'        →  ID $excludeTagId" -ForegroundColor Gr
 # Pull every failure first – it's one fast paginated call.
 # Tag filtering is done in Step 3 against only the hosts that actually have failures,
 # which is far smaller than enumerating all tagged hosts up front.
-Write-Host '[2/3] Fetching policy failures ...' -ForegroundColor Yellow
+Write-Host '[2/3] Fetching all posture records (all statuses) ...' -ForegroundColor Yellow
 
 function Get-NodeText { param($Node, [string]$XPath) $n = $Node.SelectSingleNode($XPath); if ($n) { $n.InnerText } else { '' } }
 
@@ -210,7 +210,7 @@ $allPosture = [System.Collections.Generic.List[object]]::new()
 $idMin      = 0
 
 do {
-    $parts = @("action=list", "policy_id=$POLICY_ID", "status=Failed")
+    $parts = @("action=list", "policy_id=$POLICY_ID")
     if ($idMin -gt 0) { $parts += "id_min=$idMin" }
 
     $raw = Invoke-QualysWebRequest -Uri "$BASE_URL/api/2.0/fo/compliance/posture/info/" `
@@ -225,10 +225,10 @@ do {
     if ($warn -and $warn.InnerText -match 'id_min=(\d+)') { $idMin = [long]$Matches[1] } else { break }
 } while ($true)
 
-Write-Host "    Raw failures: $($allPosture.Count)" -ForegroundColor Green
+Write-Host "    Total records (all statuses): $($allPosture.Count)" -ForegroundColor Green
 
 if ($allPosture.Count -eq 0) {
-    Write-Host "`n  No failures found for policy $POLICY_ID." -ForegroundColor Green
+    Write-Host "`n  No posture records found for policy $POLICY_ID. Verify the policy ID and account scope." -ForegroundColor Yellow
     exit 0
 }
 #endregion
