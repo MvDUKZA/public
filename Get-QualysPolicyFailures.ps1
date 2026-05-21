@@ -114,7 +114,7 @@ function Get-NodeText {
 #region ── Step 1: Resolve tag IDs ──────────────────────────────────────────────
 # Tag names with spaces can't be safely URL-encoded in form bodies;
 # using IDs in tag_set_include/exclude avoids that issue entirely.
-Write-Host '[1/3] Resolving tag IDs ...' -ForegroundColor Yellow
+Write-Host '[1/4] Resolving tag IDs ...' -ForegroundColor Yellow
 
 function Search-QualysTag {
     param([string]$TagName, [string]$Operator)
@@ -165,11 +165,11 @@ Write-Host "    '$EXCLUDE_TAG'  → ID $excludeTagId" -ForegroundColor Green
 #endregion
 
 #region ── Step 2: Fetch posture data via FO API ────────────────────────────────
-# Tag filtering is applied server-side via tag_set_by/tag_set_include/tag_set_exclude.
-# STATUS filter is NOT sent to the API (status=Failed returns 0 on this platform);
-# instead we filter Failed in PowerShell from the full result set.
+# Fetch ALL statuses (status=Failed is ignored by this platform — filter in PS).
 # The GLOSSARY section of each page maps HOST_ID→IP/DNS/OS and CONTROL_ID→STATEMENT.
-Write-Host '[2/3] Fetching posture data via FO API ...' -ForegroundColor Yellow
+# Tag filtering is done in Step 3 via the AM API (server-side tag params are silently
+# ignored on the Qualys EU platform for this policy).
+Write-Host '[2/4] Fetching posture data via FO API ...' -ForegroundColor Yellow
 
 $foPostureUrl  = "$BASE_URL/api/2.0/fo/compliance/posture/info/"
 $allInfoNodes  = [System.Collections.Generic.List[object]]::new()
@@ -183,12 +183,7 @@ while ($true) {
         "action=list",
         "policy_id=$POLICY_ID",
         "details=All",
-        "truncation_limit=5000",
-        "tag_set_by=id",
-        "tag_set_include=$includeTagId",
-        "tag_include_selector=any",
-        "tag_set_exclude=$excludeTagId",
-        "tag_exclude_selector=any"
+        "truncation_limit=5000"
     )
     if ($idMin -gt 0) { $bodyParts += "id_min=$idMin" }
     $body = $bodyParts -join '&'
@@ -242,7 +237,7 @@ while ($true) {
 
 Write-Host "    Total records fetched: $($allInfoNodes.Count)  |  Hosts in glossary: $($hostGlossary.Count)  |  Controls: $($ctrlGlossary.Count)" -ForegroundColor Green
 
-# Filter STATUS = Failed in PowerShell
+# Filter STATUS = Failed in PowerShell (API-side status=Failed returns 0 on this platform)
 $failedNodes = @($allInfoNodes | Where-Object {
     (Get-NodeText $_ 'STATUS') -in @('Failed', 'FAILED', 'Fail', 'FAIL')
 })
@@ -254,10 +249,72 @@ if ($failedNodes.Count -eq 0) {
 }
 #endregion
 
-#region ── Step 3: Build output objects and export CSV ──────────────────────────
-Write-Host '[3/3] Building report and exporting CSV ...' -ForegroundColor Yellow
+#region ── Step 3: Tag-filter failed records via AM API ─────────────────────────
+# Get unique IPs for failed hosts (from GLOSSARY), then batch-check their tags
+# via the AM hostasset API. Only approve hosts that have the include tag AND
+# do NOT have the exclude tag.
+Write-Host '[3/4] Applying tag filter via AM API ...' -ForegroundColor Yellow
 
-$results = $failedNodes | ForEach-Object {
+$uniqueIPs = @(
+    $failedNodes |
+    ForEach-Object { $hid = Get-NodeText $_ 'HOST_ID'; if ($hostGlossary.ContainsKey($hid)) { $hostGlossary[$hid].IP } } |
+    Where-Object { $_ -ne '' } |
+    Sort-Object -Unique
+)
+Write-Host "    Unique IPs in failed records: $($uniqueIPs.Count)" -ForegroundColor DarkGray
+
+$approvedIPs = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$BATCH       = 500
+
+for ($i = 0; $i -lt $uniqueIPs.Count; $i += $BATCH) {
+    $slice  = $uniqueIPs[$i .. ([Math]::Min($i + $BATCH - 1, $uniqueIPs.Count - 1))]
+    $ipsCsv = $slice -join ','
+    $bNum   = [math]::Floor($i / $BATCH) + 1
+    Write-Host "    Tag-checking IP batch $bNum ($($slice.Count) IPs) ..." -ForegroundColor DarkGray
+
+    $amBody = @"
+<?xml version="1.0" encoding="UTF-8"?>
+<ServiceRequest>
+  <filters>
+    <Criteria field="address" operator="IN">$ipsCsv</Criteria>
+  </filters>
+  <preferences><limitResults>$BATCH</limitResults></preferences>
+</ServiceRequest>
+"@
+    $raw  = Invoke-QualysWebRequest -Uri "$BASE_URL/qps/rest/2.0/search/am/hostasset" `
+                                    -Method Post -Headers $qpsHeaders -Body $amBody
+    [xml]$hxml = $raw.Content
+
+    foreach ($h in $hxml.SelectNodes('//HostAsset')) {
+        $addrNode = $h.SelectSingleNode('address')
+        if (-not $addrNode) { continue }
+        $ip   = $addrNode.InnerText.Trim()
+        $tids = @($h.SelectNodes('.//TagSimple/id') | ForEach-Object { [long]$_.InnerText })
+        if (($tids -contains $includeTagId) -and ($tids -notcontains $excludeTagId)) {
+            [void]$approvedIPs.Add($ip)
+        }
+    }
+}
+
+Write-Host "    IPs passing tag filter: $($approvedIPs.Count)" -ForegroundColor Green
+
+$filteredNodes = @($failedNodes | Where-Object {
+    $hid = Get-NodeText $_ 'HOST_ID'
+    $ip  = if ($hostGlossary.ContainsKey($hid)) { $hostGlossary[$hid].IP } else { '' }
+    $ip -ne '' -and $approvedIPs.Contains($ip)
+})
+Write-Host "    Failed records after tag filter: $($filteredNodes.Count)" -ForegroundColor Green
+
+if ($filteredNodes.Count -eq 0) {
+    Write-Host "`n  No records matched the tag criteria (include '$INCLUDE_TAG', exclude '$EXCLUDE_TAG')." -ForegroundColor Yellow
+    exit 0
+}
+#endregion
+
+#region ── Step 4: Build output objects and export CSV ──────────────────────────
+Write-Host '[4/4] Building report and exporting CSV ...' -ForegroundColor Yellow
+
+$results = $filteredNodes | ForEach-Object {
     $hid  = Get-NodeText $_ 'HOST_ID'
     $cid  = Get-NodeText $_ 'CONTROL_ID'
     $h    = if ($hostGlossary.ContainsKey($hid))  { $hostGlossary[$hid]  } else { @{ IP=''; DNS=''; OS='' } }
