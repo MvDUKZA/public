@@ -31,7 +31,6 @@ $BASE_URL       = 'https://qualysapi.qualys.eu'
 $POLICY_ID      = 1661380
 $INCLUDE_TAG    = 'All.Workstations'
 $EXCLUDE_TAG    = 'VSI Testing'
-$PAGE_SIZE      = 1000   # max records per page
 #endregion
 
 #region ── Banner ───────────────────────────────────────────────────────────────
@@ -211,7 +210,7 @@ $allPosture = [System.Collections.Generic.List[object]]::new()
 $idMin      = 0
 
 do {
-    $parts = @("action=list", "policy_id=$POLICY_ID", "status=FAIL", "truncation_limit=$PAGE_SIZE")
+    $parts = @("action=list", "policy_id=$POLICY_ID", "status=Failed")
     if ($idMin -gt 0) { $parts += "id_min=$idMin" }
 
     $raw = Invoke-QualysWebRequest -Uri "$BASE_URL/api/2.0/fo/compliance/posture/info/" `
