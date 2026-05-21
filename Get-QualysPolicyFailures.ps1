@@ -181,44 +181,82 @@ if ($policyHostIds.Count -eq 0) {
 }
 #endregion
 
-#region ── Step 3: Fetch posture info via PCRS postureInfo ───────────────────────
-# POST /pcrs/1.0/posture/postureInfo  – requires policyId + hostIds array.
-# Returns JSON; we filter for FAILED in PowerShell.
+#region ── Step 3: Fetch posture info via PCRS ───────────────────────────────────
 Write-Host '[3/4] Fetching posture data via PCRS ...' -ForegroundColor Yellow
 
+# Try known PCRS postureInfo endpoint variants in order
+$postureInfoCandidates = @(
+    "$BASE_URL/pcrs/1.0/posture/postureInfo",
+    "$BASE_URL/pcrs/1.0/posture/postureinfo",
+    "$BASE_URL/pcrs/2.0/posture/postureInfo",
+    "$BASE_URL/pcrs/1.0/postureInfo"
+)
+
+function Invoke-PostureInfo {
+    param([string]$Url, [string]$BodyJson)
+    try {
+        return Invoke-QualysWebRequest -Uri $Url -Method Post -Headers $pcrsHeaders -Body $BodyJson -Retries 1
+    }
+    catch {
+        if ($_ -match '404') { return $null }
+        throw
+    }
+}
+
+# Probe for the working URL with a minimal single-host request
+$postureInfoUrl = $null
+Write-Host "    Probing postureInfo endpoint ..." -ForegroundColor DarkGray
+$probeBody = [ordered]@{
+    policyId         = [string]$POLICY_ID
+    hostIds          = @([string]$policyHostIds[0])
+    pageNumber       = 1
+    pageSize         = 10
+    evidenceRequired = 0
+} | ConvertTo-Json -Depth 5
+
+foreach ($candidate in $postureInfoCandidates) {
+    Write-Host "    Trying $candidate ..." -ForegroundColor DarkGray
+    $probeResult = Invoke-PostureInfo -Url $candidate -BodyJson $probeBody
+    if ($null -ne $probeResult) {
+        $postureInfoUrl = $candidate
+        Write-Host "    Found working endpoint: $postureInfoUrl" -ForegroundColor Green
+        Write-Host "    [DIAG] probe response: $($probeResult.Content.Substring(0,[Math]::Min(500,$probeResult.Content.Length)))" -ForegroundColor DarkGray
+        break
+    }
+}
+
+if (-not $postureInfoUrl) {
+    throw "Could not find a working postureInfo endpoint. Tried:`n$($postureInfoCandidates -join "`n")"
+}
+
 $allRecords  = [System.Collections.Generic.List[object]]::new()
-$HCHUNK      = 1000   # host IDs per call
+$HCHUNK      = 500   # host IDs per call; keep small to stay within API limits
 $totalChunks = [math]::Ceiling($policyHostIds.Count / $HCHUNK)
 
 for ($ci = 0; $ci -lt $policyHostIds.Count; $ci += $HCHUNK) {
     $end   = [Math]::Min($ci + $HCHUNK - 1, $policyHostIds.Count - 1)
-    $chunk = [long[]]($policyHostIds[$ci..$end])
+    # hostIds must be strings, not integers
+    $chunk = @($policyHostIds[$ci..$end] | ForEach-Object { [string]$_ })
     $cNum  = [math]::Floor($ci / $HCHUNK) + 1
     Write-Host "    Chunk $cNum/$totalChunks ($($chunk.Count) hosts) ..." -ForegroundColor DarkGray
 
-    $pgNum2 = 1
+    $pgNum2  = 1
     $pgMore2 = $true
 
     while ($pgMore2) {
         $bodyJson = [ordered]@{
-            policyId         = $POLICY_ID
+            policyId         = [string]$POLICY_ID
             hostIds          = $chunk
             pageNumber       = $pgNum2
-            pageSize         = 5000
+            pageSize         = 100
             evidenceRequired = 1
         } | ConvertTo-Json -Depth 5
 
-        $raw  = Invoke-QualysWebRequest -Uri "$BASE_URL/pcrs/1.0/posture/postureInfo" `
-                                         -Method Post -Headers $pcrsHeaders -Body $bodyJson
-
-        # Dump first response so we can confirm field names
-        if ($ci -eq 0 -and $pgNum2 -eq 1) {
-            Write-Host "    [DIAG] postureInfo response (first 600 chars):`n$($raw.Content.Substring(0,[Math]::Min(600,$raw.Content.Length)))" -ForegroundColor DarkGray
-        }
+        $raw  = Invoke-QualysWebRequest -Uri $postureInfoUrl -Method Post `
+                                         -Headers $pcrsHeaders -Body $bodyJson
 
         $json = $raw.Content | ConvertFrom-Json
 
-        # Response array may be named differently across PCRS versions
         $recs = if     ($null -ne $json.postureInfoList) { $json.postureInfoList }
                 elseif ($null -ne $json.data)            { $json.data }
                 elseif ($null -ne $json.results)         { $json.results }
@@ -226,7 +264,7 @@ for ($ci = 0; $ci -lt $policyHostIds.Count; $ci += $HCHUNK) {
 
         foreach ($r in $recs) { $allRecords.Add($r) }
         if ($recs.Count -gt 0) {
-            Write-Host "      +$($recs.Count) records (total: $($allRecords.Count))" -ForegroundColor DarkGray
+            Write-Host "      +$($recs.Count) (total: $($allRecords.Count))" -ForegroundColor DarkGray
         }
 
         $pgMore2 = ($json.hasMoreRecords -eq $true) -and ($recs.Count -gt 0)
