@@ -198,11 +198,8 @@ Write-Host "    '$INCLUDE_TAG'  →  ID $includeTagId" -ForegroundColor Green
 Write-Host "    '$EXCLUDE_TAG'        →  ID $excludeTagId" -ForegroundColor Green
 #endregion
 
-#region ── Step 2: Fetch ALL FAIL records for the policy (no host pre-filter) ───
-# Pull every failure first – it's one fast paginated call.
-# Tag filtering is done in Step 3 against only the hosts that actually have failures,
-# which is far smaller than enumerating all tagged hosts up front.
-Write-Host '[2/3] Fetching all posture records (all statuses) ...' -ForegroundColor Yellow
+#region ── Step 2: Fetch ALL posture records for the policy ─────────────────────
+Write-Host '[2/3] Fetching posture records ...' -ForegroundColor Yellow
 
 function Get-NodeText { param($Node, [string]$XPath) $n = $Node.SelectSingleNode($XPath); if ($n) { $n.InnerText } else { '' } }
 
@@ -210,42 +207,63 @@ $allPosture = [System.Collections.Generic.List[object]]::new()
 $idMin      = 0
 
 do {
-    $parts = @("action=list", "policy_id=$POLICY_ID")
+    # details=All   → includes control statement, evidence, OS etc.
+    # truncation_limit=5000 → max per page (Qualys default is also 5000)
+    $parts = @(
+        "action=list",
+        "policy_id=$POLICY_ID",
+        "details=All",
+        "truncation_limit=5000"
+    )
     if ($idMin -gt 0) { $parts += "id_min=$idMin" }
 
     $raw = Invoke-QualysWebRequest -Uri "$BASE_URL/api/2.0/fo/compliance/posture/info/" `
                                    -Method Post -Headers $foHeaders -Body ($parts -join '&')
     [xml]$xml = $raw.Content
 
-    $batch = $xml.SelectNodes('//POSTURE_INFO')
+    # Dump the raw XML on the very first call so we can see the real structure
+    if ($allPosture.Count -eq 0) {
+        Write-Verbose "First response XML:`n$($raw.Content)"
+        # Always show root element name to confirm we're hitting the right endpoint
+        Write-Host "    Response root: <$($xml.DocumentElement.Name)>" -ForegroundColor DarkGray
+    }
+
+    # Qualys PC posture API: root=POSTURE_INFO_LIST_OUTPUT, records in INFO_LIST/INFO
+    $batch = $xml.SelectNodes('//INFO')
     foreach ($n in $batch) { $allPosture.Add($n) }
     Write-Host "    +$($batch.Count) records (total: $($allPosture.Count))" -ForegroundColor DarkGray
+
+    # Show first record's key fields so caller can confirm data looks right
+    if ($allPosture.Count -gt 0 -and $idMin -eq 0 -and $batch.Count -gt 0) {
+        $sample = $batch.Item(0)
+        Write-Host "    Sample → IP:$(Get-NodeText $sample 'IP_ADDR')  Host:$(Get-NodeText $sample 'HOSTNAME')  Status:$(Get-NodeText $sample 'STATUS')  ControlID:$(Get-NodeText $sample 'CONTROL_ID')" -ForegroundColor DarkGray
+    }
 
     $warn = $xml.SelectSingleNode('//WARNING/URL')
     if ($warn -and $warn.InnerText -match 'id_min=(\d+)') { $idMin = [long]$Matches[1] } else { break }
 } while ($true)
 
-Write-Host "    Total records (all statuses): $($allPosture.Count)" -ForegroundColor Green
+Write-Host "    Total records: $($allPosture.Count)" -ForegroundColor Green
 
 if ($allPosture.Count -eq 0) {
-    Write-Host "`n  No posture records found for policy $POLICY_ID. Verify the policy ID and account scope." -ForegroundColor Yellow
+    # Dump full XML to help diagnose empty response
+    Write-Warning "No records returned. Full last response:`n$($raw.Content)"
+    Write-Host "`n  No posture records found for policy $POLICY_ID." -ForegroundColor Yellow
     exit 0
 }
 #endregion
 
-#region ── Step 3: Tag-filter against only the IPs present in the failure set ───
-# Much faster than enumerating all tagged hosts: we only look up the small set
-# of IPs that already have failures, then keep those matching the tag criteria.
+#region ── Step 3: Tag-filter against only the IPs present in results ────────────
 Write-Host '[3/3] Applying tag filter and exporting ...' -ForegroundColor Yellow
 
+# IP_ADDR is the field name in the Qualys PC posture API response
 $uniqueIPs = @($allPosture |
-    ForEach-Object { Get-NodeText $_ 'HOST_ID/IP' } |
+    ForEach-Object { Get-NodeText $_ 'IP_ADDR' } |
     Where-Object   { $_ -ne '' } |
     Sort-Object -Unique)
 
-Write-Host "    Unique IPs with failures: $($uniqueIPs.Count)" -ForegroundColor DarkGray
+Write-Host "    Unique IPs in results: $($uniqueIPs.Count)" -ForegroundColor DarkGray
 
-# Batch-fetch host assets for those IPs using IN operator, get their tag IDs
 $approvedIPs = [System.Collections.Generic.HashSet[string]]::new(
     [System.StringComparer]::OrdinalIgnoreCase)
 
@@ -283,32 +301,32 @@ for ($i = 0; $i -lt $uniqueIPs.Count; $i += $BATCH) {
 Write-Host "    IPs passing tag filter: $($approvedIPs.Count)" -ForegroundColor Green
 
 $filtered = @($allPosture | Where-Object {
-    $ip = Get-NodeText $_ 'HOST_ID/IP'
+    $ip = Get-NodeText $_ 'IP_ADDR'
     $ip -ne '' -and $approvedIPs.Contains($ip)
 })
 
-Write-Host "    Failures after filter: $($filtered.Count)" -ForegroundColor Green
+Write-Host "    Records after tag filter: $($filtered.Count)" -ForegroundColor Green
 
 if ($filtered.Count -eq 0) {
-    Write-Host "`n  No failures matched the tag criteria." -ForegroundColor Yellow
+    Write-Host "`n  No records matched the tag criteria." -ForegroundColor Yellow
     exit 0
 }
 
 $results = $filtered | ForEach-Object {
     [PSCustomObject]@{
-        PolicyID    = $POLICY_ID
-        IP          = Get-NodeText $_ 'HOST_ID/IP'
-        Hostname    = Get-NodeText $_ 'HOST_ID/HOSTNAME'
-        OS          = Get-NodeText $_ 'HOST_ID/OS'
-        ControlID   = Get-NodeText $_ 'CONTROL_ID'
-        ControlText = (Get-NodeText $_ 'CONTROL_STATEMENT') -replace '\s+', ' '
-        Status      = Get-NodeText $_ 'STATUS'
-        Evidence    = (Get-NodeText $_ 'EVIDENCE') -replace '\s+', ' '
-        LastEval    = Get-NodeText $_ 'LAST_EVALUATED'
+        PolicyID         = $POLICY_ID
+        IP               = Get-NodeText $_ 'IP_ADDR'
+        Hostname         = Get-NodeText $_ 'HOSTNAME'
+        OS               = Get-NodeText $_ 'OS'
+        ControlID        = Get-NodeText $_ 'CONTROL_ID'
+        ControlStatement = (Get-NodeText $_ 'CONTROL_STATEMENT') -replace '\s+', ' '
+        Status           = Get-NodeText $_ 'STATUS'
+        EvaluationDate   = Get-NodeText $_ 'EVALUATION_DATE'
+        Evidence         = (Get-NodeText $_ 'EVIDENCE/BOOLEAN_EXPR') -replace '\s+', ' '
     }
 }
 
-$csvPath = ".\Qualys_Policy${POLICY_ID}_Failures_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+$csvPath = ".\Qualys_Policy${POLICY_ID}_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
 $results | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
 Write-Host ''
 Write-Host "CSV exported: $csvPath  ($($results.Count) rows)" -ForegroundColor Green
