@@ -1,66 +1,58 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Retrieves Qualys Policy Compliance failures with tag-based host filtering.
+    Exports Qualys Policy Compliance failures to CSV using the PCRS API.
 
 .DESCRIPTION
-    Connects to the Qualys EU platform (qualysapi.qualys.eu), resolves tag IDs
-    by name, then retrieves all FAIL posture records for Policy ID 1661380 where
-    the host is tagged with "All.Workstations" (any) but NOT tagged with
-    "VSI Testing" (any).
-
-    Results are displayed in the console and exported to a timestamped CSV file.
+    Uses the Qualys PCRS (Policy Compliance Reporting Streaming) API —
+    the same engine that powers the "(SS) Policy Compliance - Workstation Failures"
+    dashboard report — to fetch FAILED posture records for Policy ID 1661380,
+    filtered to hosts tagged "All.Workstations" but NOT "VSI Testing".
 
 .NOTES
-    Platform  : Qualys EU  (qualysapi.qualys.eu)
-    Policy ID : 1661380
-    Include   : tag ANY of "All.Workstations"
-    Exclude   : tag ANY of "VSI Testing"
+    Platform   : Qualys EU  (qualysapi.qualys.eu)
+    Policy ID  : 1661380
+    Include tag: All.Workstations
+    Exclude tag: VSI Testing
+    PCRS docs  : /pcrs/1.0/posture/hostids  +  /pcrs/1.0/posture/postureInfo
 #>
 [CmdletBinding()]
 param()
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-
-# Ensure TLS 1.2 (required by Qualys)
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 #region ── Constants ────────────────────────────────────────────────────────────
-$BASE_URL       = 'https://qualysapi.qualys.eu'
-$POLICY_ID      = 1661380
-$INCLUDE_TAG    = 'All.Workstations'
-$EXCLUDE_TAG    = 'VSI Testing'
+$BASE_URL    = 'https://qualysapi.qualys.eu'
+$POLICY_ID   = 1661380
+$INCLUDE_TAG = 'All.Workstations'
+$EXCLUDE_TAG = 'VSI Testing'
 #endregion
 
 #region ── Banner ───────────────────────────────────────────────────────────────
 Write-Host ''
 Write-Host '╔══════════════════════════════════════════════════════════════╗' -ForegroundColor Cyan
-Write-Host '║        Qualys Policy Compliance  –  Failure Report          ║' -ForegroundColor Cyan
-Write-Host '║                                                              ║' -ForegroundColor Cyan
-Write-Host "║  Platform   : qualysapi.qualys.eu                           ║" -ForegroundColor Cyan
-Write-Host "║  Policy ID  : $POLICY_ID                                  ║" -ForegroundColor Cyan
-Write-Host "║  Include    : Any tag '$INCLUDE_TAG'              ║" -ForegroundColor Cyan
-Write-Host "║  Exclude    : Any tag '$EXCLUDE_TAG'                  ║" -ForegroundColor Cyan
+Write-Host '║   Qualys Policy Compliance  –  Failure Report (PCRS API)    ║' -ForegroundColor Cyan
+Write-Host "║   Policy  : $POLICY_ID                                   ║" -ForegroundColor Cyan
+Write-Host "║   Include : $INCLUDE_TAG                          ║" -ForegroundColor Cyan
+Write-Host "║   Exclude : $EXCLUDE_TAG                              ║" -ForegroundColor Cyan
 Write-Host '╚══════════════════════════════════════════════════════════════╝' -ForegroundColor Cyan
 Write-Host ''
 #endregion
 
 #region ── Credentials ──────────────────────────────────────────────────────────
-$cred     = Get-Credential -Message 'Enter your Qualys EU credentials (username / password)'
-$username = $cred.UserName
-$password = $cred.GetNetworkCredential().Password
-
+$cred      = Get-Credential -Message 'Enter your Qualys EU credentials'
+$username  = $cred.UserName
+$password  = $cred.GetNetworkCredential().Password
 $authToken = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${username}:${password}"))
 
-# Form-encoded headers (for legacy FO API calls)
-$foHeaders = @{
+$pcrsHeaders = @{
     'Authorization'    = "Basic $authToken"
     'X-Requested-With' = 'PowerShell'
-    'Content-Type'     = 'application/x-www-form-urlencoded'
+    'Content-Type'     = 'application/json'
+    'Accept'           = 'application/json'
 }
-
-# XML/JSON headers (for QPS REST API calls)
 $qpsHeaders = @{
     'Authorization'    = "Basic $authToken"
     'X-Requested-With' = 'PowerShell'
@@ -68,7 +60,7 @@ $qpsHeaders = @{
 }
 #endregion
 
-#region ── Helper: Invoke-QualysWebRequest (raw XML) ────────────────────────────
+#region ── Helper: HTTP with error body extraction ──────────────────────────────
 function Invoke-QualysWebRequest {
     param(
         [string]   $Uri,
@@ -80,196 +72,205 @@ function Invoke-QualysWebRequest {
     $attempt = 0
     while ($true) {
         try {
-            $splat = @{
-                Uri         = $Uri
-                Method      = $Method
-                Headers     = $Headers
-                ErrorAction = 'Stop'
-            }
+            $splat = @{ Uri = $Uri; Method = $Method; Headers = $Headers; ErrorAction = 'Stop' }
             if ($Body) { $splat['Body'] = $Body }
             return Invoke-WebRequest @splat
         }
         catch {
-            # In PS 5.1, Invoke-WebRequest throws on 4xx/5xx. Extract the response
-            # body so we can see the actual Qualys error message rather than just
-            # a generic "The remote server returned an error" message.
             $detail = ''
             $ex = $_.Exception
             if ($ex -is [System.Net.WebException] -and $ex.Response) {
                 try {
                     $stream = $ex.Response.GetResponseStream()
                     $reader = [System.IO.StreamReader]::new($stream)
-                    $detail = " | Qualys response: $($reader.ReadToEnd())"
+                    $detail = " | Response: $($reader.ReadToEnd())"
                 } catch {}
             }
             $attempt++
-            if ($attempt -ge $Retries) {
-                throw "API call to $Uri failed: $($_)$detail"
-            }
+            if ($attempt -ge $Retries) { throw "API call to $Uri failed: $($_)$detail" }
             $wait = [math]::Pow(2, $attempt)
-            Write-Warning "Request failed (attempt $attempt/$Retries) – retrying in ${wait}s: $_"
+            Write-Warning "Retry $attempt/$Retries in ${wait}s: $_"
             Start-Sleep -Seconds $wait
         }
     }
 }
 #endregion
 
-#region ── Step 1: Resolve tag names → IDs via Asset Management API ─────────────
-Write-Host '[1/3] Resolving Qualys tag IDs ...' -ForegroundColor Yellow
+#region ── Step 1: Resolve tag IDs (needed for AM tag-filter in Step 4) ─────────
+Write-Host '[1/4] Resolving tag IDs ...' -ForegroundColor Yellow
 
 function Search-QualysTag {
     param([string]$TagName, [string]$Operator)
-
     $body = @"
 <?xml version="1.0" encoding="UTF-8"?>
 <ServiceRequest>
   <filters>
     <Criteria field="name" operator="$Operator">$TagName</Criteria>
   </filters>
-  <preferences>
-    <limitResults>25</limitResults>
-  </preferences>
+  <preferences><limitResults>25</limitResults></preferences>
 </ServiceRequest>
 "@
-    $raw = Invoke-QualysWebRequest -Uri "$BASE_URL/qps/rest/2.0/search/am/tag" `
-                                   -Method Post -Headers $qpsHeaders -Body $body
+    $raw   = Invoke-QualysWebRequest -Uri "$BASE_URL/qps/rest/2.0/search/am/tag" -Method Post -Headers $qpsHeaders -Body $body
     [xml]$xml = $raw.Content
-    Write-Verbose "Tag search ($Operator '$TagName'):`n$($raw.Content)"
-
-    $codeNode = $xml.SelectSingleNode('//ServiceResponse/responseCode')
-    if (-not $codeNode -or $codeNode.InnerText -ne 'SUCCESS') {
-        $detail = $xml.SelectSingleNode('//responseErrorDetails')
-        throw "Tag search failed (operator=$Operator, code=$($codeNode.InnerText)): $($detail.InnerText)"
+    $code  = $xml.SelectSingleNode('//ServiceResponse/responseCode')
+    if (-not $code -or $code.InnerText -ne 'SUCCESS') {
+        throw "Tag search failed: $($xml.SelectSingleNode('//responseErrorDetails').InnerText)"
     }
-
-    $countNode = $xml.SelectSingleNode('//ServiceResponse/count')
-    $count     = if ($countNode) { [int]$countNode.InnerText } else { 0 }
-    return @{ Count = $count; Xml = $xml }
+    $count = $xml.SelectSingleNode('//ServiceResponse/count')
+    return @{ Count = if ($count) { [int]$count.InnerText } else { 0 }; Xml = $xml }
 }
 
 function Get-QualysTagId {
     param([string]$TagName)
-
-    # ── 1. Try exact case-sensitive match first (EQUALS per Qualys docs) ──────
-    $result = Search-QualysTag -TagName $TagName -Operator 'EQUALS'
-
-    if ($result.Count -gt 0) {
-        $idNode = $result.Xml.SelectSingleNode('//ServiceResponse/data/Tag[1]/id')
-        if (-not $idNode) {
-            Write-Warning "EQUALS match found but <id> missing. Raw:`n$($result.Xml.OuterXml)"
-            throw "Unexpected response structure for tag '$TagName'."
-        }
-        return [long]$idNode.InnerText
+    $r = Search-QualysTag -TagName $TagName -Operator 'EQUALS'
+    if ($r.Count -gt 0) {
+        return [long]$r.Xml.SelectSingleNode('//ServiceResponse/data/Tag[1]/id').InnerText
     }
-
-    # ── 2. EQUALS returned 0 – EQUALS is case-sensitive in Qualys.
-    #       Fall back to CONTAINS so we can suggest the real name. ─────────────
-    Write-Warning "Tag '$TagName' not found with exact match (EQUALS is case-sensitive)."
-    Write-Warning "Falling back to CONTAINS search to find the closest match..."
-
-    $fuzzy = Search-QualysTag -TagName $TagName -Operator 'CONTAINS'
-
-    if ($fuzzy.Count -eq 0) {
-        throw "Tag '$TagName' not found in Qualys with EQUALS or CONTAINS. Verify the tag exists and your account has scope to see it."
+    Write-Warning "Tag '$TagName' not found by EQUALS (case-sensitive). Trying CONTAINS..."
+    $f = Search-QualysTag -TagName $TagName -Operator 'CONTAINS'
+    if ($f.Count -eq 0) { throw "Tag '$TagName' not found." }
+    foreach ($t in $f.Xml.SelectNodes('//ServiceResponse/data/Tag')) {
+        Write-Warning "  Found: ID=$($t.SelectSingleNode('id').InnerText)  Name='$($t.SelectSingleNode('name').InnerText)'"
     }
-
-    $tagNodes = $fuzzy.Xml.SelectNodes('//ServiceResponse/data/Tag')
-    Write-Warning "Found $($fuzzy.Count) tag(s) containing '$TagName':"
-    foreach ($t in $tagNodes) {
-        $tid   = $t.SelectSingleNode('id').InnerText
-        $tname = $t.SelectSingleNode('name').InnerText
-        Write-Warning "    ID=$tid  Name='$tname'"
+    if ($f.Count -eq 1) {
+        $n = $f.Xml.SelectSingleNode('//ServiceResponse/data/Tag[1]')
+        Write-Warning "Auto-selecting '$($n.SelectSingleNode('name').InnerText)' (ID=$($n.SelectSingleNode('id').InnerText))"
+        return [long]$n.SelectSingleNode('id').InnerText
     }
-
-    if ($fuzzy.Count -eq 1) {
-        $idNode   = $fuzzy.Xml.SelectSingleNode('//ServiceResponse/data/Tag[1]/id')
-        $nameNode = $fuzzy.Xml.SelectSingleNode('//ServiceResponse/data/Tag[1]/name')
-        Write-Warning "Auto-selecting the single match: '$($nameNode.InnerText)' (ID=$($idNode.InnerText))"
-        return [long]$idNode.InnerText
-    }
-
-    throw "Multiple tags match '$TagName'. Update the script constant with the exact name shown above (case-sensitive)."
+    throw "Multiple tags match '$TagName'. Set the exact name in the constants above."
 }
 
 $includeTagId = Get-QualysTagId -TagName $INCLUDE_TAG
 $excludeTagId = Get-QualysTagId -TagName $EXCLUDE_TAG
-
-Write-Host "    '$INCLUDE_TAG'  →  ID $includeTagId" -ForegroundColor Green
-Write-Host "    '$EXCLUDE_TAG'        →  ID $excludeTagId" -ForegroundColor Green
+Write-Host "    '$INCLUDE_TAG'  → ID $includeTagId" -ForegroundColor Green
+Write-Host "    '$EXCLUDE_TAG'  → ID $excludeTagId" -ForegroundColor Green
 #endregion
 
-#region ── Step 2: Fetch ALL posture records for the policy ─────────────────────
-Write-Host '[2/3] Fetching posture records ...' -ForegroundColor Yellow
+#region ── Step 2: Resolve host IDs for the policy via PCRS ─────────────────────
+# GET /pcrs/1.0/posture/hostids returns the QG host IDs scanned by this policy.
+Write-Host '[2/4] Getting policy host IDs via PCRS ...' -ForegroundColor Yellow
 
-function Get-NodeText { param($Node, [string]$XPath) $n = $Node.SelectSingleNode($XPath); if ($n) { $n.InnerText } else { '' } }
+$policyHostIds = [System.Collections.Generic.List[long]]::new()
+$pgNum    = 1
+$pgMore   = $true
 
-$allPosture = [System.Collections.Generic.List[object]]::new()
-$idMin      = 0
+while ($pgMore) {
+    $url = "$BASE_URL/pcrs/1.0/posture/hostids?policyId=$POLICY_ID&pageSize=5000&pageNumber=$pgNum"
+    Write-Host "    Page $pgNum ..." -ForegroundColor DarkGray
+    $raw  = Invoke-QualysWebRequest -Uri $url -Method Get -Headers $pcrsHeaders
 
-do {
-    # details=All   → includes control statement, evidence, OS etc.
-    # truncation_limit=5000 → max per page (Qualys default is also 5000)
-    # status=Failed → only compliance failures (Passed/Failed/Error are the valid values)
-    $parts = @(
-        "action=list",
-        "policy_id=$POLICY_ID",
-        "status=Failed",
-        "details=All",
-        "truncation_limit=5000"
-    )
-    if ($idMin -gt 0) { $parts += "id_min=$idMin" }
-
-    $raw = Invoke-QualysWebRequest -Uri "$BASE_URL/api/2.0/fo/compliance/posture/info/" `
-                                   -Method Post -Headers $foHeaders -Body ($parts -join '&')
-    [xml]$xml = $raw.Content
-
-    # Dump the raw XML on the very first call so we can see the real structure
-    if ($allPosture.Count -eq 0) {
-        Write-Verbose "First response XML:`n$($raw.Content)"
-        # Always show root element name to confirm we're hitting the right endpoint
-        Write-Host "    Response root: <$($xml.DocumentElement.Name)>" -ForegroundColor DarkGray
+    if ($pgNum -eq 1) {
+        Write-Host "    [DIAG] hostids response (first 400 chars): $($raw.Content.Substring(0,[Math]::Min(400,$raw.Content.Length)))" -ForegroundColor DarkGray
     }
 
-    # Use fully-qualified path to avoid accidentally matching nested INFO elements
-    $batch = $xml.SelectNodes('//RESPONSE/INFO_LIST/INFO')
-    foreach ($n in $batch) { $allPosture.Add($n) }
-    Write-Host "    +$($batch.Count) records (total: $($allPosture.Count))" -ForegroundColor DarkGray
-
-    # Show first record's key fields so caller can confirm data looks right
-    if ($allPosture.Count -gt 0 -and $idMin -eq 0 -and $batch.Count -gt 0) {
-        $sample = $batch.Item(0)
-        Write-Host "    Sample → IP:$(Get-NodeText $sample 'IP_ADDR')  Host:$(Get-NodeText $sample 'HOSTNAME')  Status:$(Get-NodeText $sample 'STATUS')  ControlID:$(Get-NodeText $sample 'CONTROL_ID')" -ForegroundColor DarkGray
+    $json = $raw.Content | ConvertFrom-Json
+    $ids  = $json.hostIds
+    if ($ids -and $ids.Count -gt 0) {
+        foreach ($id in $ids) { $policyHostIds.Add([long]$id) }
+        Write-Host "    +$($ids.Count) IDs (total: $($policyHostIds.Count))" -ForegroundColor DarkGray
     }
+    $pgMore = ($json.hasMoreRecords -eq $true) -and ($ids.Count -gt 0)
+    $pgNum++
+}
 
-    $warn = $xml.SelectSingleNode('//WARNING/URL')
-    if ($warn -and $warn.InnerText -match 'id_min=(\d+)') { $idMin = [long]$Matches[1] } else { break }
-} while ($true)
+Write-Host "    Total host IDs: $($policyHostIds.Count)" -ForegroundColor Green
 
-Write-Host "    Total records: $($allPosture.Count)" -ForegroundColor Green
-
-if ($allPosture.Count -eq 0) {
-    # Dump full XML to help diagnose empty response
-    Write-Warning "No records returned. Full last response:`n$($raw.Content)"
-    Write-Host "`n  No posture records found for policy $POLICY_ID." -ForegroundColor Yellow
+if ($policyHostIds.Count -eq 0) {
+    Write-Host "`n  No hosts found for policy $POLICY_ID. Check policy ID and account scope." -ForegroundColor Yellow
     exit 0
 }
 #endregion
 
-#region ── Step 3: Tag-filter against only the IPs present in results ────────────
-Write-Host '[3/3] Applying tag filter and exporting ...' -ForegroundColor Yellow
+#region ── Step 3: Fetch posture info via PCRS postureInfo ───────────────────────
+# POST /pcrs/1.0/posture/postureInfo  – requires policyId + hostIds array.
+# Returns JSON; we filter for FAILED in PowerShell.
+Write-Host '[3/4] Fetching posture data via PCRS ...' -ForegroundColor Yellow
 
-# IP_ADDR is the field name in the Qualys PC posture API response
-$uniqueIPs = @($allPosture |
-    ForEach-Object { Get-NodeText $_ 'IP_ADDR' } |
-    Where-Object   { $_ -ne '' } |
-    Sort-Object -Unique)
+$allRecords  = [System.Collections.Generic.List[object]]::new()
+$HCHUNK      = 1000   # host IDs per call
+$totalChunks = [math]::Ceiling($policyHostIds.Count / $HCHUNK)
 
-Write-Host "    Unique IPs in results: $($uniqueIPs.Count)" -ForegroundColor DarkGray
+for ($ci = 0; $ci -lt $policyHostIds.Count; $ci += $HCHUNK) {
+    $end   = [Math]::Min($ci + $HCHUNK - 1, $policyHostIds.Count - 1)
+    $chunk = [long[]]($policyHostIds[$ci..$end])
+    $cNum  = [math]::Floor($ci / $HCHUNK) + 1
+    Write-Host "    Chunk $cNum/$totalChunks ($($chunk.Count) hosts) ..." -ForegroundColor DarkGray
 
-$approvedIPs = [System.Collections.Generic.HashSet[string]]::new(
-    [System.StringComparer]::OrdinalIgnoreCase)
+    $pgNum2 = 1
+    $pgMore2 = $true
 
-$BATCH = 500
+    while ($pgMore2) {
+        $bodyJson = [ordered]@{
+            policyId         = $POLICY_ID
+            hostIds          = $chunk
+            pageNumber       = $pgNum2
+            pageSize         = 5000
+            evidenceRequired = 1
+        } | ConvertTo-Json -Depth 5
+
+        $raw  = Invoke-QualysWebRequest -Uri "$BASE_URL/pcrs/1.0/posture/postureInfo" `
+                                         -Method Post -Headers $pcrsHeaders -Body $bodyJson
+
+        # Dump first response so we can confirm field names
+        if ($ci -eq 0 -and $pgNum2 -eq 1) {
+            Write-Host "    [DIAG] postureInfo response (first 600 chars):`n$($raw.Content.Substring(0,[Math]::Min(600,$raw.Content.Length)))" -ForegroundColor DarkGray
+        }
+
+        $json = $raw.Content | ConvertFrom-Json
+
+        # Response array may be named differently across PCRS versions
+        $recs = if     ($null -ne $json.postureInfoList) { $json.postureInfoList }
+                elseif ($null -ne $json.data)            { $json.data }
+                elseif ($null -ne $json.results)         { $json.results }
+                else                                     { @() }
+
+        foreach ($r in $recs) { $allRecords.Add($r) }
+        if ($recs.Count -gt 0) {
+            Write-Host "      +$($recs.Count) records (total: $($allRecords.Count))" -ForegroundColor DarkGray
+        }
+
+        $pgMore2 = ($json.hasMoreRecords -eq $true) -and ($recs.Count -gt 0)
+        $pgNum2++
+    }
+}
+
+Write-Host "    Total records (all statuses): $($allRecords.Count)" -ForegroundColor Green
+
+if ($allRecords.Count -eq 0) {
+    Write-Warning "PCRS returned 0 records. Check the [DIAG] lines above for the raw response."
+    exit 0
+}
+
+# Filter FAILED — PCRS uses 'FAILED' (all caps)
+$failedRecs = @($allRecords | Where-Object {
+    $s = if ($null -ne $_.status) { [string]$_.status }
+         elseif ($null -ne $_.postureStatus) { [string]$_.postureStatus }
+         else { '' }
+    $s.ToUpper() -in @('FAILED','FAIL')
+})
+Write-Host "    Failed records: $($failedRecs.Count)" -ForegroundColor Green
+#endregion
+
+#region ── Step 4: Tag-filter via AM API, then export ───────────────────────────
+Write-Host '[4/4] Applying tag filter and exporting ...' -ForegroundColor Yellow
+
+function Get-RecordIp {
+    param($rec)
+    foreach ($f in @('hostIp','ip','ipAddress','host_ip','ipaddr')) {
+        $v = $rec.$f
+        if ($v) { return [string]$v }
+    }
+    return ''
+}
+
+$uniqueIPs = @($failedRecs | ForEach-Object { Get-RecordIp $_ } |
+    Where-Object { $_ -ne '' } | Sort-Object -Unique)
+
+Write-Host "    Unique IPs in failed records: $($uniqueIPs.Count)" -ForegroundColor DarkGray
+
+$approvedIPs = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$BATCH       = 500
+
 for ($i = 0; $i -lt $uniqueIPs.Count; $i += $BATCH) {
     $slice  = $uniqueIPs[$i .. ([Math]::Min($i + $BATCH - 1, $uniqueIPs.Count - 1))]
     $ipsCsv = $slice -join ','
@@ -280,9 +281,7 @@ for ($i = 0; $i -lt $uniqueIPs.Count; $i += $BATCH) {
   <filters>
     <Criteria field="address" operator="IN">$ipsCsv</Criteria>
   </filters>
-  <preferences>
-    <limitResults>$BATCH</limitResults>
-  </preferences>
+  <preferences><limitResults>$BATCH</limitResults></preferences>
 </ServiceRequest>
 "@
     $raw = Invoke-QualysWebRequest -Uri "$BASE_URL/qps/rest/2.0/search/am/hostasset" `
@@ -302,11 +301,7 @@ for ($i = 0; $i -lt $uniqueIPs.Count; $i += $BATCH) {
 
 Write-Host "    IPs passing tag filter: $($approvedIPs.Count)" -ForegroundColor Green
 
-$filtered = @($allPosture | Where-Object {
-    $ip = Get-NodeText $_ 'IP_ADDR'
-    $ip -ne '' -and $approvedIPs.Contains($ip)
-})
-
+$filtered = @($failedRecs | Where-Object { $approvedIPs.Contains((Get-RecordIp $_)) })
 Write-Host "    Records after tag filter: $($filtered.Count)" -ForegroundColor Green
 
 if ($filtered.Count -eq 0) {
@@ -315,20 +310,28 @@ if ($filtered.Count -eq 0) {
 }
 
 $results = $filtered | ForEach-Object {
+    $r = $_
     [PSCustomObject]@{
         PolicyID         = $POLICY_ID
-        IP               = Get-NodeText $_ 'IP_ADDR'
-        Hostname         = Get-NodeText $_ 'HOSTNAME'
-        OS               = Get-NodeText $_ 'OS'
-        ControlID        = Get-NodeText $_ 'CONTROL_ID'
-        ControlStatement = (Get-NodeText $_ 'CONTROL_STATEMENT') -replace '\s+', ' '
-        Status           = Get-NodeText $_ 'STATUS'
-        EvaluationDate   = Get-NodeText $_ 'EVALUATION_DATE'
-        Evidence         = (Get-NodeText $_ 'EVIDENCE/BOOLEAN_EXPR') -replace '\s+', ' '
+        IP               = Get-RecordIp $r
+        Hostname         = if ($r.dns)              { $r.dns }
+                           elseif ($r.hostname)     { $r.hostname }
+                           elseif ($r.hostName)     { $r.hostName }
+                           else                     { '' }
+        OS               = if ($r.osCpe)            { $r.osCpe }
+                           elseif ($r.os)           { $r.os }
+                           else                     { '' }
+        ControlID        = if ($r.controlId)        { $r.controlId }        else { '' }
+        ControlStatement = if ($r.controlStatement) { ([string]$r.controlStatement) -replace '\s+',' ' } else { '' }
+        Status           = if ($r.status)           { $r.status }           else { '' }
+        EvaluationDate   = if ($r.lastEvaluatedDate){ $r.lastEvaluatedDate }
+                           elseif ($r.evaluationDate){ $r.evaluationDate }
+                           else                     { '' }
+        Evidence         = if ($r.evidence)         { ([string]$r.evidence) -replace '\s+',' ' } else { '' }
     }
 }
 
-$csvPath = ".\Qualys_Policy${POLICY_ID}_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+$csvPath = ".\Qualys_Policy${POLICY_ID}_Failures_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
 $results | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
 Write-Host ''
 Write-Host "CSV exported: $csvPath  ($($results.Count) rows)" -ForegroundColor Green
