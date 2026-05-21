@@ -209,9 +209,11 @@ $idMin      = 0
 do {
     # details=All   → includes control statement, evidence, OS etc.
     # truncation_limit=5000 → max per page (Qualys default is also 5000)
+    # status=Failed → only compliance failures (Passed/Failed/Error are the valid values)
     $parts = @(
         "action=list",
         "policy_id=$POLICY_ID",
+        "status=Failed",
         "details=All",
         "truncation_limit=5000"
     )
@@ -228,8 +230,8 @@ do {
         Write-Host "    Response root: <$($xml.DocumentElement.Name)>" -ForegroundColor DarkGray
     }
 
-    # Qualys PC posture API: root=POSTURE_INFO_LIST_OUTPUT, records in INFO_LIST/INFO
-    $batch = $xml.SelectNodes('//INFO')
+    # Use fully-qualified path to avoid accidentally matching nested INFO elements
+    $batch = $xml.SelectNodes('//RESPONSE/INFO_LIST/INFO')
     foreach ($n in $batch) { $allPosture.Add($n) }
     Write-Host "    +$($batch.Count) records (total: $($allPosture.Count))" -ForegroundColor DarkGray
 
