@@ -117,48 +117,78 @@ function Invoke-QualysApi {
 #region ── Step 1: Resolve tag names → IDs via Asset Management API ─────────────
 Write-Host '[1/3] Resolving Qualys tag IDs ...' -ForegroundColor Yellow
 
-function Get-QualysTagId {
-    param([string]$TagName)
+function Search-QualysTag {
+    param([string]$TagName, [string]$Operator)
 
     $body = @"
 <?xml version="1.0" encoding="UTF-8"?>
 <ServiceRequest>
   <filters>
-    <Criteria field="name" operator="EQUALS">$TagName</Criteria>
+    <Criteria field="name" operator="$Operator">$TagName</Criteria>
   </filters>
+  <preferences>
+    <limitResults>25</limitResults>
+  </preferences>
 </ServiceRequest>
 "@
-    # Use raw Invoke-WebRequest so we control XML parsing explicitly.
-    # Invoke-RestMethod auto-parses and can lose nodes when namespaces are present;
-    # casting to [xml] ourselves keeps the full document intact.
     $raw = Invoke-QualysWebRequest -Uri "$BASE_URL/qps/rest/2.0/search/am/tag" `
                                    -Method Post -Headers $qpsHeaders -Body $body
     [xml]$xml = $raw.Content
+    Write-Verbose "Tag search ($Operator '$TagName'):`n$($raw.Content)"
 
-    Write-Verbose "Tag lookup response for '$TagName':`n$($raw.Content)"
-
-    $responseCode = $xml.SelectSingleNode('//ServiceResponse/responseCode')
-    if (-not $responseCode -or $responseCode.InnerText -ne 'SUCCESS') {
+    $codeNode = $xml.SelectSingleNode('//ServiceResponse/responseCode')
+    if (-not $codeNode -or $codeNode.InnerText -ne 'SUCCESS') {
         $detail = $xml.SelectSingleNode('//responseErrorDetails')
-        throw "Tag search for '$TagName' failed (code=$($responseCode.InnerText)): $($detail.InnerText)"
+        throw "Tag search failed (operator=$Operator, code=$($codeNode.InnerText)): $($detail.InnerText)"
     }
 
-    # A count of 0 means the tag name does not exist in this subscription
     $countNode = $xml.SelectSingleNode('//ServiceResponse/count')
-    if ($countNode -and [int]$countNode.InnerText -eq 0) {
-        throw "Tag '$TagName' not found in Qualys (count=0). Verify the exact tag name and subscription scope."
+    $count     = if ($countNode) { [int]$countNode.InnerText } else { 0 }
+    return @{ Count = $count; Xml = $xml }
+}
+
+function Get-QualysTagId {
+    param([string]$TagName)
+
+    # ── 1. Try exact case-sensitive match first (EQUALS per Qualys docs) ──────
+    $result = Search-QualysTag -TagName $TagName -Operator 'EQUALS'
+
+    if ($result.Count -gt 0) {
+        $idNode = $result.Xml.SelectSingleNode('//ServiceResponse/data/Tag[1]/id')
+        if (-not $idNode) {
+            Write-Warning "EQUALS match found but <id> missing. Raw:`n$($result.Xml.OuterXml)"
+            throw "Unexpected response structure for tag '$TagName'."
+        }
+        return [long]$idNode.InnerText
     }
 
-    # SelectSingleNode returns $null (not an exception) if the path is absent,
-    # which is safe even with Set-StrictMode -Version Latest
-    $idNode = $xml.SelectSingleNode('//ServiceResponse/data/Tag[1]/id')
-    if (-not $idNode) {
-        # Dump the raw XML to help diagnose unexpected structures
-        Write-Warning "Unexpected response XML for tag '$TagName':`n$($raw.Content)"
-        throw "Could not locate <id> for tag '$TagName' in the API response."
+    # ── 2. EQUALS returned 0 – EQUALS is case-sensitive in Qualys.
+    #       Fall back to CONTAINS so we can suggest the real name. ─────────────
+    Write-Warning "Tag '$TagName' not found with exact match (EQUALS is case-sensitive)."
+    Write-Warning "Falling back to CONTAINS search to find the closest match..."
+
+    $fuzzy = Search-QualysTag -TagName $TagName -Operator 'CONTAINS'
+
+    if ($fuzzy.Count -eq 0) {
+        throw "Tag '$TagName' not found in Qualys with EQUALS or CONTAINS. Verify the tag exists and your account has scope to see it."
     }
 
-    return [long]$idNode.InnerText
+    $tagNodes = $fuzzy.Xml.SelectNodes('//ServiceResponse/data/Tag')
+    Write-Warning "Found $($fuzzy.Count) tag(s) containing '$TagName':"
+    foreach ($t in $tagNodes) {
+        $tid   = $t.SelectSingleNode('id').InnerText
+        $tname = $t.SelectSingleNode('name').InnerText
+        Write-Warning "    ID=$tid  Name='$tname'"
+    }
+
+    if ($fuzzy.Count -eq 1) {
+        $idNode   = $fuzzy.Xml.SelectSingleNode('//ServiceResponse/data/Tag[1]/id')
+        $nameNode = $fuzzy.Xml.SelectSingleNode('//ServiceResponse/data/Tag[1]/name')
+        Write-Warning "Auto-selecting the single match: '$($nameNode.InnerText)' (ID=$($idNode.InnerText))"
+        return [long]$idNode.InnerText
+    }
+
+    throw "Multiple tags match '$TagName'. Update the script constant with the exact name shown above (case-sensitive)."
 }
 
 $includeTagId = Get-QualysTagId -TagName $INCLUDE_TAG
