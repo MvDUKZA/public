@@ -69,8 +69,8 @@ $qpsHeaders = @{
 }
 #endregion
 
-#region ── Helper: Invoke-QualysApi ─────────────────────────────────────────────
-function Invoke-QualysApi {
+#region ── Helper: Invoke-QualysWebRequest (raw XML) ────────────────────────────
+function Invoke-QualysWebRequest {
     param(
         [string]   $Uri,
         [string]   $Method  = 'POST',
@@ -88,7 +88,7 @@ function Invoke-QualysApi {
                 ErrorAction = 'Stop'
             }
             if ($Body) { $splat['Body'] = $Body }
-            return Invoke-RestMethod @splat
+            return Invoke-WebRequest @splat
         }
         catch {
             $attempt++
@@ -98,6 +98,19 @@ function Invoke-QualysApi {
             Start-Sleep -Seconds $wait
         }
     }
+}
+
+function Invoke-QualysApi {
+    param(
+        [string]   $Uri,
+        [string]   $Method  = 'POST',
+        [hashtable]$Headers,
+        [string]   $Body    = $null,
+        [int]      $Retries = 3
+    )
+    $raw = Invoke-QualysWebRequest -Uri $Uri -Method $Method -Headers $Headers -Body $Body -Retries $Retries
+    [xml]$xml = $raw.Content
+    return $xml
 }
 #endregion
 
@@ -115,19 +128,37 @@ function Get-QualysTagId {
   </filters>
 </ServiceRequest>
 "@
-    $r = Invoke-QualysApi -Uri "$BASE_URL/qps/rest/2.0/search/am/tag" `
-                          -Method Post -Headers $qpsHeaders -Body $body
+    # Use raw Invoke-WebRequest so we control XML parsing explicitly.
+    # Invoke-RestMethod auto-parses and can lose nodes when namespaces are present;
+    # casting to [xml] ourselves keeps the full document intact.
+    $raw = Invoke-QualysWebRequest -Uri "$BASE_URL/qps/rest/2.0/search/am/tag" `
+                                   -Method Post -Headers $qpsHeaders -Body $body
+    [xml]$xml = $raw.Content
 
-    if ($r.ServiceResponse.responseCode -ne 'SUCCESS') {
-        throw "Tag search for '$TagName' failed: $($r.ServiceResponse.responseErrorDetails)"
+    Write-Verbose "Tag lookup response for '$TagName':`n$($raw.Content)"
+
+    $responseCode = $xml.SelectSingleNode('//ServiceResponse/responseCode')
+    if (-not $responseCode -or $responseCode.InnerText -ne 'SUCCESS') {
+        $detail = $xml.SelectSingleNode('//responseErrorDetails')
+        throw "Tag search for '$TagName' failed (code=$($responseCode.InnerText)): $($detail.InnerText)"
     }
 
-    # May return a single Tag object or an array; grab the first id
-    $id = @($r.ServiceResponse.data.Tag)[0].id
-    if (-not $id) {
-        throw "Tag '$TagName' was not found in Qualys. Check the exact tag name and your subscription."
+    # A count of 0 means the tag name does not exist in this subscription
+    $countNode = $xml.SelectSingleNode('//ServiceResponse/count')
+    if ($countNode -and [int]$countNode.InnerText -eq 0) {
+        throw "Tag '$TagName' not found in Qualys (count=0). Verify the exact tag name and subscription scope."
     }
-    return [long]$id
+
+    # SelectSingleNode returns $null (not an exception) if the path is absent,
+    # which is safe even with Set-StrictMode -Version Latest
+    $idNode = $xml.SelectSingleNode('//ServiceResponse/data/Tag[1]/id')
+    if (-not $idNode) {
+        # Dump the raw XML to help diagnose unexpected structures
+        Write-Warning "Unexpected response XML for tag '$TagName':`n$($raw.Content)"
+        throw "Could not locate <id> for tag '$TagName' in the API response."
+    }
+
+    return [long]$idNode.InnerText
 }
 
 $includeTagId = Get-QualysTagId -TagName $INCLUDE_TAG
@@ -160,19 +191,20 @@ do {
     if ($idMin -gt 0) { $bodyParts += "id_min=$idMin" }
     $body = $bodyParts -join '&'
 
-    $resp  = Invoke-QualysApi -Uri "$BASE_URL/api/2.0/fo/compliance/posture/info/" `
-                               -Method Post -Headers $foHeaders -Body $body
-    $chunk = $resp.COMPLIANCE_POSTURE_INFO_OUTPUT.RESPONSE.POSTURE_INFO_LIST.POSTURE_INFO
+    $raw  = Invoke-QualysWebRequest -Uri "$BASE_URL/api/2.0/fo/compliance/posture/info/" `
+                                    -Method Post -Headers $foHeaders -Body $body
+    [xml]$xml = $raw.Content
 
-    if ($chunk) {
-        $allFailures.AddRange([object[]]$chunk)
-        Write-Host "      Retrieved $($chunk.Count) record(s)  (running total: $($allFailures.Count))" `
+    $chunkNodes = $xml.SelectNodes('//POSTURE_INFO')
+    if ($chunkNodes.Count -gt 0) {
+        foreach ($node in $chunkNodes) { $allFailures.Add($node) }
+        Write-Host "      Retrieved $($chunkNodes.Count) record(s)  (running total: $($allFailures.Count))" `
                    -ForegroundColor DarkGray
     }
 
     # Qualys returns a <WARNING><URL>…</URL></WARNING> element when more pages exist
-    $warning = $resp.COMPLIANCE_POSTURE_INFO_OUTPUT.RESPONSE.WARNING
-    if ($warning -and $warning.URL -match 'id_min=(\d+)') {
+    $warningUrl = $xml.SelectSingleNode('//WARNING/URL')
+    if ($warningUrl -and $warningUrl.InnerText -match 'id_min=(\d+)') {
         $idMin = [long]$Matches[1]
         $page++
     }
@@ -194,17 +226,20 @@ if ($allFailures.Count -eq 0) {
     exit 0
 }
 
+function Get-NodeText { param($Node, [string]$XPath) $n = $Node.SelectSingleNode($XPath); if ($n) { $n.InnerText } else { '' } }
+
 $results = $allFailures | ForEach-Object {
+    $node = $_   # XmlElement
     [PSCustomObject]@{
         PolicyID    = $POLICY_ID
-        ControlID   = $_.CONTROL_ID
-        ControlText = ($_.CONTROL_STATEMENT -replace '\s+', ' ').Trim()
-        Status      = $_.STATUS
-        IP          = $_.HOST_ID.IP
-        Hostname    = $_.HOST_ID.HOSTNAME
-        OS          = $_.HOST_ID.OS
-        Evidence    = ($_.EVIDENCE -replace '\s+', ' ').Trim()
-        LastEval    = $_.LAST_EVALUATED
+        ControlID   = Get-NodeText $node 'CONTROL_ID'
+        ControlText = (Get-NodeText $node 'CONTROL_STATEMENT') -replace '\s+', ' '
+        Status      = Get-NodeText $node 'STATUS'
+        IP          = Get-NodeText $node 'HOST_ID/IP'
+        Hostname    = Get-NodeText $node 'HOST_ID/HOSTNAME'
+        OS          = Get-NodeText $node 'HOST_ID/OS'
+        Evidence    = (Get-NodeText $node 'EVIDENCE') -replace '\s+', ' '
+        LastEval    = Get-NodeText $node 'LAST_EVALUATED'
     }
 }
 
