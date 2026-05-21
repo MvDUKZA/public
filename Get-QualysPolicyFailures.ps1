@@ -207,26 +207,30 @@ Write-Host '[2/4] Resolving host IDs by tag ...' -ForegroundColor Yellow
 function Get-HostIdsByTagId {
     param([long]$TagId, [string]$Label)
 
-    $ids     = [System.Collections.Generic.List[long]]::new()
-    $hasMore = $true
-    $lastId  = 0
+    $ids         = [System.Collections.Generic.List[long]]::new()
+    $hasMore     = $true
+    $startFromId = 0
+    $page        = 1
 
     while ($hasMore) {
-        $idFilter = if ($lastId -gt 0) {
-            "`n    <Criteria field=`"id`" operator=`"GREATER`">$lastId</Criteria>"
-        } else { '' }
+        # startFromId is exclusive – the record with that id is NOT included,
+        # so passing the last returned id advances the window correctly.
+        $startPref = if ($startFromId -gt 0) { "<startFromId>$startFromId</startFromId>" } else { '' }
 
         $body = @"
 <?xml version="1.0" encoding="UTF-8"?>
 <ServiceRequest>
   <filters>
-    <Criteria field="tagId" operator="EQUALS">$TagId</Criteria>$idFilter
+    <Criteria field="tagId" operator="EQUALS">$TagId</Criteria>
   </filters>
   <preferences>
     <limitResults>1000</limitResults>
+    $startPref
   </preferences>
 </ServiceRequest>
 "@
+        Write-Host "      '$Label' page $page (startFromId=$startFromId) ..." -ForegroundColor DarkGray
+
         $raw = Invoke-QualysWebRequest -Uri "$BASE_URL/qps/rest/2.0/search/am/hostasset" `
                                        -Method Post -Headers $qpsHeaders -Body $body
         [xml]$xml = $raw.Content
@@ -239,15 +243,19 @@ function Get-HostIdsByTagId {
 
         $idNodes = $xml.SelectNodes('//ServiceResponse/data/HostAsset/id')
         foreach ($n in $idNodes) { $ids.Add([long]$n.InnerText) }
+        Write-Host "        +$($idNodes.Count) hosts (running total: $($ids.Count))" -ForegroundColor DarkGray
 
         $hasMoreNode = $xml.SelectSingleNode('//ServiceResponse/hasMoreRecords')
         $hasMore     = ($hasMoreNode -and $hasMoreNode.InnerText -eq 'true')
+
         if ($hasMore -and $idNodes.Count -gt 0) {
-            $lastId = [long]$idNodes.Item($idNodes.Count - 1).InnerText
+            $startFromId = [long]$idNodes.Item($idNodes.Count - 1).InnerText
+            $page++
         } else {
             $hasMore = $false
         }
     }
+
     return $ids
 }
 
