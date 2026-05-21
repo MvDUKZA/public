@@ -199,183 +199,119 @@ Write-Host "    '$INCLUDE_TAG'  →  ID $includeTagId" -ForegroundColor Green
 Write-Host "    '$EXCLUDE_TAG'        →  ID $excludeTagId" -ForegroundColor Green
 #endregion
 
-#region ── Step 2: Resolve host IDs by tag via Asset Management API ─────────────
-# The PC posture API does not accept tag_include/exclude_selector parameters.
-# We resolve host IDs ourselves: include-tag hosts minus exclude-tag hosts.
-Write-Host '[2/4] Resolving host IDs by tag ...' -ForegroundColor Yellow
-
-function Get-HostIdsByTagId {
-    param([long]$TagId, [string]$Label)
-
-    $ids         = [System.Collections.Generic.List[long]]::new()
-    $hasMore     = $true
-    $startFromId = 0
-    $page        = 1
-
-    while ($hasMore) {
-        # startFromId is exclusive – the record with that id is NOT included,
-        # so passing the last returned id advances the window correctly.
-        $startPref = if ($startFromId -gt 0) { "<startFromId>$startFromId</startFromId>" } else { '' }
-
-        $body = @"
-<?xml version="1.0" encoding="UTF-8"?>
-<ServiceRequest>
-  <filters>
-    <Criteria field="tagId" operator="EQUALS">$TagId</Criteria>
-  </filters>
-  <preferences>
-    <limitResults>1000</limitResults>
-    $startPref
-  </preferences>
-</ServiceRequest>
-"@
-        Write-Host "      '$Label' page $page (startFromId=$startFromId) ..." -ForegroundColor DarkGray
-
-        $raw = Invoke-QualysWebRequest -Uri "$BASE_URL/qps/rest/2.0/search/am/hostasset" `
-                                       -Method Post -Headers $qpsHeaders -Body $body
-        [xml]$xml = $raw.Content
-
-        $codeNode = $xml.SelectSingleNode('//ServiceResponse/responseCode')
-        if (-not $codeNode -or $codeNode.InnerText -ne 'SUCCESS') {
-            $detail = $xml.SelectSingleNode('//responseErrorDetails')
-            throw "Host search for tag '$Label' (ID=$TagId) failed: $($detail.InnerText)"
-        }
-
-        $idNodes = $xml.SelectNodes('//ServiceResponse/data/HostAsset/id')
-        foreach ($n in $idNodes) { $ids.Add([long]$n.InnerText) }
-        Write-Host "        +$($idNodes.Count) hosts (running total: $($ids.Count))" -ForegroundColor DarkGray
-
-        $hasMoreNode = $xml.SelectSingleNode('//ServiceResponse/hasMoreRecords')
-        $hasMore     = ($hasMoreNode -and $hasMoreNode.InnerText -eq 'true')
-
-        if ($hasMore -and $idNodes.Count -gt 0) {
-            $startFromId = [long]$idNodes.Item($idNodes.Count - 1).InnerText
-            $page++
-        } else {
-            $hasMore = $false
-        }
-    }
-
-    return $ids
-}
-
-$includeHostIds = Get-HostIdsByTagId -TagId $includeTagId -Label $INCLUDE_TAG
-Write-Host "    Hosts with '$INCLUDE_TAG': $($includeHostIds.Count)" -ForegroundColor Green
-
-$excludeHostIds = Get-HostIdsByTagId -TagId $excludeTagId -Label $EXCLUDE_TAG
-Write-Host "    Hosts with '$EXCLUDE_TAG':  $($excludeHostIds.Count)" -ForegroundColor Green
-
-$excludeSet    = [System.Collections.Generic.HashSet[long]]::new($excludeHostIds)
-$targetHostIds = [long[]]($includeHostIds | Where-Object { -not $excludeSet.Contains($_) })
-Write-Host "    Target hosts after exclusion: $($targetHostIds.Count)" -ForegroundColor Green
-
-if ($targetHostIds.Count -eq 0) {
-    Write-Host "`n  No hosts match the tag criteria (include minus exclude)." -ForegroundColor Yellow
-    exit 0
-}
-#endregion
-
-#region ── Step 3: Fetch compliance posture FAIL records (chunked by host ID) ────
-# The posture API accepts host_id as a comma-separated list.
-# We chunk to avoid excessively long request bodies.
-Write-Host '[3/4] Fetching compliance posture failures ...' -ForegroundColor Yellow
-
-$allFailures = [System.Collections.Generic.List[object]]::new()
-$CHUNK_SIZE  = 300
-$totalChunks = [math]::Ceiling($targetHostIds.Count / $CHUNK_SIZE)
-
-for ($offset = 0; $offset -lt $targetHostIds.Count; $offset += $CHUNK_SIZE) {
-    $end        = [Math]::Min($offset + $CHUNK_SIZE - 1, $targetHostIds.Count - 1)
-    $hostChunk  = ($targetHostIds[$offset..$end]) -join ','
-    $chunkNum   = [math]::Floor($offset / $CHUNK_SIZE) + 1
-    Write-Host "    Chunk $chunkNum/$totalChunks (hosts $($offset+1)–$($end+1)) ..." -ForegroundColor DarkGray
-
-    $idMin = 0
-    do {
-        $bodyParts = @(
-            "action=list",
-            "policy_id=$POLICY_ID",
-            "status=FAIL",
-            "host_id=$hostChunk",
-            "truncation_limit=$PAGE_SIZE"
-        )
-        if ($idMin -gt 0) { $bodyParts += "id_min=$idMin" }
-
-        $raw = Invoke-QualysWebRequest -Uri "$BASE_URL/api/2.0/fo/compliance/posture/info/" `
-                                       -Method Post -Headers $foHeaders -Body ($bodyParts -join '&')
-        [xml]$xml = $raw.Content
-
-        $nodes = $xml.SelectNodes('//POSTURE_INFO')
-        foreach ($node in $nodes) { $allFailures.Add($node) }
-        if ($nodes.Count -gt 0) {
-            Write-Host "      +$($nodes.Count) records (total: $($allFailures.Count))" -ForegroundColor DarkGray
-        }
-
-        $warningUrl = $xml.SelectSingleNode('//WARNING/URL')
-        if ($warningUrl -and $warningUrl.InnerText -match 'id_min=(\d+)') {
-            $idMin = [long]$Matches[1]
-        } else {
-            break
-        }
-    } while ($true)
-}
-
-Write-Host "    Total FAIL records: $($allFailures.Count)" -ForegroundColor Green
-#endregion
-
-#region ── Step 4: Format, display and export results ────────────────────────────
-Write-Host '[4/4] Formatting results ...' -ForegroundColor Yellow
-
-if ($allFailures.Count -eq 0) {
-    Write-Host ''
-    Write-Host '  No failures found for the specified criteria.' -ForegroundColor Green
-    Write-Host ''
-    exit 0
-}
+#region ── Step 2: Fetch ALL FAIL records for the policy (no host pre-filter) ───
+# Pull every failure first – it's one fast paginated call.
+# Tag filtering is done in Step 3 against only the hosts that actually have failures,
+# which is far smaller than enumerating all tagged hosts up front.
+Write-Host '[2/3] Fetching policy failures ...' -ForegroundColor Yellow
 
 function Get-NodeText { param($Node, [string]$XPath) $n = $Node.SelectSingleNode($XPath); if ($n) { $n.InnerText } else { '' } }
 
-$results = $allFailures | ForEach-Object {
-    $node = $_   # XmlElement
-    [PSCustomObject]@{
-        PolicyID    = $POLICY_ID
-        ControlID   = Get-NodeText $node 'CONTROL_ID'
-        ControlText = (Get-NodeText $node 'CONTROL_STATEMENT') -replace '\s+', ' '
-        Status      = Get-NodeText $node 'STATUS'
-        IP          = Get-NodeText $node 'HOST_ID/IP'
-        Hostname    = Get-NodeText $node 'HOST_ID/HOSTNAME'
-        OS          = Get-NodeText $node 'HOST_ID/OS'
-        Evidence    = (Get-NodeText $node 'EVIDENCE') -replace '\s+', ' '
-        LastEval    = Get-NodeText $node 'LAST_EVALUATED'
+$allPosture = [System.Collections.Generic.List[object]]::new()
+$idMin      = 0
+
+do {
+    $parts = @("action=list", "policy_id=$POLICY_ID", "status=FAIL", "truncation_limit=$PAGE_SIZE")
+    if ($idMin -gt 0) { $parts += "id_min=$idMin" }
+
+    $raw = Invoke-QualysWebRequest -Uri "$BASE_URL/api/2.0/fo/compliance/posture/info/" `
+                                   -Method Post -Headers $foHeaders -Body ($parts -join '&')
+    [xml]$xml = $raw.Content
+
+    $batch = $xml.SelectNodes('//POSTURE_INFO')
+    foreach ($n in $batch) { $allPosture.Add($n) }
+    Write-Host "    +$($batch.Count) records (total: $($allPosture.Count))" -ForegroundColor DarkGray
+
+    $warn = $xml.SelectSingleNode('//WARNING/URL')
+    if ($warn -and $warn.InnerText -match 'id_min=(\d+)') { $idMin = [long]$Matches[1] } else { break }
+} while ($true)
+
+Write-Host "    Raw failures: $($allPosture.Count)" -ForegroundColor Green
+
+if ($allPosture.Count -eq 0) {
+    Write-Host "`n  No failures found for policy $POLICY_ID." -ForegroundColor Green
+    exit 0
+}
+#endregion
+
+#region ── Step 3: Tag-filter against only the IPs present in the failure set ───
+# Much faster than enumerating all tagged hosts: we only look up the small set
+# of IPs that already have failures, then keep those matching the tag criteria.
+Write-Host '[3/3] Applying tag filter and exporting ...' -ForegroundColor Yellow
+
+$uniqueIPs = @($allPosture |
+    ForEach-Object { Get-NodeText $_ 'HOST_ID/IP' } |
+    Where-Object   { $_ -ne '' } |
+    Sort-Object -Unique)
+
+Write-Host "    Unique IPs with failures: $($uniqueIPs.Count)" -ForegroundColor DarkGray
+
+# Batch-fetch host assets for those IPs using IN operator, get their tag IDs
+$approvedIPs = [System.Collections.Generic.HashSet[string]]::new(
+    [System.StringComparer]::OrdinalIgnoreCase)
+
+$BATCH = 500
+for ($i = 0; $i -lt $uniqueIPs.Count; $i += $BATCH) {
+    $slice  = $uniqueIPs[$i .. ([Math]::Min($i + $BATCH - 1, $uniqueIPs.Count - 1))]
+    $ipsCsv = $slice -join ','
+
+    $body = @"
+<?xml version="1.0" encoding="UTF-8"?>
+<ServiceRequest>
+  <filters>
+    <Criteria field="address" operator="IN">$ipsCsv</Criteria>
+  </filters>
+  <preferences>
+    <limitResults>$BATCH</limitResults>
+  </preferences>
+</ServiceRequest>
+"@
+    $raw = Invoke-QualysWebRequest -Uri "$BASE_URL/qps/rest/2.0/search/am/hostasset" `
+                                   -Method Post -Headers $qpsHeaders -Body $body
+    [xml]$hxml = $raw.Content
+
+    foreach ($h in $hxml.SelectNodes('//HostAsset')) {
+        $addrNode = $h.SelectSingleNode('address')
+        if (-not $addrNode) { continue }
+        $ip   = $addrNode.InnerText.Trim()
+        $tids = @($h.SelectNodes('.//TagSimple/id') | ForEach-Object { [long]$_.InnerText })
+        if (($tids -contains $includeTagId) -and ($tids -notcontains $excludeTagId)) {
+            [void]$approvedIPs.Add($ip)
+        }
     }
 }
 
-# ── Console: detail table ──
-Write-Host ''
-Write-Host "── Policy $POLICY_ID  |  Include: $INCLUDE_TAG  |  Exclude: $EXCLUDE_TAG ──" `
-           -ForegroundColor Cyan
-$results | Format-Table IP, Hostname, ControlID, ControlText, Status, LastEval -AutoSize
+Write-Host "    IPs passing tag filter: $($approvedIPs.Count)" -ForegroundColor Green
 
-# ── Console: failures-per-host summary ──
-Write-Host '── Failures per host ──' -ForegroundColor Cyan
-$results |
-    Group-Object Hostname |
-    Sort-Object Count -Descending |
-    Format-Table @{L='Hostname'; E={$_.Name}},
-                 @{L='Failures'; E={$_.Count}} -AutoSize
+$filtered = @($allPosture | Where-Object {
+    $ip = Get-NodeText $_ 'HOST_ID/IP'
+    $ip -ne '' -and $approvedIPs.Contains($ip)
+})
 
-# ── Console: failures-per-control summary ──
-Write-Host '── Failures per control ──' -ForegroundColor Cyan
-$results |
-    Group-Object ControlID |
-    Sort-Object Count -Descending |
-    Format-Table @{L='ControlID';    E={$_.Name}},
-                 @{L='AffectedHosts'; E={$_.Count}},
-                 @{L='ControlText';  E={($_.Group[0].ControlText | Select-Object -First 1)}} -AutoSize
+Write-Host "    Failures after filter: $($filtered.Count)" -ForegroundColor Green
 
-# ── Export to CSV ──
+if ($filtered.Count -eq 0) {
+    Write-Host "`n  No failures matched the tag criteria." -ForegroundColor Yellow
+    exit 0
+}
+
+$results = $filtered | ForEach-Object {
+    [PSCustomObject]@{
+        PolicyID    = $POLICY_ID
+        IP          = Get-NodeText $_ 'HOST_ID/IP'
+        Hostname    = Get-NodeText $_ 'HOST_ID/HOSTNAME'
+        OS          = Get-NodeText $_ 'HOST_ID/OS'
+        ControlID   = Get-NodeText $_ 'CONTROL_ID'
+        ControlText = (Get-NodeText $_ 'CONTROL_STATEMENT') -replace '\s+', ' '
+        Status      = Get-NodeText $_ 'STATUS'
+        Evidence    = (Get-NodeText $_ 'EVIDENCE') -replace '\s+', ' '
+        LastEval    = Get-NodeText $_ 'LAST_EVALUATED'
+    }
+}
+
 $csvPath = ".\Qualys_Policy${POLICY_ID}_Failures_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
 $results | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
-Write-Host "Full results saved to: $csvPath" -ForegroundColor Green
+Write-Host ''
+Write-Host "CSV exported: $csvPath  ($($results.Count) rows)" -ForegroundColor Green
 Write-Host ''
 #endregion
