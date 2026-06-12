@@ -288,6 +288,20 @@ Name: `Rollback`
 > SetupRollback.cmd fires TSMBootstrap and execution resumes here instead of
 > Post-Processing.
 
+**Required condition on this group** (Options tab > Add Condition > Task Sequence Variable):
+
+| Variable | Operator | Value |
+|---|---|---|
+| `_SMSTSSetupRollback` | equals | `True` |
+
+**How rollback triggering works — you configure nothing beyond this condition:**
+
+When setup.exe fails mid-upgrade, Windows reverts the OS automatically. It then fires
+`SetupRollback.cmd` which MECM pre-wrote to disk before setup started. That script sets
+`_SMSTSSetupRollback = True` and calls `TSMBootstrap.exe` to resume the TS. The Upgrade
+OS step then "completes", Post-Processing is skipped (condition is False), and this
+Rollback group runs. The machine is back on its original OS.
+
 ---
 
 #### Step 11 — Log Rollback Event
