@@ -518,6 +518,14 @@ function Install-UpdateFromPackage {
 #  MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ── Initialise all state variables FIRST — before any step runs ──────────────
+$actions      = [System.Collections.Generic.List[string]]::new()
+$reboot       = $false
+$abort        = $false
+$updateResult = 'NotRequested'
+$hexCodes     = ''
+$kbFinalStatus= 'NotChecked'
+
 Write-Log "════════════════════════════════════════════════════════"
 Write-Log "VDI Patch Remediation started — $env:COMPUTERNAME"
 Write-Log "KBNumber    : $(if($KBNumber){"'$KBNumber'"}else{'(none)'})"
@@ -526,12 +534,8 @@ Write-Log "MinFreeGB   : $MinFreeGB"
 Write-Log "RebootDelay : ${RebootDelaySec}s"
 Write-Log "════════════════════════════════════════════════════════"
 
-$actions      = [System.Collections.Generic.List[string]]::new()
-$reboot       = $false
-$abort        = $false
-$updateResult = 'NotRequested'
-
 # ── Step 0: KB pre-check — exit immediately if already installed ──────────────
+# This must run AFTER $actions is initialised above.
 if ($KBNumber) {
     Write-Log "--- Step 0: KB pre-check ---"
     $kbID     = if ($KBNumber -match '^KB') { $KBNumber } else { "KB$KBNumber" }
@@ -540,11 +544,11 @@ if ($KBNumber) {
     if ($kbStatus.Installed) {
         Write-Log "$kbID already installed on $env:COMPUTERNAME — nothing to do." 'SUCCESS'
 
-        # Return early — no remediation, no reboot, clean exit
+        # Output JSON and use a flag to skip all remaining steps
         [PSCustomObject]@{
             Computer        = $env:COMPUTERNAME
             KBNumber        = $kbID
-            KBStatus        = "AlreadyInstalled ($($kbStatus.Method))"
+            KBStatus        = "AlreadyInstalled-$($kbStatus.Method)"
             ErrorCodes      = 'NotChecked'
             Actions         = 'KBAlreadyInstalled-Skipped'
             UpdateInstalled = 'AlreadyInstalled'
@@ -553,41 +557,49 @@ if ($KBNumber) {
             FreeGB          = (Get-FreeDiskGB)
             LogPath         = $LogPath
         } | ConvertTo-Json -Depth 3
-        return
-    }
 
-    Write-Log "$kbID not installed — proceeding with remediation."
-    $actions.Add("KB-NotInstalled($kbID)")
+        $abort = $true   # prevents all further steps from running
+        $kbFinalStatus = "AlreadyInstalled-$($kbStatus.Method)"
+    } else {
+        Write-Log "$kbID not installed — proceeding with remediation."
+        $actions.Add("KB-NotInstalled($kbID)")
+    }
 }
 
 # ── Step 1: Read error codes ──────────────────────────────────────────────────
-Write-Log "--- Step 1: Reading WU/CCM error codes ---"
-$codes    = Get-UpdateErrors
-$hexCodes = ($codes | ForEach-Object { '0x' + $_.ToString('X8') }) -join ', '
+$codes = @()
+if (-not $abort) {
+    Write-Log "--- Step 1: Reading WU/CCM error codes ---"
+    $codes    = Get-UpdateErrors
+    $hexCodes = ($codes | ForEach-Object { '0x' + $_.ToString('X8') }) -join ', '
 
-if ($codes.Count -eq 0) {
-    Write-Log "No active error codes found on this machine." 'WARN'
-} else {
-    Write-Log "Error codes: $hexCodes"
+    if ($codes.Count -eq 0) {
+        Write-Log "No active error codes found on this machine." 'WARN'
+    } else {
+        Write-Log "Error codes: $hexCodes"
+    }
 }
 
 # ── Step 2: Disk space ────────────────────────────────────────────────────────
-Write-Log "--- Step 2: Disk space check ---"
-$freeGB  = Get-FreeDiskGB
-Write-Log "C: free: ${freeGB} GB (minimum: ${MinFreeGB} GB)"
+$freeGB = $null
+if (-not $abort) {
+    Write-Log "--- Step 2: Disk space check ---"
+    $freeGB = Get-FreeDiskGB
+    Write-Log "C: free: ${freeGB} GB (minimum: ${MinFreeGB} GB)"
 
-if (($codes -contains $EC.DiskFull) -or ($freeGB -lt $MinFreeGB)) {
-    Write-Log "Below threshold — running cleanup..." 'WARN'
-    $freeGB = Invoke-DiskCleanup
-    $actions.Add('DiskCleanup')
-    if ($freeGB -lt $MinFreeGB) {
-        Write-Log "ABORT: ${freeGB} GB free after cleanup — still below ${MinFreeGB} GB minimum." 'ERROR'
-        Write-Log "Manual intervention required: check WinSxS, user profiles, app logs." 'WARN'
-        $actions.Add("DiskInsufficient-${freeGB}GB")
-        $abort = $true
-    } else {
-        Write-Log "Disk now ${freeGB} GB — sufficient." 'SUCCESS'
-        $reboot = $true   # disk cleanup warrants a reboot
+    if (($codes -contains $EC.DiskFull) -or ($freeGB -lt $MinFreeGB)) {
+        Write-Log "Below threshold — running cleanup..." 'WARN'
+        $freeGB = Invoke-DiskCleanup
+        $actions.Add('DiskCleanup')
+        if ($freeGB -lt $MinFreeGB) {
+            Write-Log "ABORT: ${freeGB} GB free after cleanup — still below ${MinFreeGB} GB minimum." 'ERROR'
+            Write-Log "Manual intervention required: check WinSxS, user profiles, app logs." 'WARN'
+            $actions.Add("DiskInsufficient-${freeGB}GB")
+            $abort = $true
+        } else {
+            Write-Log "Disk now ${freeGB} GB — sufficient." 'SUCCESS'
+            $reboot = $true
+        }
     }
 }
 
@@ -672,7 +684,7 @@ if (-not $abort -and $UpdatePath) {
         $reboot = $true
     }
     $actions.Add("UpdateInstall:$updateResult")
-} else {
+} elseif (-not $abort) {
     Write-Log "--- Step 4: No update path specified — skipping ---"
 }
 
@@ -689,7 +701,7 @@ if ($reboot -and -not $abort) {
     Schedule-Reboot
     $actions.Add("RebootIn${RebootDelaySec}s")
 } elseif ($abort) {
-    Write-Log "Reboot skipped — aborted due to disk space." 'WARN'
+    Write-Log "Reboot skipped — aborted (KB already installed or disk space issue)." 'WARN'
 } else {
     Write-Log "Nothing fixed — no reboot needed." 'INFO'
 }
@@ -706,12 +718,11 @@ Write-Log "Aborted      : $abort"
 Write-Log "Free disk    : ${freeGBFinal} GB"
 Write-Log "════════════════════════════════════════════════════════"
 
-# Post-remediation KB check — confirm whether the KB is now present
-$kbFinalStatus = 'NotChecked'
-if ($KBNumber) {
+# Post-remediation KB check — only if we actually ran remediation (not early-exit)
+if ($KBNumber -and $kbFinalStatus -notmatch '^AlreadyInstalled') {
     $kbID         = if ($KBNumber -match '^KB') { $KBNumber } else { "KB$KBNumber" }
     $kbFinal      = Test-KBInstalled -KB $kbID
-    $kbFinalStatus= if ($kbFinal.Installed) { "Installed ($($kbFinal.Method))" } else { 'StillMissing' }
+    $kbFinalStatus = if ($kbFinal.Installed) { "Installed-$($kbFinal.Method)" } else { 'StillMissing' }
     Write-Log "Post-remediation KB status: $kbFinalStatus"
 }
 
