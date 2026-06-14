@@ -1,48 +1,9 @@
 <#
 .SYNOPSIS
     VDI patch remediation — right-click Run Script from MECM console.
-    Remediates WUA/CBS/disk errors on the local machine, optionally installs
-    a specific update, and reboots if anything was fixed.
-
-.DESCRIPTION
-    Designed to be run via MECM Administration > Scripts > Run Script against
-    machines in a collection (e.g. 0626-Update). Runs as SYSTEM on the target.
-
-    WHAT IT DOES
-    ────────────
-    0. If KBNumber specified: checks installed state — exits immediately
-       with 'AlreadyInstalled' if found. No remediation, no reboot.
-    1. Reads actual WU/CCM error codes from the machine
-    2. Checks disk space (20 GB minimum) — cleans up if below threshold
-    3. Runs the correct fix per error code found:
-         0x8007045B  → Clean reboot (shutdown-in-progress during last attempt)
-         0x87D00651  → Clear pending reboot state
-         0x80070005  → ACL reset + WUA full reset
-         0x80240022  → WUA full reset
-         0x8000FFFF  → WUA full reset + DISM RestoreHealth
-         0x800F0820  → DISM RestoreHealth (CBS transaction failure)
-         0x80073712  → DISM RestoreHealth (component store corruption)
-         0x8007007E  → DISM RestoreHealth (missing DLL / damaged image)
-         0x80240008  → Clear WUA DataStore cache
-         0x80240439  → Clear WUA DataStore cache
-         0x8007066A  → Noted (clears on next MECM scan)
-         0x80070070  → Aggressive disk cleanup
-    4. Optionally installs a specific update:
-         - UNC path to a single .msu file
-         - UNC path to a folder (installs all .msu files found)
-         - MECM Package ID (8-char alphanumeric e.g. PRD00042)
-    5. Triggers MECM SU scan + deployment eval
-    6. Reboots via scheduled task (90s delay) if anything was fixed
-
-    RETURN VALUE (JSON in MECM Run Script Detailed Output pane)
-    ────────────
-    Computer, KBNumber, KBStatus, ErrorCodes, Actions,
-    UpdateInstalled, RebootScheduled, Aborted, FreeGB, LogPath
 
 .PARAMETER KBNumber
-    Optional. KB article number to check before doing anything else.
-    Accepts with or without the 'KB' prefix: KB5039212 or 5039212.
-    Exits immediately with AlreadyInstalled if found.
+    Optional. KB article to check first e.g. KB5039212
 
 .PARAMETER UpdatePath
     Optional. UNC path to .msu, folder of .msu files, or MECM Package ID.
@@ -51,47 +12,38 @@
     Minimum free space on C: required. Default: 20
 
 .PARAMETER RebootDelaySec
-    Seconds between script exit and scheduled reboot. Default: 90
-
-.NOTES
-    Set MECM Run Script timeout to 1800 seconds (30 min) to cover DISM.
-    Full log: C:\Windows\Temp\VDIPatchRemediation.log
-    Script must be approved in MECM console before use.
+    Seconds before scheduled reboot fires. Default: 90
 #>
 
-# MECM Run Script passes parameters as plain strings.
-# Do NOT use [CmdletBinding()] — it breaks MECM parameter passing.
-param(
-    [string] $KBNumber       = '',
-    [string] $UpdatePath     = '',
-    [int]    $MinFreeGB      = 20,
-    [int]    $RebootDelaySec = 90
-)
+# NOTE: No param() block here.
+# MECM Run Script injects parameters as variables directly into scope.
+# Declaring param() causes a parse conflict in MECM's execution wrapper.
+# Parameters are declared in the MECM console script definition instead.
+# Variables available: $KBNumber, $UpdatePath, $MinFreeGB, $RebootDelaySec
 
-# StrictMode off — MECM runs scripts in constrained environments where
-# StrictMode causes spurious terminating errors on null pipeline results.
-# We handle nulls explicitly throughout instead.
+# Safe defaults for any parameter not supplied
+if (-not $KBNumber)       { $KBNumber       = '' }
+if (-not $UpdatePath)     { $UpdatePath      = '' }
+if (-not $MinFreeGB)      { $MinFreeGB       = 20 }
+if (-not $RebootDelaySec) { $RebootDelaySec  = 90 }
+
 $ErrorActionPreference = 'SilentlyContinue'
 
 #region ── Logging ─────────────────────────────────────────────────────────────
 
 $LogPath = 'C:\Windows\Temp\VDIPatchRemediation.log'
-$null    = New-Item -ItemType Directory -Path 'C:\Windows\Temp' -Force -ErrorAction SilentlyContinue
+$null = New-Item -ItemType Directory -Path 'C:\Windows\Temp' -Force -ErrorAction SilentlyContinue
+$null = New-Item -ItemType File -Path $LogPath -Force -ErrorAction SilentlyContinue
 
 function Write-Log {
-    param(
-        [string]$Message,
-        [string]$Level = 'INFO'
-    )
+    param([string]$Message, [string]$Level = 'INFO')
     $entry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [$Level] $Message"
     Add-Content -Path $LogPath -Value $entry -Encoding UTF8 -ErrorAction SilentlyContinue
 }
 
 #endregion
 
-#region ── Error code constants ────────────────────────────────────────────────
-# Stored as strings for reliable -contains comparison across PS versions.
-# WMI returns signed int32 error codes; we convert to hex string for matching.
+#region ── Error code constants (hex strings, no 0x prefix) ───────────────────
 
 $EC_SHUTDOWN      = '8007045B'
 $EC_PENDINGREBOOT = '87D00651'
@@ -108,59 +60,53 @@ $EC_DATA_CONTRACT = '80240439'
 
 #endregion
 
-#region ── Helper functions ────────────────────────────────────────────────────
+#region ── Functions ───────────────────────────────────────────────────────────
 
 function Get-FreeDiskGB {
     try {
         $d = Get-WmiObject -Class Win32_LogicalDisk -Filter "DeviceID='C:'" -ErrorAction Stop
         if ($d) { return [math]::Round($d.FreeSpace / 1GB, 2) }
     } catch {}
-    return 99   # assume fine if we can't query — don't block on unknown
+    return 99
 }
 
-function ConvertTo-HexErrorCode {
-    # Converts a WMI/CCM error code (may be signed int32 or uint32) to
-    # an 8-character uppercase hex string for reliable comparison.
+function ConvertTo-HexCode {
     param($Code)
     try {
         $i = [int64]$Code
-        # Negative values are signed representations of HRESULT codes
-        if ($i -lt 0) { $i = $i + [int64]'0x100000000' }
-        return $i.ToString('X8')
+        if ($i -lt 0) { $i = $i + 4294967296 }
+        return $i.ToString('X8').ToUpper()
     } catch { return $null }
 }
 
 function Get-UpdateErrorCodes {
-    # Returns a [string[]] of 8-char hex codes (no 0x prefix) from three sources.
-    # Returns empty array (never $null) so callers can safely use -contains.
-    $codes = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $codes = New-Object 'System.Collections.Generic.HashSet[string]'
 
-    # Source 1: CCM_SoftwareUpdate WMI — MECM's own per-article error record
+    # Source 1: CCM_SoftwareUpdate WMI
     try {
         $updates = Get-WmiObject -Namespace 'ROOT\ccm\SoftMgmtAgent' `
-                                 -Class 'CCM_SoftwareUpdate' `
-                                 -ErrorAction Stop
+                                 -Class 'CCM_SoftwareUpdate' -ErrorAction Stop
         if ($updates) {
             foreach ($u in @($updates)) {
-                if ($u.ErrorCode -and $u.ErrorCode -ne 0) {
-                    $hex = ConvertTo-HexErrorCode $u.ErrorCode
+                if ($null -ne $u.ErrorCode -and $u.ErrorCode -ne 0) {
+                    $hex = ConvertTo-HexCode $u.ErrorCode
                     if ($hex) {
                         [void]$codes.Add($hex)
-                        Write-Log "CCM_SoftwareUpdate KB$($u.ArticleID): 0x$hex"
+                        Write-Log "CCM KB$($u.ArticleID) error: 0x$hex"
                     }
                 }
             }
         }
     } catch { Write-Log "CCM_SoftwareUpdate query failed: $_" 'WARN' }
 
-    # Source 2: UpdatesDeployment.log — last 500 lines
+    # Source 2: UpdatesDeployment.log last 500 lines
     try {
         $udLog = "$env:SystemRoot\CCM\Logs\UpdatesDeployment.log"
         if (Test-Path $udLog) {
             $lines = Get-Content $udLog -Tail 500 -ErrorAction Stop
-            foreach ($line in $lines) {
-                $matches = [regex]::Matches($line, '0x([0-9A-Fa-f]{8})')
-                foreach ($m in $matches) {
+            foreach ($line in @($lines)) {
+                $rxMatches = [regex]::Matches($line, '0x([0-9A-Fa-f]{8})')
+                foreach ($m in $rxMatches) {
                     $hex = $m.Groups[1].Value.ToUpper()
                     if ($hex -ne '00000000' -and $hex -ne '80070000') {
                         [void]$codes.Add($hex)
@@ -170,49 +116,49 @@ function Get-UpdateErrorCodes {
         }
     } catch { Write-Log "UpdatesDeployment.log parse failed: $_" 'WARN' }
 
-    # Source 3: WU registry LastError — fallback
+    # Source 3: WU registry
     try {
         $k = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\Results\Install'
         if (Test-Path $k) {
             $val = (Get-ItemProperty -Path $k -ErrorAction Stop).LastError
-            if ($val -and $val -ne 0) {
-                $hex = ConvertTo-HexErrorCode $val
+            if ($null -ne $val -and $val -ne 0) {
+                $hex = ConvertTo-HexCode $val
                 if ($hex) { [void]$codes.Add($hex) }
             }
         }
     } catch {}
 
-    Write-Log "Error codes found: $(if($codes.Count -gt 0){ ($codes | ForEach-Object {"0x$_"}) -join ', ' }else{'None'})"
-    return @([string[]]$codes)
+    $arr = @([string[]]$codes)
+    Write-Log "Error codes: $(if($arr.Count -gt 0){ ($arr | ForEach-Object {"0x$_"}) -join ', ' }else{'None'})"
+    return $arr
 }
 
 function Test-KBInstalled {
     param([string]$KB)
     $kbID  = if ($KB -match '^[Kk][Bb]') { $KB.ToUpper() } else { "KB$KB" }
-    $kbNum = $kbID -replace '^KB',''
-
-    Write-Log "Checking if $kbID is installed..."
+    $kbNum = $kbID -replace '^KB', ''
+    Write-Log "Checking $kbID..."
 
     # Method 1: Get-HotFix
     try {
         $hf = Get-HotFix -Id $kbID -ErrorAction SilentlyContinue
         if ($hf) {
-            Write-Log "$kbID found via Get-HotFix." 'SUCCESS'
+            Write-Log "$kbID found via HotFix." 'SUCCESS'
             return [PSCustomObject]@{ Installed = $true; Method = 'HotFix' }
         }
     } catch {}
 
-    # Method 2: Win32_QuickFixEngineering
+    # Method 2: WMI QFE
     try {
         $wmi = Get-WmiObject -Class Win32_QuickFixEngineering `
-                             -Filter "HotFixID='$kbID'" -ErrorAction Stop
+               -Filter "HotFixID='$kbID'" -ErrorAction Stop
         if ($wmi) {
             Write-Log "$kbID found via WMI QFE." 'SUCCESS'
             return [PSCustomObject]@{ Installed = $true; Method = 'WMI-QFE' }
         }
     } catch {}
 
-    # Method 3: CBS registry (most reliable for Win11 CUs)
+    # Method 3: CBS registry
     try {
         $cbsPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\Packages'
         $found = Get-ChildItem -Path $cbsPath -ErrorAction Stop |
@@ -221,45 +167,41 @@ function Test-KBInstalled {
         if ($found) {
             $state = (Get-ItemProperty -Path $found.PSPath -ErrorAction SilentlyContinue).CurrentState
             if ($state -eq 112) {
-                Write-Log "$kbID found in CBS registry (state=112)." 'SUCCESS'
+                Write-Log "$kbID found via CBS (state=112)." 'SUCCESS'
                 return [PSCustomObject]@{ Installed = $true; Method = 'CBS' }
             }
         }
     } catch {}
 
-    # Method 4: DISM (slowest — authoritative fallback)
+    # Method 4: DISM
     try {
         $dismOut = & "$env:SystemRoot\System32\dism.exe" /Online /Get-Packages /Format:Table 2>&1
-        if ($dismOut -match $kbNum) {
+        if (($dismOut -join ' ') -match $kbNum) {
             Write-Log "$kbID found via DISM." 'SUCCESS'
             return [PSCustomObject]@{ Installed = $true; Method = 'DISM' }
         }
     } catch {}
 
-    Write-Log "$kbID NOT found on this machine." 'WARN'
+    Write-Log "$kbID NOT found." 'WARN'
     return [PSCustomObject]@{ Installed = $false; Method = 'None' }
 }
 
 function Invoke-DiskCleanup {
     Write-Log "Running disk cleanup..."
+    Remove-Item "$env:SystemRoot\Temp\*" -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item "$env:TEMP\*" -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item "$env:SystemRoot\Logs\CBS\*.cab" -Force -ErrorAction SilentlyContinue
 
-    # Temp folders
-    Remove-Item "$env:SystemRoot\Temp\*"        -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Item "$env:TEMP\*"                   -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Item "$env:SystemRoot\Logs\CBS\*.cab" -Force  -ErrorAction SilentlyContinue
-
-    # SoftwareDistribution\Download — safe to clear, re-downloads automatically
     try {
         Stop-Service -Name wuauserv -Force -ErrorAction SilentlyContinue
         $sdDl = "$env:SystemRoot\SoftwareDistribution\Download"
         if (Test-Path $sdDl) {
             Remove-Item "$sdDl\*" -Recurse -Force -ErrorAction SilentlyContinue
-            Write-Log "Cleared SoftwareDistribution\Download" 'SUCCESS'
+            Write-Log "Cleared SD\Download" 'SUCCESS'
         }
         Start-Service -Name wuauserv -ErrorAction SilentlyContinue
-    } catch { Write-Log "SD\Download clear failed: $_" 'WARN' }
+    } catch {}
 
-    # CCM cache items >30 days old
     try {
         $mgr = New-Object -ComObject UIResource.UIResourceMgr -ErrorAction Stop
         $cache = $mgr.GetCacheInfo()
@@ -267,30 +209,17 @@ function Invoke-DiskCleanup {
         foreach ($item in @($cache.GetCacheElements())) {
             if ($item.LastReferenceTime -lt $cut) {
                 $cache.DeleteCacheElement($item.CacheElementID)
-                Write-Log "  Removed CCM cache: $($item.ContentID)"
             }
         }
-    } catch { Write-Log "CCM cache cleanup skipped: $_" 'WARN' }
-
-    # Windows Disk Cleanup utility
-    try {
-        $root = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VolumeCaches'
-        @('Update Cleanup','Temporary Files','Windows Upgrade Log Files','Recycle Bin') | ForEach-Object {
-            $p = Join-Path $root $_
-            if (Test-Path $p) {
-                Set-ItemProperty -Path $p -Name 'StateFlags0099' -Value 2 -Type DWord -ErrorAction SilentlyContinue
-            }
-        }
-        Start-Process -FilePath cleanmgr.exe -ArgumentList '/sagerun:99' -Wait -ErrorAction SilentlyContinue
-    } catch { Write-Log "Disk Cleanup utility failed: $_" 'WARN' }
+    } catch {}
 
     $free = Get-FreeDiskGB
-    Write-Log "Free space after cleanup: ${free} GB"
+    Write-Log "Free after cleanup: ${free}GB"
     return $free
 }
 
 function Reset-WUA {
-    Write-Log "Stopping WUA services..."
+    Write-Log "WUA reset starting..."
     @('wuauserv','bits','cryptsvc','msiserver','ccmexec') | ForEach-Object {
         Stop-Service -Name $_ -Force -ErrorAction SilentlyContinue
     }
@@ -299,10 +228,8 @@ function Reset-WUA {
     $ts = Get-Date -Format 'yyyyMMddHHmmss'
     foreach ($p in @("$env:SystemRoot\SoftwareDistribution","$env:SystemRoot\System32\catroot2")) {
         if (Test-Path $p) {
-            try {
-                Rename-Item -Path $p -NewName "${p}.bak_$ts" -Force -ErrorAction Stop
-                Write-Log "Renamed: $(Split-Path $p -Leaf)" 'SUCCESS'
-            } catch { Write-Log "Could not rename $p`: $_" 'WARN' }
+            Rename-Item -Path $p -NewName "${p}.bak_$ts" -Force -ErrorAction SilentlyContinue
+            Write-Log "Renamed: $(Split-Path $p -Leaf)"
         }
     }
 
@@ -311,12 +238,10 @@ function Reset-WUA {
       'wintrust.dll','dssenh.dll','rsaenh.dll','cryptdlg.dll','oleaut32.dll','ole32.dll',
       'shell32.dll','initpki.dll','wuapi.dll','wuaueng.dll','wucltui.dll','wups.dll',
       'wups2.dll','wuweb.dll','qmgr.dll','qmgrprxy.dll','wucltux.dll','muweb.dll','wuwebv.dll'
-    ) | ForEach-Object {
-        & "$env:SystemRoot\System32\regsvr32.exe" /s $_ 2>$null
-    }
+    ) | ForEach-Object { & "$env:SystemRoot\System32\regsvr32.exe" /s $_ 2>$null }
 
-    & "$env:SystemRoot\System32\netsh.exe" winsock reset | Out-Null
-    & "$env:SystemRoot\System32\netsh.exe" winhttp reset proxy | Out-Null
+    & "$env:SystemRoot\System32\netsh.exe" winsock reset 2>&1 | Out-Null
+    & "$env:SystemRoot\System32\netsh.exe" winhttp reset proxy 2>&1 | Out-Null
 
     @('cryptsvc','bits','wuauserv') | ForEach-Object {
         Start-Service -Name $_ -ErrorAction SilentlyContinue
@@ -325,35 +250,30 @@ function Reset-WUA {
 }
 
 function Invoke-DISMRepair {
-    Write-Log "Running DISM CheckHealth..."
-    $chkOut  = & "$env:SystemRoot\System32\dism.exe" /Online /Cleanup-Image /CheckHealth 2>&1
-    $chkExit = $LASTEXITCODE
-
-    if ($chkExit -eq 0 -and ($chkOut -join ' ') -notmatch 'repairable|corruption') {
-        Write-Log "DISM CheckHealth: clean — skipping RestoreHealth." 'SUCCESS'
+    Write-Log "DISM CheckHealth..."
+    $chk  = & "$env:SystemRoot\System32\dism.exe" /Online /Cleanup-Image /CheckHealth 2>&1
+    $exit = $LASTEXITCODE
+    if ($exit -eq 0 -and ($chk -join ' ') -notmatch 'repairable|corruption') {
+        Write-Log "DISM: clean." 'SUCCESS'
         return 'Clean'
     }
-
-    Write-Log "DISM RestoreHealth starting (may take 10-25 min)..."
+    Write-Log "DISM RestoreHealth (10-25 min)..."
     & "$env:SystemRoot\System32\dism.exe" /Online /Cleanup-Image /RestoreHealth /NoRestart 2>&1 | Out-Null
     switch ($LASTEXITCODE) {
-        0    { Write-Log "DISM RestoreHealth: success." 'SUCCESS'; return 'Repaired' }
-        3010 { Write-Log "DISM RestoreHealth: success, reboot needed." 'SUCCESS'; return 'RepairedRebootNeeded' }
-        default {
-            Write-Log "DISM RestoreHealth: failed (exit $LASTEXITCODE)." 'ERROR'
-            return 'Failed'
-        }
+        0    { Write-Log "DISM: repaired." 'SUCCESS'; return 'Repaired' }
+        3010 { Write-Log "DISM: repaired, reboot needed." 'SUCCESS'; return 'RepairedRebootNeeded' }
+        default { Write-Log "DISM: failed (exit $LASTEXITCODE)." 'ERROR'; return 'Failed' }
     }
 }
 
 function Reset-SDACL {
     Write-Log "Resetting SoftwareDistribution ACLs..."
     & "$env:SystemRoot\System32\icacls.exe" "$env:SystemRoot\SoftwareDistribution" /reset /T /C /Q 2>&1 | Out-Null
-    Write-Log "ACL reset complete." 'SUCCESS'
+    Write-Log "ACL reset done." 'SUCCESS'
 }
 
 function Clear-WUADataStore {
-    Write-Log "Clearing WUA DataStore cache..."
+    Write-Log "Clearing WUA DataStore..."
     Stop-Service -Name wuauserv -Force -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 3
     $ds = "$env:SystemRoot\SoftwareDistribution\DataStore"
@@ -365,17 +285,14 @@ function Clear-WUADataStore {
 }
 
 function Invoke-MECMTriggers {
-    Write-Log "Triggering MECM SU scan + deployment eval..."
-    # Must use -Arguments (hashtable) not -ArgumentList for SMS_Client.TriggerSchedule
+    Write-Log "Triggering MECM SU scan + deploy eval..."
     try {
-        Invoke-WmiMethod -Namespace 'ROOT\ccm' -Class 'SMS_Client' `
-            -Name 'TriggerSchedule' `
+        Invoke-WmiMethod -Namespace 'ROOT\ccm' -Class 'SMS_Client' -Name 'TriggerSchedule' `
             -Arguments @{ sScheduleID = '{00000000-0000-0000-0000-000000000113}' } `
             -ErrorAction Stop | Out-Null
         Write-Log "SU Scan triggered." 'SUCCESS'
         Start-Sleep -Seconds 10
-        Invoke-WmiMethod -Namespace 'ROOT\ccm' -Class 'SMS_Client' `
-            -Name 'TriggerSchedule' `
+        Invoke-WmiMethod -Namespace 'ROOT\ccm' -Class 'SMS_Client' -Name 'TriggerSchedule' `
             -Arguments @{ sScheduleID = '{00000000-0000-0000-0000-000000000108}' } `
             -ErrorAction Stop | Out-Null
         Write-Log "SU Deploy Eval triggered." 'SUCCESS'
@@ -385,115 +302,80 @@ function Invoke-MECMTriggers {
 function Schedule-Reboot {
     param([int]$DelaySec = 90)
     Write-Log "Scheduling reboot in ${DelaySec}s..."
-    # Remove existing task silently first
-    $null = schtasks.exe /Delete /TN 'MECM_Patch_Remediation_Reboot' /F 2>&1
-    $at = (Get-Date).AddSeconds($DelaySec).ToString('HH:mm:ss')
-    $null = schtasks.exe /Create /TN 'MECM_Patch_Remediation_Reboot' `
-        /TR 'shutdown.exe /r /t 10 /f' `
-        /SC ONCE /ST $at /RU SYSTEM /RL HIGHEST /F 2>&1
+    $null = & "$env:SystemRoot\System32\schtasks.exe" /Delete /TN 'MECM_Patch_Remediation_Reboot' /F 2>&1
+    $at   = (Get-Date).AddSeconds($DelaySec).ToString('HH:mm:ss')
+    $null = & "$env:SystemRoot\System32\schtasks.exe" /Create /TN 'MECM_Patch_Remediation_Reboot' `
+            /TR 'shutdown.exe /r /t 10 /f' /SC ONCE /ST $at /RU SYSTEM /RL HIGHEST /F 2>&1
     Write-Log "Reboot scheduled at $at." 'SUCCESS'
-}
-
-function Install-Update {
-    param([string]$Path)
-    Write-Log "Update installation requested: '$Path'"
-
-    # MECM Package ID: 3 letters + 5 digits e.g. PRD00042
-    if ($Path -match '^[A-Za-z]{3}\d{5}$') {
-        return Install-FromPackage -PackageID $Path.ToUpper()
-    }
-    # Single .msu file
-    if ($Path -match '\.msu$') {
-        if (-not (Test-Path $Path)) {
-            Write-Log "MSU not found: $Path" 'ERROR'; return 'FileNotFound'
-        }
-        return Install-MSU -FilePath $Path
-    }
-    # Folder of .msu files
-    if (Test-Path $Path -PathType Container) {
-        $files = @(Get-ChildItem -Path $Path -Filter '*.msu' -ErrorAction SilentlyContinue)
-        if (-not $files) { Write-Log "No .msu files in: $Path" 'WARN'; return 'NoMSUFound' }
-        $results = $files | ForEach-Object { Install-MSU -FilePath $_.FullName }
-        return $results -join ' | '
-    }
-    Write-Log "Invalid UpdatePath: '$Path'" 'ERROR'
-    return 'InvalidPath'
 }
 
 function Install-MSU {
     param([string]$FilePath)
-    $kb = if ($FilePath -match '(KB\d+)') { $Matches[1] } else { [System.IO.Path]::GetFileNameWithoutExtension($FilePath) }
-    Write-Log "Installing $kb from $FilePath..."
-
-    # Check already installed
+    $kb    = if ($FilePath -match '(KB\d+)') { $Matches[1] } else { [System.IO.Path]::GetFileNameWithoutExtension($FilePath) }
     $check = Test-KBInstalled -KB $kb
-    if ($check.Installed) {
-        Write-Log "$kb already installed." 'SUCCESS'
-        return "$kb-AlreadyInstalled"
-    }
+    if ($check.Installed) { Write-Log "$kb already installed." 'SUCCESS'; return "$kb-AlreadyInstalled" }
 
+    Write-Log "Installing $kb..."
     try {
-        $logArg = "/log:`"C:\Windows\Temp\wusa_$kb.log`""
         $p = Start-Process -FilePath "$env:SystemRoot\System32\wusa.exe" `
-             -ArgumentList "`"$FilePath`" /quiet /norestart $logArg" `
+             -ArgumentList "`"$FilePath`" /quiet /norestart /log:`"C:\Windows\Temp\wusa_$kb.log`"" `
              -Wait -PassThru -NoNewWindow -ErrorAction Stop
         switch ($p.ExitCode) {
             0       { Write-Log "$kb installed." 'SUCCESS'; return "$kb-Installed" }
             3010    { Write-Log "$kb installed, reboot needed." 'SUCCESS'; return "$kb-InstalledRebootNeeded" }
-            2359302 { Write-Log "$kb already installed (wusa 2359302)." 'SUCCESS'; return "$kb-AlreadyInstalled" }
-            default { Write-Log "$kb failed: wusa exit $($p.ExitCode)." 'ERROR'; return "$kb-Failed($($p.ExitCode))" }
+            2359302 { Write-Log "$kb already installed." 'SUCCESS'; return "$kb-AlreadyInstalled" }
+            default { Write-Log "$kb failed: exit $($p.ExitCode)." 'ERROR'; return "$kb-Failed($($p.ExitCode))" }
         }
-    } catch {
-        Write-Log "$kb exception: $_" 'ERROR'
-        return "$kb-Exception"
-    }
+    } catch { Write-Log "$kb exception: $_" 'ERROR'; return "$kb-Exception" }
 }
 
-function Install-FromPackage {
-    param([string]$PackageID)
-    Write-Log "Checking CCM cache for Package $PackageID..."
-    try {
-        $mgr    = New-Object -ComObject UIResource.UIResourceMgr -ErrorAction Stop
-        $cache  = $mgr.GetCacheInfo()
-        $cached = @($cache.GetCacheElements()) | Where-Object { $_.ContentID -eq $PackageID } | Select-Object -First 1
-
-        if (-not $cached) {
-            Write-Log "Package not in cache — triggering policy..."
-            Invoke-WmiMethod -Namespace 'ROOT\ccm' -Class 'SMS_Client' -Name 'TriggerSchedule' `
-                -Arguments @{ sScheduleID = '{00000000-0000-0000-0000-000000000021}' } | Out-Null
-            Start-Sleep -Seconds 30
-            $cached = @($cache.GetCacheElements()) | Where-Object { $_.ContentID -eq $PackageID } | Select-Object -First 1
-        }
-
-        if ($cached) {
-            $msuFiles = @(Get-ChildItem -Path $cached.Location -Filter '*.msu' -Recurse -ErrorAction SilentlyContinue)
-            if ($msuFiles) {
-                $results = $msuFiles | ForEach-Object { Install-MSU -FilePath $_.FullName }
-                return "Package($PackageID): $($results -join ' | ')"
+function Install-Update {
+    param([string]$Path)
+    Write-Log "Install-Update: '$Path'"
+    if ($Path -match '^[A-Za-z]{3}\d{5}$') {
+        # MECM Package ID
+        try {
+            $mgr    = New-Object -ComObject UIResource.UIResourceMgr -ErrorAction Stop
+            $cache  = $mgr.GetCacheInfo()
+            $cached = @($cache.GetCacheElements()) | Where-Object { $_.ContentID -eq $Path.ToUpper() } | Select-Object -First 1
+            if (-not $cached) {
+                Invoke-WmiMethod -Namespace 'ROOT\ccm' -Class 'SMS_Client' -Name 'TriggerSchedule' `
+                    -Arguments @{ sScheduleID = '{00000000-0000-0000-0000-000000000021}' } | Out-Null
+                Start-Sleep -Seconds 30
+                $cached = @($cache.GetCacheElements()) | Where-Object { $_.ContentID -eq $Path.ToUpper() } | Select-Object -First 1
             }
-            Write-Log "No .msu found in package content at $($cached.Location)." 'WARN'
-            return "Package($PackageID)-NoMSUInContent"
-        }
-        Write-Log "Package $PackageID not available after policy trigger." 'WARN'
-        return "Package($PackageID)-ContentUnavailable"
-    } catch {
-        Write-Log "Package install failed: $_" 'ERROR'
-        return "Package($PackageID)-Exception"
+            if ($cached) {
+                $files = @(Get-ChildItem -Path $cached.Location -Filter '*.msu' -Recurse -ErrorAction SilentlyContinue)
+                if ($files) { return ($files | ForEach-Object { Install-MSU $_.FullName }) -join ' | ' }
+                return "Package($Path)-NoMSUInContent"
+            }
+            return "Package($Path)-ContentUnavailable"
+        } catch { return "Package($Path)-Exception:$_" }
     }
+    if ($Path -match '\.msu$') {
+        if (-not (Test-Path $Path)) { return 'FileNotFound' }
+        return Install-MSU -FilePath $Path
+    }
+    if (Test-Path $Path -PathType Container) {
+        $files = @(Get-ChildItem -Path $Path -Filter '*.msu' -ErrorAction SilentlyContinue)
+        if (-not $files) { return 'NoMSUFound' }
+        return ($files | ForEach-Object { Install-MSU $_.FullName }) -join ' | '
+    }
+    return 'InvalidPath'
 }
 
 #endregion
 
 #region ── MAIN ────────────────────────────────────────────────────────────────
 
-# Initialise ALL state variables before anything else runs
-$actions       = [System.Collections.Generic.List[string]]::new()
+# All state variables initialised here — before any step
+$actions       = New-Object 'System.Collections.Generic.List[string]'
 $reboot        = $false
 $abort         = $false
 $updateResult  = 'NotRequested'
 $hexCodes      = 'None'
 $kbFinalStatus = 'NotChecked'
-$freeGBFinal   = $null
+$freeGBFinal   = 99
 
 Write-Log "════════════════════════════════════════════════════════"
 Write-Log "VDI Patch Remediation started on $env:COMPUTERNAME"
@@ -504,13 +386,12 @@ Write-Log "RebootDelay : ${RebootDelaySec}s"
 Write-Log "════════════════════════════════════════════════════════"
 
 # ── Step 0: KB pre-check ──────────────────────────────────────────────────────
-if ($KBNumber) {
+if ($KBNumber -and $KBNumber -ne '') {
     Write-Log "--- Step 0: KB pre-check ---"
     $kbID     = if ($KBNumber -match '^[Kk][Bb]') { $KBNumber.ToUpper() } else { "KB$KBNumber" }
     $kbStatus = Test-KBInstalled -KB $kbID
-
     if ($kbStatus.Installed) {
-        Write-Log "$kbID already installed — exiting." 'SUCCESS'
+        Write-Log "$kbID already installed — skipping remediation." 'SUCCESS'
         $kbFinalStatus = "AlreadyInstalled-$($kbStatus.Method)"
         $abort         = $true
         $actions.Add('KBAlreadyInstalled-Skipped')
@@ -521,116 +402,97 @@ if ($KBNumber) {
 }
 
 # ── Step 1: Read error codes ──────────────────────────────────────────────────
-$errorCodes = @()   # always an array, never $null
+$errorCodes = @()
 if (-not $abort) {
-    Write-Log "--- Step 1: Reading WU/CCM error codes ---"
-    $errorCodes = Get-UpdateErrorCodes   # returns [string[]] of hex codes, never $null
-    $hexCodes   = if ($errorCodes.Count -gt 0) { ($errorCodes | ForEach-Object { "0x$_" }) -join ', ' } else { 'None' }
-    Write-Log "Error codes: $hexCodes"
+    Write-Log "--- Step 1: Reading error codes ---"
+    $errorCodes = Get-UpdateErrorCodes
+    if ($errorCodes.Count -gt 0) {
+        $hexCodes = ($errorCodes | ForEach-Object { "0x$_" }) -join ', '
+    }
+    Write-Log "Hex codes: $hexCodes"
 }
 
 # ── Step 2: Disk space ────────────────────────────────────────────────────────
 if (-not $abort) {
-    Write-Log "--- Step 2: Disk space check ---"
-    $freeGB = Get-FreeDiskGB
-    Write-Log "C: free: ${freeGB} GB (minimum: ${MinFreeGB} GB)"
-
-    $diskLow = ($freeGB -is [double] -or $freeGB -is [int]) -and ($freeGB -lt $MinFreeGB)
+    Write-Log "--- Step 2: Disk space ---"
+    $freeGB  = Get-FreeDiskGB
+    $diskLow = ($freeGB -lt $MinFreeGB)
+    Write-Log "C: free ${freeGB}GB  (min ${MinFreeGB}GB)  low=$diskLow"
 
     if (($errorCodes -contains $EC_DISK_FULL) -or $diskLow) {
-        Write-Log "Disk below threshold — running cleanup..." 'WARN'
+        Write-Log "Running disk cleanup..." 'WARN'
         $freeGB = Invoke-DiskCleanup
         $actions.Add('DiskCleanup')
-
         if ($freeGB -lt $MinFreeGB) {
-            Write-Log "ABORT: ${freeGB} GB after cleanup — still below ${MinFreeGB} GB." 'ERROR'
+            Write-Log "ABORT: ${freeGB}GB still below ${MinFreeGB}GB." 'ERROR'
             $actions.Add("DiskInsufficient-${freeGB}GB")
             $abort = $true
         } else {
-            Write-Log "Disk now ${freeGB} GB — OK." 'SUCCESS'
+            Write-Log "Disk OK: ${freeGB}GB." 'SUCCESS'
             $reboot = $true
         }
     }
 }
 
-# ── Step 3: Error-code-driven remediation ─────────────────────────────────────
+# ── Step 3: Remediation ───────────────────────────────────────────────────────
 if (-not $abort) {
     Write-Log "--- Step 3: Remediation ---"
 
     if ($errorCodes -contains $EC_SHUTDOWN) {
-        Write-Log "0x8007045B: Shutdown-in-progress — clean reboot will fix." 'WARN'
-        $reboot = $true
-        $actions.Add('0x8007045B-NeedReboot')
+        Write-Log "0x8007045B: Shutdown-in-progress — reboot will fix." 'WARN'
+        $reboot = $true; $actions.Add('0x8007045B-NeedReboot')
     }
-
     if ($errorCodes -contains $EC_PENDINGREBOOT) {
-        Write-Log "0x87D00651: Pending reboot blocking updates." 'WARN'
-        $reboot = $true
-        $actions.Add('0x87D00651-PendingReboot')
+        Write-Log "0x87D00651: Pending reboot." 'WARN'
+        $reboot = $true; $actions.Add('0x87D00651-PendingReboot')
     }
-
     if ($errorCodes -contains $EC_ACCESS_DENIED) {
-        Write-Log "0x80070005: Access denied — ACL reset + WUA reset." 'WARN'
-        Reset-SDACL
-        Reset-WUA
-        $reboot = $true
-        $actions.Add('0x80070005-ACL+WUAReset')
+        Write-Log "0x80070005: Access denied — ACL + WUA reset." 'WARN'
+        Reset-SDACL; Reset-WUA
+        $reboot = $true; $actions.Add('0x80070005-ACL+WUAReset')
     }
-
     if ($errorCodes -contains $EC_ALLUPDATES) {
         Write-Log "0x80240022: All updates failed — WUA reset." 'WARN'
         Reset-WUA
-        $reboot = $true
-        $actions.Add('0x80240022-WUAReset')
+        $reboot = $true; $actions.Add('0x80240022-WUAReset')
     }
-
     if ($errorCodes -contains $EC_UNEXPECTED) {
-        Write-Log "0x8000FFFF: Catastrophic failure — WUA reset + DISM." 'WARN'
-        Reset-WUA
-        $dr = Invoke-DISMRepair
-        $reboot = $true
-        $actions.Add("0x8000FFFF-WUA+DISM($dr)")
+        Write-Log "0x8000FFFF: Catastrophic — WUA reset + DISM." 'WARN'
+        Reset-WUA; $dr = Invoke-DISMRepair
+        $reboot = $true; $actions.Add("0x8000FFFF-WUA+DISM($dr)")
     }
 
-    $cbsCodes = $errorCodes | Where-Object { $_ -in @($EC_CBS_TRANS, $EC_COMP_STORE, $EC_MISSING_DLL) }
-    if ($cbsCodes) {
+    $cbsCodes = @($errorCodes | Where-Object { $_ -in @($EC_CBS_TRANS,$EC_COMP_STORE,$EC_MISSING_DLL) })
+    if ($cbsCodes.Count -gt 0) {
         $hex = ($cbsCodes | ForEach-Object { "0x$_" }) -join '+'
-        Write-Log "$hex: CBS/component corruption — DISM RestoreHealth." 'WARN'
+        Write-Log "$hex: CBS corruption — DISM." 'WARN'
         $dr = Invoke-DISMRepair
-        $reboot = $true
-        $actions.Add("CBS($hex)-DISM($dr)")
-        if ($dr -eq 'Failed') {
-            Write-Log "DISM failed — VDI may need recomposing." 'ERROR'
-        }
+        $reboot = $true; $actions.Add("CBS($hex)-DISM($dr)")
     }
 
     if (($errorCodes -contains $EC_KEY_NOTFOUND) -or ($errorCodes -contains $EC_DATA_CONTRACT)) {
         $which = @()
         if ($errorCodes -contains $EC_KEY_NOTFOUND)  { $which += '0x80240008' }
         if ($errorCodes -contains $EC_DATA_CONTRACT) { $which += '0x80240439' }
-        Write-Log "$($which -join '+') — clearing WUA DataStore." 'WARN'
+        Write-Log "$($which -join '+') — clearing DataStore." 'WARN'
         Clear-WUADataStore
-        $reboot = $true
-        $actions.Add("$($which -join '+')-DataStoreCleared")
+        $reboot = $true; $actions.Add("$($which -join '+')-DataStoreCleared")
     }
-
     if ($errorCodes -contains $EC_SUPERSEDED) {
-        Write-Log "0x8007066A: Superseded update — clears on next scan." 'WARN'
+        Write-Log "0x8007066A: Superseded — clears on next scan." 'WARN'
         $actions.Add('0x8007066A-Noted')
     }
-
     if ($errorCodes.Count -eq 0) {
-        Write-Log "No error codes — triggering policy only."
         $actions.Add('NoErrorCodes-PolicyTriggerOnly')
     }
 }
 
-# ── Step 4: Optional update install ───────────────────────────────────────────
-if (-not $abort -and $UpdatePath) {
+# ── Step 4: Update install ────────────────────────────────────────────────────
+if ((-not $abort) -and ($UpdatePath -and $UpdatePath -ne '')) {
     Write-Log "--- Step 4: Update install ---"
     $updateResult = Install-Update -Path $UpdatePath
     Write-Log "Update result: $updateResult"
-    if ($updateResult -notmatch 'AlreadyInstalled|NotRequested|Failed|Exception|NotFound|Invalid|Unavailable|NoMSU') {
+    if ($updateResult -notmatch 'AlreadyInstalled|NotRequested|Failed|Exception|NotFound|Invalid|NoMSU|Unavailable') {
         $reboot = $true
     }
     $actions.Add("UpdateInstall:$updateResult")
@@ -646,53 +508,51 @@ if (-not $abort) {
 }
 
 # ── Step 6: Reboot ────────────────────────────────────────────────────────────
-Write-Log "--- Step 6: Reboot ---"
-if ($reboot -and -not $abort) {
-    # Use schtasks instead of Register-ScheduledTask for broader compatibility
+Write-Log "--- Step 6: Reboot (reboot=$reboot abort=$abort) ---"
+if ($reboot -and (-not $abort)) {
     Schedule-Reboot -DelaySec $RebootDelaySec
     $actions.Add("RebootIn${RebootDelaySec}s")
-} elseif ($abort -and $kbFinalStatus -notmatch 'AlreadyInstalled') {
-    Write-Log "Reboot skipped — aborted (disk space)." 'WARN'
+} elseif ($abort -and ($kbFinalStatus -match 'AlreadyInstalled')) {
+    Write-Log "No reboot — KB already installed." 'INFO'
 } elseif ($abort) {
-    Write-Log "Reboot skipped — KB already installed." 'INFO'
+    Write-Log "No reboot — aborted (disk space)." 'WARN'
 } else {
     Write-Log "No reboot needed." 'INFO'
 }
 
 # ── Post-remediation KB check ─────────────────────────────────────────────────
-if ($KBNumber -and $kbFinalStatus -eq 'NotChecked') {
-    $kbID2      = if ($KBNumber -match '^[Kk][Bb]') { $KBNumber.ToUpper() } else { "KB$KBNumber" }
-    $kbFinal    = Test-KBInstalled -KB $kbID2
+if (($KBNumber -and $KBNumber -ne '') -and ($kbFinalStatus -eq 'NotChecked')) {
+    $kbID2     = if ($KBNumber -match '^[Kk][Bb]') { $KBNumber.ToUpper() } else { "KB$KBNumber" }
+    $kbFinal   = Test-KBInstalled -KB $kbID2
     $kbFinalStatus = if ($kbFinal.Installed) { "Installed-$($kbFinal.Method)" } else { 'StillMissing' }
-    Write-Log "Post-remediation KB status: $kbFinalStatus"
+    Write-Log "Post-remediation KB: $kbFinalStatus"
 }
 
-# ── Summary ───────────────────────────────────────────────────────────────────
+# ── Summary and JSON output ───────────────────────────────────────────────────
 $freeGBFinal = Get-FreeDiskGB
+$kbOut = if ($KBNumber -and $KBNumber -ne '') {
+    if ($KBNumber -match '^[Kk][Bb]') { $KBNumber.ToUpper() } else { "KB$KBNumber" }
+} else { 'N/A' }
+
 Write-Log "════════════════════════════════════════════════════════"
-Write-Log "Complete — $env:COMPUTERNAME"
-Write-Log "ErrorCodes  : $hexCodes"
-Write-Log "Actions     : $($actions -join ' | ')"
-Write-Log "KBStatus    : $kbFinalStatus"
-Write-Log "UpdateResult: $updateResult"
-Write-Log "Reboot      : $reboot"
-Write-Log "Aborted     : $abort"
-Write-Log "FreeGB      : $freeGBFinal"
+Write-Log "COMPLETE $env:COMPUTERNAME | KB=$kbOut | Status=$kbFinalStatus"
+Write-Log "Codes=$hexCodes | Actions=$($actions -join ' | ')"
+Write-Log "Reboot=$reboot | Abort=$abort | FreeGB=$freeGBFinal"
 Write-Log "════════════════════════════════════════════════════════"
 
-# Single Write-Output — the ONLY thing MECM captures in Detailed Output
-$kbOut = if ($KBNumber) { if ($KBNumber -match '^[Kk][Bb]') { $KBNumber.ToUpper() } else { "KB$KBNumber" } } else { 'N/A' }
-Write-Output ([PSCustomObject]@{
-    Computer        = $env:COMPUTERNAME
-    KBNumber        = $kbOut
-    KBStatus        = $kbFinalStatus
-    ErrorCodes      = $hexCodes
-    Actions         = $actions -join ' | '
-    UpdateInstalled = $updateResult
-    RebootScheduled = $reboot
-    Aborted         = $abort
-    FreeGB          = $freeGBFinal
-    LogPath         = $LogPath
-} | ConvertTo-Json -Depth 2 -Compress)
+# This is the ONLY Write-Output in the script.
+# MECM captures this as the Script Output in the results pane.
+$jsonOut = '{"Computer":"' + $env:COMPUTERNAME + '",' +
+           '"KBNumber":"' + $kbOut + '",' +
+           '"KBStatus":"' + $kbFinalStatus + '",' +
+           '"ErrorCodes":"' + $hexCodes + '",' +
+           '"Actions":"' + ($actions -join ' | ') + '",' +
+           '"UpdateInstalled":"' + $updateResult + '",' +
+           '"RebootScheduled":' + ($reboot.ToString().ToLower()) + ',' +
+           '"Aborted":' + ($abort.ToString().ToLower()) + ',' +
+           '"FreeGB":' + $freeGBFinal + ',' +
+           '"LogPath":"' + $LogPath + '"}'
+
+Write-Output $jsonOut
 
 #endregion
