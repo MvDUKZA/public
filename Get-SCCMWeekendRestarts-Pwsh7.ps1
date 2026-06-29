@@ -1,16 +1,22 @@
-#Requires -Version 5.1
+#Requires -Version 7.0
 <#
 .SYNOPSIS
-    Enumerates SCCM device collections, lets you pick one, then reports how many
-    times each machine in that collection was restarted on a Saturday or Sunday.
+    (PowerShell 7+) Enumerates SCCM device collections, lets you pick one, then
+    reports how many times each machine in that collection was restarted on a
+    Saturday or Sunday.
 
 .DESCRIPTION
+    PowerShell 7 edition of Get-SCCMWeekendRestarts.ps1. Uses
+    ForEach-Object -Parallel (-ThrottleLimit) instead of a manual runspace pool,
+    and a picker that degrades gracefully across PS7 hosts.
+
     It targets ONE specific weekend (a single Saturday + Sunday). With no date
     supplied it defaults to the *previous* weekend relative to today.
 
     Workflow:
       1. Connects to the SCCM site server WMI namespace (root\SMS\site_<code>).
-      2. Lists all device collections in an Out-GridView picker (single-select).
+      2. Lists device collections in a picker (single-select):
+           Out-GridView  →  Out-ConsoleGridView  →  numbered console menu.
       3. Resolves the collection's members (SMS_FullCollectionMembership).
       4. For every member it opens a CIM session (WSMan, falling back to DCOM)
          and reads the System event log for restart events that fall on the
@@ -36,7 +42,7 @@
     SCCM Site Code (e.g. PS1). Prompted if omitted.
 
 .PARAMETER CollectionName
-    Device Collection name. Selected via Out-GridView if omitted.
+    Device Collection name. Selected via the picker if omitted.
 
 .PARAMETER WeekendOf
     Any date that falls in the weekend you want to check; the script resolves
@@ -50,25 +56,29 @@
 .PARAMETER OutputPath
     Folder for the CSV output. Defaults to the current directory.
 
-.PARAMETER MaxConcurrent
-    Parallel runspaces. Default: 20.
+.PARAMETER ThrottleLimit
+    Maximum machines queried in parallel. Default: 20.
 
 .EXAMPLE
-    .\Get-SCCMWeekendRestarts.ps1
+    .\Get-SCCMWeekendRestarts-Pwsh7.ps1
     # Checks the previous weekend.
 
 .EXAMPLE
-    .\Get-SCCMWeekendRestarts.ps1 -SiteServer SCCM-MP01.corp.local -SiteCode PS1 `
-        -CollectionName "All Workstations - Prod" -WeekendOf 2026-06-13
+    .\Get-SCCMWeekendRestarts-Pwsh7.ps1 -SiteServer SCCM-MP01.corp.local -SiteCode PS1 `
+        -CollectionName "All Workstations - Prod" -WeekendOf 2026-06-13 -ThrottleLimit 40
 
 .EXAMPLE
-    .\Get-SCCMWeekendRestarts.ps1 -CountBoots
+    .\Get-SCCMWeekendRestarts-Pwsh7.ps1 -CountBoots
 
 .NOTES
     Version : 1.0
-    Requires: Read rights on the SCCM site WMI namespace (root\SMS\site_<code>).
+    Requires: PowerShell 7.0+.
+              Read rights on the SCCM site WMI namespace (root\SMS\site_<code>).
               WinRM or DCOM access to the target machines for the event-log read.
               An account with rights to read the remote System event log.
+    Note    : Out-GridView / Out-ConsoleGridView are optional. If neither is
+              present the script falls back to a numbered console menu, so it
+              works on a headless server too.
 #>
 
 [CmdletBinding()]
@@ -79,17 +89,17 @@ param(
     [datetime]$WeekendOf,
     [switch]  $CountBoots,
     [string]$OutputPath    = (Get-Location).Path,
-    [int]   $MaxConcurrent = 20
+    [int]   $ThrottleLimit = 20
 )
 
 Set-StrictMode -Version Latest
-$ErrorActionPreference = 'SilentlyContinue'
+$ErrorActionPreference = 'Stop'
 
 #region ── Banner ──────────────────────────────────────────────────────────────
 Clear-Host
 Write-Host ""
 Write-Host "  ╔══════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
-Write-Host "  ║         SCCM Weekend Restart Counter  v1.0               ║" -ForegroundColor Cyan
+Write-Host "  ║      SCCM Weekend Restart Counter  v1.0  (PS7)           ║" -ForegroundColor Cyan
 Write-Host "  ║   Collection → per-machine Saturday / Sunday restarts    ║" -ForegroundColor Cyan
 Write-Host "  ╚══════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
 Write-Host ""
@@ -102,6 +112,42 @@ function Read-Prompt {
     $val     = Read-Host "  $display"
     if ([string]::IsNullOrWhiteSpace($val) -and $Default) { return $Default }
     return $val.Trim()
+}
+#endregion
+
+#region ── Helper: single-select picker (GUI → console grid → menu) ───────────
+function Select-OneItem {
+    param(
+        [Parameter(Mandatory)] [object[]]$Items,
+        [Parameter(Mandatory)] [string]  $Title,
+        [string[]]$DisplayProperty
+    )
+
+    # 1) Out-GridView (Windows + Microsoft.PowerShell.GraphicalTools)
+    if (Get-Command Out-GridView -ErrorAction SilentlyContinue) {
+        try { return ($Items | Out-GridView -Title $Title -OutputMode Single) } catch { }
+    }
+    # 2) Out-ConsoleGridView (Microsoft.PowerShell.ConsoleGuiTools) – works headless
+    if (Get-Command Out-ConsoleGridView -ErrorAction SilentlyContinue) {
+        try { return ($Items | Out-ConsoleGridView -Title $Title -OutputMode Single) } catch { }
+    }
+    # 3) Plain numbered console menu
+    Write-Host ""
+    Write-Host "  $Title" -ForegroundColor Cyan
+    for ($i = 0; $i -lt $Items.Count; $i++) {
+        $label = if ($DisplayProperty) {
+            ($DisplayProperty | ForEach-Object { $Items[$i].$_ }) -join '  |  '
+        } else { "$($Items[$i])" }
+        Write-Host ("   [{0,3}] {1}" -f ($i + 1), $label)
+    }
+    while ($true) {
+        $pick = Read-Host "  Enter number (1-$($Items.Count)), or blank to cancel"
+        if ([string]::IsNullOrWhiteSpace($pick)) { return $null }
+        if ($pick -as [int] -and [int]$pick -ge 1 -and [int]$pick -le $Items.Count) {
+            return $Items[[int]$pick - 1]
+        }
+        Write-Host "  [!] Invalid selection." -ForegroundColor Yellow
+    }
 }
 #endregion
 
@@ -135,32 +181,30 @@ Write-Host ("  [*] Weekend : Sat {0:yyyy-MM-dd} + Sun {1:yyyy-MM-dd}" -f $target
 Write-Host "  [*] Counting $eventBasis." -ForegroundColor DarkCyan
 #endregion
 
-#region ── Step 2 – Collection picker (Out-GridView) ─────────────────────────
+#region ── Step 2 – Collection picker ─────────────────────────────────────────
 $CollectionID = $null
 if (-not $CollectionName) {
     Write-Host ""
     Write-Host "  [*] Fetching device collections from $SiteServer ..." -ForegroundColor Cyan
     try {
-        $allCollections = Get-WmiObject -ComputerName $SiteServer `
-                                        -Namespace $sccmNamespace `
-                                        -Class SMS_Collection `
-                                        -Filter "CollectionType = 2" `
-                                        -ErrorAction Stop |
+        $allCollections = Get-CimInstance -ComputerName $SiteServer `
+                                          -Namespace $sccmNamespace `
+                                          -ClassName SMS_Collection `
+                                          -Filter "CollectionType = 2" `
+                                          -ErrorAction Stop |
                           Select-Object Name,
                                         CollectionID,
                                         @{N='Members';     E={ $_.MemberCount }},
                                         Comment,
-                                        @{N='LastRefresh'; E={
-                                            [Management.ManagementDateTimeConverter]::ToDateTime($_.LastRefreshTime)
-                                        }} |
+                                        @{N='LastRefresh'; E={ $_.LastRefreshTime }} |
                           Sort-Object Name
 
         if (-not $allCollections) { throw "No device collections returned." }
-        Write-Host "  [+] $($allCollections.Count) collections found – select one and click OK." -ForegroundColor Green
+        Write-Host "  [+] $($allCollections.Count) collections found – select one." -ForegroundColor Green
 
-        $sel = $allCollections | Out-GridView `
-                   -Title "Select Device Collection  (single-select → OK)" `
-                   -OutputMode Single
+        $sel = Select-OneItem -Items $allCollections `
+                              -Title "Select Device Collection (single-select)" `
+                              -DisplayProperty Name, CollectionID, Members
 
         if (-not $sel) { Write-Error "No collection selected."; exit 1 }
         $CollectionName = $sel.Name
@@ -182,12 +226,12 @@ $machines = @()
 try {
     if (-not $CollectionID) {
         $cq = "SELECT CollectionID FROM SMS_Collection WHERE Name = '$($CollectionName -replace "'","''")'"
-        $co = Get-WmiObject -ComputerName $SiteServer -Namespace $sccmNamespace -Query $cq -ErrorAction Stop
+        $co = Get-CimInstance -ComputerName $SiteServer -Namespace $sccmNamespace -Query $cq -ErrorAction Stop
         if (-not $co) { throw "Collection '$CollectionName' not found." }
         $CollectionID = $co.CollectionID
     }
     $mq       = "SELECT Name FROM SMS_FullCollectionMembership WHERE CollectionID = '$CollectionID'"
-    $members  = Get-WmiObject -ComputerName $SiteServer -Namespace $sccmNamespace -Query $mq -ErrorAction Stop
+    $members  = Get-CimInstance -ComputerName $SiteServer -Namespace $sccmNamespace -Query $mq -ErrorAction Stop
     $machines = @($members | Select-Object -ExpandProperty Name | Sort-Object -Unique)
     Write-Host "  [+] $($machines.Count) machines in collection." -ForegroundColor Green
 }
@@ -206,10 +250,15 @@ catch {
 if (-not $machines -or $machines.Count -eq 0) { Write-Error "No machines to process."; exit 1 }
 #endregion
 
-#region ── Per-machine worker scriptblock ────────────────────────────────────
-#  Runs inside each runspace. Self-contained – no outer-scope references.
-$worker = {
-    param($MachineName, $WinStart, $WinEnd, $CountBoots)
+#region ── Parallel query (ForEach-Object -Parallel) ─────────────────────────
+Write-Host ""
+Write-Host "  [*] Querying $($machines.Count) machine(s), up to $ThrottleLimit in parallel ..." -ForegroundColor Cyan
+
+$results = $machines | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
+    $MachineName = $_
+    $winStart    = $using:targetSat       # Saturday 00:00 (inclusive)
+    $winEnd      = $using:windowEnd        # Monday   00:00 (exclusive)
+    $CountBoots  = $using:CountBoots
 
     $r = [PSCustomObject]@{
         Machine          = $MachineName
@@ -219,10 +268,10 @@ $worker = {
         WeekendRestarts  = 0
         LastWeekendBoot  = $null
         Notes            = ''
-        _Detail          = @()        # carried back, expanded into the detail CSV
+        Detail           = @()        # nested – expanded into the detail CSV later
     }
 
-    # Quick reachability check (ping) – avoids long CIM timeouts on dead hosts.
+    # Quick reachability check – avoids long CIM timeouts on dead hosts.
     if (-not (Test-Connection -ComputerName $MachineName -Count 1 -Quiet -ErrorAction SilentlyContinue)) {
         $r.Notes = 'No ping response'
         return $r
@@ -245,14 +294,15 @@ $worker = {
     try {
         # Bound the query server-side to just the target weekend so we don't
         # pull the entire System log over the wire.
-        $dmtfStart = [Management.ManagementDateTimeConverter]::ToDmtfDateTime($WinStart)
-        $dmtfEnd   = [Management.ManagementDateTimeConverter]::ToDmtfDateTime($WinEnd)
+        $dmtfStart = [Management.ManagementDateTimeConverter]::ToDmtfDateTime($winStart)
+        $dmtfEnd   = [Management.ManagementDateTimeConverter]::ToDmtfDateTime($winEnd)
 
         $eventCode = if ($CountBoots) { 6005 } else { 1074 }
         $filter    = "Logfile='System' AND EventCode=$eventCode AND TimeWritten>='$dmtfStart' AND TimeWritten<'$dmtfEnd'"
 
-        $evts = Get-CimInstance -CimSession $cimSess -ClassName Win32_NTLogEvent `
-                    -Filter $filter -ErrorAction Stop
+        $evts   = Get-CimInstance -CimSession $cimSess -ClassName Win32_NTLogEvent `
+                      -Filter $filter -ErrorAction Stop
+        $detail = [System.Collections.Generic.List[object]]::new()
 
         foreach ($e in @($evts)) {
             $when = $e.TimeGenerated
@@ -269,20 +319,21 @@ $worker = {
             $dow = $when.DayOfWeek
             if ($dow -eq 'Saturday' -or $dow -eq 'Sunday') {
                 if ($dow -eq 'Saturday') { $r.SaturdayRestarts++ } else { $r.SundayRestarts++ }
-                $r._Detail += [PSCustomObject]@{
+                $detail.Add([PSCustomObject]@{
                     Machine   = $MachineName
                     EventTime = $when.ToString('yyyy-MM-dd HH:mm:ss')
                     DayOfWeek = "$dow"
                     EventID   = $e.EventCode
                     Source    = "$($e.SourceName)"
                     Message   = ("$($e.Message)" -replace '\s+', ' ').Trim()
-                }
+                })
                 if (-not $r.LastWeekendBoot -or $when -gt [datetime]$r.LastWeekendBoot) {
                     $r.LastWeekendBoot = $when.ToString('yyyy-MM-dd HH:mm:ss')
                 }
             }
         }
 
+        $r.Detail          = $detail.ToArray()
         $r.WeekendRestarts = $r.SaturdayRestarts + $r.SundayRestarts
         if (-not $r.Notes) { $r.Notes = 'OK' }
     }
@@ -291,34 +342,6 @@ $worker = {
 
     return $r
 }
-#endregion
-
-#region ── Parallel execution via runspace pool ──────────────────────────────
-Write-Host ""
-Write-Host "  [*] Querying $($machines.Count) machine(s) with up to $MaxConcurrent in parallel ..." -ForegroundColor Cyan
-
-$pool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $MaxConcurrent)
-$pool.Open()
-
-$jobs = [System.Collections.Generic.List[PSCustomObject]]::new()
-foreach ($m in $machines) {
-    $ps = [System.Management.Automation.PowerShell]::Create()
-    $ps.RunspacePool = $pool
-    [void]$ps.AddScript($worker).AddArgument($m).AddArgument($targetSat).AddArgument($windowEnd).AddArgument([bool]$CountBoots)
-    $jobs.Add([PSCustomObject]@{ PS = $ps; Handle = $ps.BeginInvoke(); Machine = $m })
-}
-
-$results = [System.Collections.Generic.List[PSCustomObject]]::new()
-$done    = 0
-foreach ($j in $jobs) {
-    try   { $res = $j.PS.EndInvoke($j.Handle); if ($res) { $results.Add($res) } }
-    catch { $results.Add([PSCustomObject]@{ Machine=$j.Machine; Online=$false; SaturdayRestarts=0; SundayRestarts=0; WeekendRestarts=0; LastWeekendBoot=$null; Notes="Runspace error: $($_.Exception.Message)"; _Detail=@() }) }
-    finally { $j.PS.Dispose() }
-    $done++
-    Write-Progress -Activity "Reading event logs" -Status "$done / $($jobs.Count)" -PercentComplete (($done / $jobs.Count) * 100)
-}
-Write-Progress -Activity "Reading event logs" -Completed
-$pool.Close(); $pool.Dispose()
 #endregion
 
 #region ── Output ────────────────────────────────────────────────────────────
@@ -331,7 +354,7 @@ $summary = $results |
     Select-Object Machine, Online, SaturdayRestarts, SundayRestarts, WeekendRestarts, LastWeekendBoot, Notes |
     Sort-Object WeekendRestarts -Descending
 
-$detail  = $results | ForEach-Object { $_._Detail } | Sort-Object Machine, EventTime
+$detail  = $results | ForEach-Object { $_.Detail } | Sort-Object Machine, EventTime
 
 $summary | Export-Csv -Path $summaryPath -NoTypeInformation -Encoding UTF8
 if ($detail) { $detail | Export-Csv -Path $detailPath -NoTypeInformation -Encoding UTF8 }
@@ -340,9 +363,9 @@ Write-Host ""
 Write-Host "  ── Per-machine weekend restart summary ─────────────────────" -ForegroundColor Cyan
 $summary | Format-Table -AutoSize
 
-$totSat     = ($results | Measure-Object SaturdayRestarts -Sum).Sum
-$totSun     = ($results | Measure-Object SundayRestarts   -Sum).Sum
-$onlineCnt  = @($results | Where-Object Online).Count
+$totSat    = ($results | Measure-Object SaturdayRestarts -Sum).Sum
+$totSun    = ($results | Measure-Object SundayRestarts   -Sum).Sum
+$onlineCnt = @($results | Where-Object Online).Count
 
 Write-Host ""
 Write-Host ("  ── Totals — '{0}'  (Sat {1:yyyy-MM-dd} + Sun {2:yyyy-MM-dd}) ──" -f $CollectionName, $targetSat, $targetSun) -ForegroundColor Cyan
