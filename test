@@ -1,20 +1,12 @@
 $base = 'https://appsmcm101fp.iprod.local/AdminService'
 
-Write-Host "`n--- Test 1: app list query ---" -ForegroundColor Cyan
+Write-Host "`n--- A: filter form (no parens) ---" -ForegroundColor Cyan
 try {
-    $r1 = Invoke-RestMethod -Uri "$base/wmi/SMS_ApplicationLatest?`$select=CI_ID,LocalizedDisplayName" -UseDefaultCredentials
-    Write-Host "OK - returned $($r1.value.Count) apps" -ForegroundColor Green
+    $a = Invoke-RestMethod -Uri "$base/wmi/SMS_Application?`$filter=CI_ID eq 16796464&`$select=SDMPackageXML" -UseDefaultCredentials
+    Write-Host "OK - got $($a.value.Count) row(s), XML length: $($a.value[0].SDMPackageXML.Length)" -ForegroundColor Green
 } catch { Write-Host "FAIL: $($_.Exception.Message)" -ForegroundColor Red }
 
-Write-Host "`n--- Test 2: per-app detail query (suspected failure) ---" -ForegroundColor Cyan
-try {
-    $r2 = Invoke-RestMethod -Uri "$base/wmi/SMS_Application(16796464)?`$select=SDMPackageXML" -UseDefaultCredentials
-    Write-Host "OK - XML length: $($r2.value.SDMPackageXML.Length)" -ForegroundColor Green
-} catch { Write-Host "FAIL: $($_.Exception.Message)" -ForegroundColor Red }
-
-Write-Host "`n--- Test 3: detail query via [System.Uri] (the fix) ---" -ForegroundColor Cyan
-try {
-    $u = [System.Uri]::new("$base/wmi/SMS_Application(16796464)?`$select=SDMPackageXML")
-    $r3 = Invoke-RestMethod -Uri $u -UseDefaultCredentials
-    Write-Host "OK - XML length: $($r3.value.SDMPackageXML.Length)" -ForegroundColor Green
-} catch { Write-Host "FAIL: $($_.Exception.Message)" -ForegroundColor Red }
+Write-Host "`n--- B: curl.exe with parens ---" -ForegroundColor Cyan
+$out = curl.exe -s --negotiate -u : "$base/wmi/SMS_Application(16796464)?`$select=SDMPackageXML"
+if ($out -match 'SDMPackageXML') { Write-Host "OK - curl returned the XML" -ForegroundColor Green }
+else { Write-Host "FAIL: $out" -ForegroundColor Red }
