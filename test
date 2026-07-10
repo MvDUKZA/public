@@ -14,3 +14,7 @@ else { Write-Host "FAIL: $out" -ForegroundColor Red }
 
 
 curl.exe -s --negotiate -u : "https://appsmcm101fp.iprod.local/AdminService/wmi/SMS_Application(16796464)?`$select=SDMPackageXML"
+
+curl.exe -s --negotiate -u : "https://appsmcm101fp.iprod.local/AdminService/wmi/SMS_Application(16796464)"
+
+curl.exe -s --negotiate -u : "https://appsmcm101fp.iprod.local/AdminService/wmi/SMS_Application(16796464)/SDMPackageXML"
