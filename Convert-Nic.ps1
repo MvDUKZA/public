@@ -29,6 +29,7 @@
     HELD             swapped but Horizon never said AVAILABLE - confirmed back in maintenance
     FAILED-NOT-HELD  unhealthy AND could not be put back in maintenance - STILL BOOKABLE, fix now
     BOTH-NICS        add worked, remove did not - VM powered on but health not verified; left in maintenance
+    UNEXPECTED-NICS  removal failed and the adapter set is neither converted nor both - review by hand
     FAILED           see Detail - LEFT IN MAINTENANCE
     SKIPPED          in use, or not a single-E1000 VM
     ALREADY          already a single VMXNET3
@@ -211,15 +212,25 @@ try {
                 }
                 else {
                     Start-VM -VM (Get-VM $name) -Confirm:$false -EA SilentlyContinue | Out-Null
-                    $types = ($now | % Type) -join ';'
-                    if (WaitPower $name 'PoweredOn' $PowerWaitSec) {
-                        Write-Host "    BOTH-NICS - VM powered on with: $types. Left in maintenance." -F Yellow
-                        Log $name 'BOTH-NICS' "E1000 removal failed: $rmErr | Adapters now: $types | Powered on, health not verified"
-                    } else {
-                        Write-Host "    FAILED - E1000 removal failed and the VM did not power on" -F Red
-                        Log $name 'FAILED' "E1000 removal failed: $rmErr | Adapters now: $types | VM did not power back on"
+                    $types     = ($now | ForEach-Object { $_.Type }) -join ';'
+                    $poweredOn = WaitPower $name 'PoweredOn' $PowerWaitSec
+
+                    # BOTH-NICS means exactly that: one vmxnet3 + one legacy, nothing else.
+                    $hasBothNics = ($now.Count -eq 2 -and $legNow.Count -eq 1 -and $vmxNow.Count -eq 1)
+
+                    if ($poweredOn -and $hasBothNics) {
+                        Write-Host "    BOTH-NICS - powered on with e1000 + vmxnet3. Left in maintenance." -F Yellow
+                        Log $name 'BOTH-NICS' "E1000 removal failed: $rmErr | Adapters: $types | Powered on, health not verified"
                     }
-                    continue    # left in maintenance either way
+                    elseif ($poweredOn) {
+                        Write-Host "    UNEXPECTED-NICS - powered on with: $types. Left in maintenance." -F Red
+                        Log $name 'UNEXPECTED-NICS' "E1000 removal failed: $rmErr | Adapters: $types | Powered on, needs manual review"
+                    }
+                    else {
+                        Write-Host "    FAILED - removal failed and the VM did not power on ($types)" -F Red
+                        Log $name 'FAILED' "E1000 removal failed: $rmErr | Adapters: $types | VM did not power back on"
+                    }
+                    continue    # left in maintenance in all three cases
                 }
             }
             Write-Host "    e1000 removed" -F DarkGray
@@ -294,7 +305,7 @@ try {
     Write-Host ""
     Write-Host "Log: $LogCsv" -F Green
 
-    $stuck = Import-Csv $LogCsv | Where-Object Status -in 'FAILED','HELD','BOTH-NICS','FAILED-NOT-HELD'
+    $stuck = Import-Csv $LogCsv | Where-Object Status -in 'FAILED','HELD','BOTH-NICS','UNEXPECTED-NICS','FAILED-NOT-HELD'
     if ($stuck) {
         Write-Host ""
         Write-Host "NEEDS ATTENTION:" -F Red
