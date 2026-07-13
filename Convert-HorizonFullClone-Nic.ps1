@@ -3,55 +3,103 @@
     --------------------------------
     Cold-swaps E1000/E1000e -> VMXNET3 on Horizon FULL CLONE desktops.
 
-    Run it:
-        .\Convert-HorizonFullClone-Nic.ps1                          # dry run, 25 machines
-        .\Convert-HorizonFullClone-Nic.ps1 -PoolFilter 'VDI-STD-*' -Limit 25
-        .\Convert-HorizonFullClone-Nic.ps1 -PoolFilter 'VDI-STD-*' -Limit 25 -Execute
+    You tell it WHICH machines to do - either by naming them, or by feeding it
+    a CSV. It will not go looking for work on its own.
+
+    Test one:
+        .\Convert-HorizonFullClone-Nic.ps1 -VMName VDI-W11-0042
+        .\Convert-HorizonFullClone-Nic.ps1 -VMName VDI-W11-0042 -Execute
+
+    Test two:
+        .\Convert-HorizonFullClone-Nic.ps1 -VMName VDI-W11-0042,VDI-W11-0043 -Execute
+
+    From the audit CSV (any CSV with a VMName column - filter it in Excel first):
+        .\Convert-HorizonFullClone-Nic.ps1 -InputCsv C:\Temp\E1000_Audit.csv
+        .\Convert-HorizonFullClone-Nic.ps1 -InputCsv C:\Temp\batch01.csv -Execute
+
+    Belt and braces - cap the run regardless of how many rows are in the CSV:
+        .\Convert-HorizonFullClone-Nic.ps1 -InputCsv C:\Temp\E1000_Audit.csv -Limit 25 -Execute
 
     Per machine:
       1. Re-check Horizon state LIVE (the audit CSV goes stale in minutes)
       2. Enter maintenance mode - stops brokering AND stops Horizon power-managing
          the VM back on underneath you
-      3. ipconfig /release  (returns the DHCP lease to the scope immediately -
-         Windows does NOT release on shutdown by default)
+      3. ipconfig /release - Windows does NOT release the lease on shutdown
       4. Graceful guest shutdown, hard stop after timeout
       5. Remove E1000, add VMXNET3 on the same portgroup
       6. Power on, wait for Tools
-      7. Exit maintenance mode
+      7. In-guest cleanup: purge ghost NIC, restore adapter name, verify the
+         firewall profile came back as Domain
+      8. Exit maintenance mode - but ONLY if step 7 came back clean
 
-    New MAC -> new DHCP lease. The old lease was released in step 3, so no
-    scope pressure. The ghost E1000 left in the guest holds no static config,
-    so no IP conflict - cleanup is cosmetic only.
-
-    Resumable: anything already on VMXNET3 is skipped.
+    Resumable: anything already on VMXNET3 is logged and skipped.
     Failures are LEFT IN MAINTENANCE MODE deliberately and listed at the end.
 #>
 
+[CmdletBinding(DefaultParameterSetName = 'ByName')]
 param(
-    [string] $vCenter          = 'vcenter.iprod.local',
-    [string] $ConnectionServer = 'horizon-cs01.iprod.local',
-    [string] $PoolFilter       = '*',
-    [int]    $Limit            = 25,
-    [string] $LogCsv           = "C:\Temp\NIC_Swap_Log_$(Get-Date -Format 'yyyyMMdd_HHmm').csv",
+    [Parameter(ParameterSetName = 'ByName', Mandatory)]
+    [string[]] $VMName,
 
-    [switch] $Execute,            # without this it is a DRY RUN
-    [switch] $PreserveMac,        # only if you have DHCP reservations or MAC-based port auth
-    [switch] $NoDhcpRelease,      # skip the release (lease just ages out - check scope headroom)
+    [Parameter(ParameterSetName = 'ByCsv', Mandatory)]
+    [string]   $InputCsv,
 
-    [int]    $ShutdownWaitSec  = 180,
-    [int]    $ToolsWaitSec     = 300
+    [string]   $CsvColumn         = 'VMName',   # column in the CSV holding the machine name
+    [int]      $Limit             = 0,          # 0 = no cap, do everything supplied
+
+    [string]   $vCenter           = 'vcenter.iprod.local',
+    [string]   $ConnectionServer  = 'horizon-cs01.iprod.local',
+    [string]   $LogCsv            = "C:\Temp\NIC_Swap_Log_$(Get-Date -Format 'yyyyMMdd_HHmm').csv",
+
+    [switch]   $Execute,          # without this it is a DRY RUN
+    [switch]   $PreserveMac,      # only if you have DHCP reservations or MAC-based port auth
+    [switch]   $NoDhcpRelease,    # also disables the in-guest cleanup (both need guest creds)
+
+    [int]      $ShutdownWaitSec   = 180,
+    [int]      $ToolsWaitSec      = 300
 )
 
 $DryRun = -not $Execute
 
+# ---------------------------------------------------------------- targets
+if ($PSCmdlet.ParameterSetName -eq 'ByCsv') {
+    if (-not (Test-Path $InputCsv)) { throw "CSV not found: $InputCsv" }
+    $csv = Import-Csv $InputCsv
+    if ($csv.Count -eq 0) { throw "CSV is empty: $InputCsv" }
+    if ($csv[0].PSObject.Properties.Name -notcontains $CsvColumn) {
+        throw "CSV has no '$CsvColumn' column. Columns present: $(($csv[0].PSObject.Properties.Name) -join ', ')"
+    }
+    $targets = $csv.$CsvColumn | Where-Object { $_ } | Select-Object -Unique
+} else {
+    $targets = $VMName | Where-Object { $_ } | Select-Object -Unique
+}
+
+if ($Limit -gt 0 -and $targets.Count -gt $Limit) {
+    Write-Host "Capping $($targets.Count) targets to $Limit." -ForegroundColor Yellow
+    $targets = $targets | Select-Object -First $Limit
+}
+
 Import-Module VMware.PowerCLI -ErrorAction Stop
 Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope Session | Out-Null
 
+Write-Host ""
+if ($DryRun) { Write-Host "*** DRY RUN - no changes will be made. Add -Execute to commit. ***" -ForegroundColor Magenta }
+else         { Write-Host "*** EXECUTE MODE - changes WILL be made. ***" -ForegroundColor Red }
+Write-Host "Targets: $($targets.Count)   PreserveMac: $($PreserveMac.IsPresent)   DhcpRelease/Cleanup: $(-not $NoDhcpRelease)" -ForegroundColor Gray
+$targets | ForEach-Object { Write-Host "  $_" -ForegroundColor Gray }
+Write-Host ""
+
+if (-not $DryRun) {
+    $ok = Read-Host "Convert the $($targets.Count) machine(s) above? Type YES to proceed"
+    if ($ok -ne 'YES') { Write-Host "Aborted." -ForegroundColor Yellow; return }
+}
+
+# ---------------------------------------------------------------- connect
 $cred = Get-Credential -Message "Credentials for vCenter and Horizon (DOMAIN\user)"
 
 $guestCred = $null
 if (-not $NoDhcpRelease) {
-    $guestCred = Get-Credential -Message "Guest OS credentials (local admin on the desktops) - for ipconfig /release"
+    $guestCred = Get-Credential -Message "Guest OS credentials (local admin on the desktops)"
 }
 
 Connect-VIServer -Server $vCenter -Credential $cred -ErrorAction Stop | Out-Null
@@ -62,50 +110,48 @@ $api = $hv.ExtensionData
 # session with the user's apps open - it just has no client attached.
 $SafeStates = @('AVAILABLE','MAINTENANCE')
 
-Write-Host ""
-if ($DryRun) { Write-Host "*** DRY RUN - no changes will be made. Add -Execute to commit. ***" -ForegroundColor Magenta }
-else         { Write-Host "*** EXECUTE MODE - changes WILL be made. ***" -ForegroundColor Red }
-Write-Host "Pool filter: $PoolFilter   Limit: $Limit   PreserveMac: $($PreserveMac.IsPresent)   DhcpRelease: $(-not $NoDhcpRelease)" -ForegroundColor Gray
-Write-Host ""
-
-# ---------------------------------------------------------------- machines
-Write-Host "Querying Horizon ..." -ForegroundColor Cyan
+# ---------------------------------------------------------------- Horizon index
+Write-Host "Indexing Horizon machines ..." -ForegroundColor Cyan
 $qs = New-Object VMware.Hv.QueryServiceService
 $qd = New-Object VMware.Hv.QueryDefinition
 $qd.QueryEntityType = 'MachineNamesView'
 $qd.Limit = 1000
 
-$machines = @()
+$hvIndex = @{}
 $r = $qs.QueryService_Create($api, $qd)
 while ($r.Results) {
-    $machines += $r.Results
+    foreach ($mm in $r.Results) {
+        $pool = ''; try { $pool = "$($mm.NamesData.DesktopName)" } catch {}
+        $hvIndex["$($mm.Base.Name)".ToUpper()] = [pscustomobject]@{
+            Id   = $mm.Id
+            Pool = $pool
+        }
+    }
     if (-not $r.Id) { break }
     $r = $qs.QueryService_GetNext($api, $r.Id)
 }
 if ($r.Id) { $qs.QueryService_Delete($api, $r.Id) }
-Write-Host "Horizon machines: $($machines.Count)" -ForegroundColor Cyan
+Write-Host "Horizon machines indexed: $($hvIndex.Count)" -ForegroundColor Cyan
 Write-Host ""
 
 # ---------------------------------------------------------------- in-guest cleanup
-# Runs after power-on. Purges the ghost E1000, restores the adapter name,
-# and - the important bit - makes sure the new NIC landed on the Domain
-# firewall profile. If NLA races the DC on first boot the profile lands as
-# Public, Windows Firewall blocks Blast/PCoIP/RDP/MECM, and the desktop is
-# up but unreachable.
+# Purges the ghost E1000, restores the adapter name, and - the important bit -
+# makes sure the new NIC landed on the Domain firewall profile. If NLA races the
+# DC on first boot the profile lands as Public, Windows Firewall blocks
+# Blast/PCoIP/RDP/MECM, and the desktop is up but unreachable.
 $cleanupScript = @'
 $ErrorActionPreference = 'SilentlyContinue'
 $out = @()
 
-# 1. new adapter
 $nic = Get-NetAdapter -Physical | Where-Object { $_.InterfaceDescription -match 'vmxnet3' } | Select-Object -First 1
 if (-not $nic) { 'FAIL: no vmxnet3 adapter present'; exit 1 }
 
-# 2. purge ghost E1000 (clears Enum, Class and Tcpip interface keys)
+# purge ghost E1000 (clears Enum, Class and Tcpip interface keys)
 $ghosts = Get-PnpDevice -Class Net -Status Unknown
 foreach ($g in $ghosts) { & pnputil /remove-device $g.InstanceId 2>&1 | Out-Null }
 $out += "ghosts_removed=$($ghosts.Count)"
 
-# 3. restore the connection name so anything keyed on 'Ethernet' still matches
+# restore the connection name so anything keyed on 'Ethernet' still matches
 if ($nic.Name -ne 'Ethernet') {
     if (-not (Get-NetAdapter -Name 'Ethernet')) {
         Rename-NetAdapter -Name $nic.Name -NewName 'Ethernet'
@@ -115,7 +161,7 @@ if ($nic.Name -ne 'Ethernet') {
     }
 }
 
-# 4. firewall profile - the one that actually matters
+# firewall profile - the one that actually matters
 $nic  = Get-NetAdapter -Physical | Where-Object { $_.InterfaceDescription -match 'vmxnet3' } | Select-Object -First 1
 $prof = (Get-NetConnectionProfile -InterfaceIndex $nic.ifIndex).NetworkCategory
 if ($prof -ne 'DomainAuthenticated') {
@@ -125,22 +171,20 @@ if ($prof -ne 'DomainAuthenticated') {
 }
 $out += "profile=$prof"
 
-# 5. purge stale network profiles left by the old adapter
+# purge stale network profiles left by the old adapter
 $keep = (Get-NetConnectionProfile).Name
 Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\NetworkList\Profiles' | ForEach-Object {
     $n = (Get-ItemProperty $_.PSPath).ProfileName
     if ($n -and $n -notin $keep) { Remove-Item $_.PSPath -Recurse -Force; $out += "stale_profile_removed=$n" }
 }
 
-# 6. re-register DNS
 ipconfig /registerdns | Out-Null
 
 if ($prof -eq 'DomainAuthenticated') { "OK " + ($out -join ' ') }
 else                                 { "WARN-FIREWALL-PROFILE " + ($out -join ' ') }
 '@
 
-$log       = New-Object System.Collections.Generic.List[object]
-$processed = 0
+$log = New-Object System.Collections.Generic.List[object]
 
 function Add-Log {
     param($Name,$Pool,$State,$Status,$Detail,$OldMac,$NewMac)
@@ -150,20 +194,23 @@ function Add-Log {
     })
 }
 
-foreach ($m in $machines) {
+# ---------------------------------------------------------------- work
+foreach ($name in $targets) {
 
-    if ($processed -ge $Limit) { Write-Host "Limit of $Limit reached." -ForegroundColor Yellow; break }
-
-    $name = $m.Base.Name
-    $pool = ''; try { $pool = "$($m.NamesData.DesktopName)" } catch {}
-    if ($pool -notlike $PoolFilter) { continue }
+    $hz = $hvIndex["$name".ToUpper()]
+    if (-not $hz) {
+        Write-Host "$name : NOT IN HORIZON - skipped" -ForegroundColor Yellow
+        Add-Log $name '' '' 'NOT-IN-HORIZON' 'Broker does not know this machine - convert manually if intended' '' ''
+        continue
+    }
+    $pool = $hz.Pool
 
     # ---- live state re-check ----
-    $state = ''
-    try   { $state = "$($api.Machine.Machine_Get($m.Id).Base.BasicState)" }
-    catch { $state = "$($m.Base.BasicState)" }
+    $state = 'UNKNOWN'
+    try { $state = "$($api.Machine.Machine_Get($hz.Id).Base.BasicState)" } catch { }
 
     if ($state -notin $SafeStates) {
+        Write-Host "$name : SKIP (state $state)" -ForegroundColor Yellow
         Add-Log $name $pool $state 'SKIPPED' 'Session present or machine in transition' '' ''
         continue
     }
@@ -175,8 +222,16 @@ foreach ($m in $machines) {
     $nics = @(Get-NetworkAdapter -VM $vm)
     $old  = $nics | Where-Object { $_.Type -in @('e1000','e1000e') } | Select-Object -First 1
 
-    if (-not $old)         { Add-Log $name $pool $state 'ALREADY-VMXNET3' '' '' ''; continue }
-    if ($nics.Count -gt 1) { Add-Log $name $pool $state 'SKIPPED' 'Multiple vNICs - handle manually' $old.MacAddress ''; continue }
+    if (-not $old) {
+        Write-Host "$name : already vmxnet3" -ForegroundColor DarkGray
+        Add-Log $name $pool $state 'ALREADY-VMXNET3' '' '' ''
+        continue
+    }
+    if ($nics.Count -gt 1) {
+        Write-Host "$name : SKIP (multi-NIC)" -ForegroundColor Yellow
+        Add-Log $name $pool $state 'SKIPPED' 'Multiple vNICs - handle manually' $old.MacAddress ''
+        continue
+    }
 
     $oldMac = $old.MacAddress
     $pg     = $old.NetworkName
@@ -186,32 +241,27 @@ foreach ($m in $machines) {
     if ($DryRun) {
         Write-Host "    would swap to vmxnet3" -ForegroundColor Magenta
         Add-Log $name $pool $state 'DRYRUN' "Would swap $($old.Type) on '$pg'" $oldMac ''
-        $processed++
         continue
     }
 
-    $processed++
-
     try {
         # ---- maintenance mode ----
-        try   { $api.Machine.Machine_EnterMaintenanceMode($m.Id) }
-        catch { $api.Machine.Machine_EnterMaintenanceModes(@($m.Id)) }
+        try   { $api.Machine.Machine_EnterMaintenanceMode($hz.Id) }
+        catch { $api.Machine.Machine_EnterMaintenanceModes(@($hz.Id)) }
         Start-Sleep -Seconds 3
         Write-Host "    maintenance mode on" -ForegroundColor DarkGray
 
         $vm = Get-VM -Name $name
 
         # ---- release the DHCP lease before we lose the NIC ----
-        if (-not $NoDhcpRelease -and $vm.PowerState -eq 'PoweredOn' -and
+        if ($guestCred -and $vm.PowerState -eq 'PoweredOn' -and
             $vm.ExtensionData.Guest.ToolsRunningStatus -eq 'guestToolsRunning') {
             try {
                 Invoke-VMScript -VM $vm -ScriptType Bat -ScriptText 'ipconfig /release' `
                     -GuestCredential $guestCred -ErrorAction Stop | Out-Null
                 Write-Host "    dhcp lease released" -ForegroundColor DarkGray
             }
-            catch {
-                Write-Host "    WARN: lease release failed - lease will age out" -ForegroundColor Yellow
-            }
+            catch { Write-Host "    WARN: lease release failed - lease will age out" -ForegroundColor Yellow }
         }
 
         # ---- shut down ----
@@ -263,7 +313,7 @@ foreach ($m in $machines) {
         $clean = 'NOT-RUN'
         if ($guestCred) {
             try {
-                $vm = Get-VM -Name $name
+                $vm  = Get-VM -Name $name
                 $res = Invoke-VMScript -VM $vm -ScriptType Powershell -ScriptText $cleanupScript `
                         -GuestCredential $guestCred -ErrorAction Stop
                 $clean = ($res.ScriptOutput -split "`r?`n" | Where-Object { $_ -match '\S' } | Select-Object -Last 1)
@@ -284,8 +334,8 @@ foreach ($m in $machines) {
         }
 
         # ---- back into service ----
-        try   { $api.Machine.Machine_ExitMaintenanceMode($m.Id) }
-        catch { $api.Machine.Machine_ExitMaintenanceModes(@($m.Id)) }
+        try   { $api.Machine.Machine_ExitMaintenanceMode($hz.Id) }
+        catch { $api.Machine.Machine_ExitMaintenanceModes(@($hz.Id)) }
 
         Add-Log $name $pool $state 'CONVERTED' "ip=$ip $clean" $oldMac $newMac
     }
