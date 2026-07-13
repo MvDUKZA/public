@@ -1,45 +1,55 @@
 <#
     Convert-HorizonFullClone-Nic.ps1
     --------------------------------
-    Cold-swaps E1000/E1000e -> VMXNET3 on Horizon FULL CLONE desktops.
-
-    You tell it WHICH machines to do. It will not go looking for work on its own.
+    Replaces the E1000/E1000e vNIC with a VMXNET3 on Horizon FULL CLONE desktops.
+    That is the whole job. It does nothing else to the guest.
 
         .\Convert-HorizonFullClone-Nic.ps1 -VMName VDI-W11-0042
         .\Convert-HorizonFullClone-Nic.ps1 -VMName VDI-W11-0042 -Execute
-        .\Convert-HorizonFullClone-Nic.ps1 -VMName VDI-W11-0042,VDI-W11-0043 -Execute
         .\Convert-HorizonFullClone-Nic.ps1 -InputCsv C:\Temp\batch01.csv -Execute
-        .\Convert-HorizonFullClone-Nic.ps1 -InputCsv C:\Temp\E1000_Audit.csv -Limit 25 -Execute
+        .\Convert-HorizonFullClone-Nic.ps1 -InputCsv C:\Temp\audit.csv -Limit 25 -Execute
+        .\Convert-HorizonFullClone-Nic.ps1 -InputCsv C:\Temp\halfswapped.csv -RepairHalfSwapped -Execute
+
+    WHAT IT TOUCHES IN THE GUEST
+    ----------------------------
+    Only two things, both scoped as tightly as possible:
+      1. Removes the non-present E1000 device, matched on its Intel PCI hardware ID.
+         It does NOT bulk-remove non-present network devices - Zscaler, AnyConnect,
+         GlobalProtect and similar VPN adapters legitimately appear as non-present
+         and must be left alone.
+      2. Renames the new adapter back to 'Ethernet' if that name is free.
+    It does NOT purge NetworkList profiles and does NOT restart NlaSvc. Both have a
+    blast radius well beyond this job and can disturb VPN/ZTNA clients.
 
     SAFETY DESIGN
     -------------
-    * ADD THEN REMOVE. The VMXNET3 is added before the E1000 is removed, so a
-      failure to add changes nothing. There is no window in which the VM has
-      no network adapter.
-    * ROLLBACK. If the remove fails, or the post-swap adapter set is not exactly
-      one VMXNET3, the original E1000 is restored with its original MAC and
-      portgroup and the VM is powered back on.
-    * MAINTENANCE MODE FIRST. Entered before the session check, then the state is
-      re-read. If a user connected in the gap, maintenance mode is backed out and
-      the machine is skipped untouched.
-    * INCREMENTAL LOG. Every machine is appended to the CSV as it completes. Kill
-      the script at any point and the log still tells you exactly where you got to.
-    * VERIFY BEFORE RETURNING TO SERVICE. A machine only leaves maintenance mode
-      once it is powered on, Tools is up, and it answers on the Horizon agent port.
-      Anything else is HELD in maintenance for a human.
-    * NO SILENT DOWNGRADE. Without guest credentials the in-guest cleanup cannot
-      run, so machines are HELD rather than returned to the broker unverified.
-      -NoGuestCleanup makes that choice explicit.
+    * MAINTENANCE MODE IS PROVEN, NOT ASSUMED. After requesting it, the broker is
+      polled until it actually reports MAINTENANCE. An AVAILABLE reading proves
+      nothing. If it never confirms, the request is backed out and the VM skipped.
+    * ADD BEFORE REMOVE. The VMXNET3 is created before the E1000 is deleted, so a
+      failed create changes nothing and the VM is never without an adapter.
+    * SURGICAL ROLLBACK. Only what this script created or deleted is undone, tracked
+      by adapter ID - never a blanket "remove all adapters". The E1000 is restored
+      BEFORE the VMXNET3 is withdrawn, so there is no adapterless moment there either.
+    * ONCE COMMITTED, NO ROLLBACK. After the adapter set has been verified correct,
+      a later failure (power-on, Tools) is reported, not reversed. Reverting a
+      correct config helps nobody.
+    * ONLY RELEASE WHAT WE LOCKED. A VM already in maintenance when we found it is
+      left in maintenance.
+    * INCREMENTAL LOG, written per machine.
 
     STATUSES
     --------
-    CONVERTED        done, verified, back in the pool
-    ROLLED-BACK      swap failed, original E1000 restored, machine powered on
-    HELD             converted but not verified - STILL IN MAINTENANCE MODE
-    FAILED           see Detail - STILL IN MAINTENANCE MODE, check by hand
-    SKIPPED          session present, multi-NIC, or state not safe - untouched
-    ALREADY-VMXNET3  nothing to do
-    NOT-IN-HORIZON   broker does not know it - untouched
+    CONVERTED        done, verified, reachable, back in the pool
+    ROLLED-BACK      swap failed and was reversed - original E1000 restored
+    HELD             converted but not verified - LEFT IN MAINTENANCE MODE
+    FAILED           see Detail - LEFT IN MAINTENANCE MODE
+    SKIPPED          session present / maintenance not confirmed / multi-NIC
+    ALREADY-VMXNET3  exactly one VMXNET3 and nothing else
+    HALF-SWAPPED     has BOTH a VMXNET3 and an E1000 - re-run with -RepairHalfSwapped
+    NO-NIC           zero adapters - wreckage, needs a human. NOT treated as done.
+    OTHER-NIC-TYPE   vmxnet2 / pcnet32 / something unexpected
+    NOT-IN-HORIZON   broker does not know it
 #>
 
 [CmdletBinding(DefaultParameterSetName = 'ByName')]
@@ -50,21 +60,23 @@ param(
     [Parameter(ParameterSetName = 'ByCsv', Mandatory)]
     [string]   $InputCsv,
 
-    [string]   $CsvColumn         = 'VMName',
-    [int]      $Limit             = 0,          # 0 = no cap
+    [string]   $CsvColumn          = 'VMName',
+    [int]      $Limit              = 0,          # 0 = no cap
 
-    [string]   $vCenter           = 'vcenter.iprod.local',
-    [string]   $ConnectionServer  = 'horizon-cs01.iprod.local',
-    [string]   $LogCsv            = "C:\Temp\NIC_Swap_Log_$(Get-Date -Format 'yyyyMMdd_HHmm').csv",
+    [string]   $vCenter            = 'vcenter.iprod.local',
+    [string]   $ConnectionServer   = 'horizon-cs01.iprod.local',
+    [string]   $LogCsv             = "C:\Temp\NIC_Swap_Log_$(Get-Date -Format 'yyyyMMdd_HHmm').csv",
 
-    [switch]   $Execute,          # without this it is a DRY RUN
-    [switch]   $PreserveMac,      # only for DHCP reservations / MAC-based port auth
-    [switch]   $NoDhcpRelease,    # skip ipconfig /release (lease ages out instead)
-    [switch]   $NoGuestCleanup,   # run without guest creds - machines will be HELD, not returned to service
+    [switch]   $Execute,           # without this it is a DRY RUN
+    [switch]   $PreserveMac,       # only for DHCP reservations / MAC-based port auth
+    [switch]   $NoDhcpRelease,     # skip ipconfig /release (lease ages out instead)
+    [switch]   $NoGuestCleanup,    # no guest creds - converted machines will be HELD
+    [switch]   $RepairHalfSwapped, # finish off VMs left with BOTH a VMXNET3 and an E1000
 
-    [int]      $VerifyPort        = 22443,      # Horizon agent Blast. 3389 if you prefer RDP.
-    [int]      $ShutdownWaitSec   = 180,
-    [int]      $ToolsWaitSec      = 300
+    [int]      $VerifyPort         = 22443,      # Horizon agent Blast. 3389 if you prefer RDP.
+    [int]      $MaintWaitSec       = 90,
+    [int]      $ShutdownWaitSec    = 180,
+    [int]      $ToolsWaitSec       = 300
 )
 
 $DryRun = -not $Execute
@@ -93,14 +105,13 @@ Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scop
 Write-Host ""
 if ($DryRun) { Write-Host "*** DRY RUN - no changes will be made. Add -Execute to commit. ***" -ForegroundColor Magenta }
 else         { Write-Host "*** EXECUTE MODE - changes WILL be made. ***" -ForegroundColor Red }
-Write-Host "Targets: $($targets.Count)   PreserveMac: $($PreserveMac.IsPresent)   GuestCleanup: $(-not $NoGuestCleanup)   VerifyPort: $VerifyPort" -ForegroundColor Gray
+Write-Host "Targets: $($targets.Count)   PreserveMac: $($PreserveMac.IsPresent)   GuestCleanup: $(-not $NoGuestCleanup)   Repair: $($RepairHalfSwapped.IsPresent)   VerifyPort: $VerifyPort" -ForegroundColor Gray
 $targets | ForEach-Object { Write-Host "  $_" -ForegroundColor Gray }
 
 if ($NoGuestCleanup -and -not $DryRun) {
     Write-Host ""
-    Write-Host "WARNING: -NoGuestCleanup is set. The ghost NIC will not be purged and the" -ForegroundColor Yellow
-    Write-Host "         firewall profile will not be checked. Every converted machine will be" -ForegroundColor Yellow
-    Write-Host "         HELD in maintenance mode for you to verify by hand." -ForegroundColor Yellow
+    Write-Host "WARNING: -NoGuestCleanup - the ghost E1000 will not be removed and nothing" -ForegroundColor Yellow
+    Write-Host "         will be verified inside the guest. Converted machines will be HELD." -ForegroundColor Yellow
 }
 
 Write-Host ""
@@ -121,28 +132,25 @@ Connect-VIServer -Server $vCenter -Credential $cred -ErrorAction Stop | Out-Null
 $hv  = Connect-HVServer -Server $ConnectionServer -Credential $cred -ErrorAction Stop
 $api = $hv.ExtensionData
 
-# Only these mean nobody is on the machine. DISCONNECTED still has a live session.
-$SafeStates = @('AVAILABLE','MAINTENANCE')
-
-# ---------------------------------------------------------------- logging
-# Written per machine, not at the end. If this script is killed the log is still
-# an accurate record of what was done and what is still in maintenance mode.
+# ---------------------------------------------------------------- helpers
 $dir = Split-Path $LogCsv -Parent
 if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
 $counts = @{}
 
 function Add-Log {
     param($Name,$Pool,$State,$Status,$Detail,$OldMac,$NewMac)
-    $row = [pscustomobject]@{
+    [pscustomobject]@{
         Timestamp = (Get-Date -Format 's'); Machine = $Name; Pool = $Pool
         HorizonState = $State; Status = $Status; Detail = $Detail
         OldMac = $OldMac; NewMac = $NewMac
-    }
-    $row | Export-Csv -Path $LogCsv -NoTypeInformation -Encoding UTF8 -Append
+    } | Export-Csv -Path $LogCsv -NoTypeInformation -Encoding UTF8 -Append
     if (-not $counts.ContainsKey($Status)) { $counts[$Status] = 0 }
     $counts[$Status]++
 }
 
+function Get-HvState { param($Id)
+    try { return "$($api.Machine.Machine_Get($Id).Base.BasicState)" } catch { return 'UNKNOWN' }
+}
 function Enter-Maint { param($Id)
     try   { $api.Machine.Machine_EnterMaintenanceMode($Id) }
     catch { $api.Machine.Machine_EnterMaintenanceModes(@($Id)) }
@@ -174,41 +182,49 @@ Write-Host "Horizon machines indexed: $($hvIndex.Count)" -ForegroundColor Cyan
 Write-Host ""
 
 # ---------------------------------------------------------------- in-guest cleanup
+# Deliberately minimal. Two actions, both narrowly scoped.
+#
+# The ghost removal matches on Intel PCI hardware IDs, NOT on "any non-present
+# network device". Zscaler, AnyConnect, GlobalProtect and other VPN/ZTNA miniports
+# routinely show as non-present and must not be removed.
+#   E1000  = Intel 82545EM  ->  PCI\VEN_8086&DEV_100F
+#   E1000e = Intel 82574L   ->  PCI\VEN_8086&DEV_10D3
+#
+# No NetworkList profile purge, no NlaSvc restart. NLA reclassifies the adapter on
+# its own once a DC is reachable; we wait for that rather than kicking the service,
+# which would make ZTNA clients re-evaluate their trusted network.
 $cleanupScript = @'
 $ErrorActionPreference = 'SilentlyContinue'
 $out = @()
 
-$nic = Get-NetAdapter -Physical | Where-Object { $_.InterfaceDescription -match 'vmxnet3' } | Select-Object -First 1
-if (-not $nic) { 'FAIL no vmxnet3 adapter present'; exit 1 }
+$nic = Get-NetAdapter | Where-Object { $_.InterfaceDescription -match 'vmxnet3' } | Select-Object -First 1
+if (-not $nic) { 'FAIL no vmxnet3 adapter present in guest'; exit 1 }
 
-$ghosts = Get-PnpDevice -Class Net -Status Unknown
+$ghosts = @(Get-PnpDevice -Class Net -Status Unknown | Where-Object {
+    $_.InstanceId -like 'PCI\VEN_8086&DEV_100F*' -or $_.InstanceId -like 'PCI\VEN_8086&DEV_10D3*'
+})
 foreach ($g in $ghosts) { & pnputil /remove-device $g.InstanceId 2>&1 | Out-Null }
-$out += "ghosts=$($ghosts.Count)"
+$out += "e1000_ghosts_removed=$($ghosts.Count)"
 
 if ($nic.Name -ne 'Ethernet' -and -not (Get-NetAdapter -Name 'Ethernet')) {
     Rename-NetAdapter -Name $nic.Name -NewName 'Ethernet'
-    $out += "renamed"
+    $out += 'renamed=Ethernet'
 }
 
-$nic  = Get-NetAdapter -Physical | Where-Object { $_.InterfaceDescription -match 'vmxnet3' } | Select-Object -First 1
-$prof = (Get-NetConnectionProfile -InterfaceIndex $nic.ifIndex).NetworkCategory
-if ($prof -ne 'DomainAuthenticated') {
-    Restart-Service NlaSvc -Force
-    Start-Sleep -Seconds 20
+# wait for NLA to classify - do not force it
+$nic  = Get-NetAdapter | Where-Object { $_.InterfaceDescription -match 'vmxnet3' } | Select-Object -First 1
+$prof = ''
+for ($i = 0; $i -lt 24; $i++) {
     $prof = (Get-NetConnectionProfile -InterfaceIndex $nic.ifIndex).NetworkCategory
+    if ($prof -eq 'DomainAuthenticated') { break }
+    Start-Sleep -Seconds 5
 }
 $out += "profile=$prof"
 
-$keep = (Get-NetConnectionProfile).Name
-Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\NetworkList\Profiles' | ForEach-Object {
-    $n = (Get-ItemProperty $_.PSPath).ProfileName
-    if ($n -and $n -notin $keep) { Remove-Item $_.PSPath -Recurse -Force; $out += "stale_removed" }
-}
-
 ipconfig /registerdns | Out-Null
 
-if ($prof -eq 'DomainAuthenticated') { "OK " + ($out -join ' ') }
-else                                 { "WARN-PROFILE " + ($out -join ' ') }
+if ($prof -eq 'DomainAuthenticated') { 'OK ' + ($out -join ' ') }
+else                                 { 'WARN-PROFILE ' + ($out -join ' ') }
 '@
 
 # ---------------------------------------------------------------- work
@@ -216,81 +232,129 @@ foreach ($name in $targets) {
 
     $hz = $hvIndex["$name".ToUpper()]
     if (-not $hz) {
-        Write-Host "$name : not known to Horizon - skipped" -ForegroundColor Yellow
+        Write-Host "$name : not known to Horizon" -ForegroundColor Yellow
         Add-Log $name '' '' 'NOT-IN-HORIZON' 'Broker does not know this machine' '' ''
         continue
     }
     $pool = $hz.Pool
 
-    # ---- one and only one VM by that name ----
+    # ---- exactly one VM by that name ----
     $vmAll = @(Get-VM -Name $name -ErrorAction SilentlyContinue)
     if ($vmAll.Count -eq 0) { Add-Log $name $pool '' 'FAILED' 'Not found in vCenter' '' ''; continue }
     if ($vmAll.Count -gt 1) {
-        Write-Host "$name : AMBIGUOUS - $($vmAll.Count) VMs with this name" -ForegroundColor Red
+        Write-Host "$name : AMBIGUOUS - $($vmAll.Count) VMs share this name" -ForegroundColor Red
         Add-Log $name $pool '' 'SKIPPED' "Ambiguous - $($vmAll.Count) VMs share this name" '' ''
         continue
     }
     $vm = $vmAll[0]
 
-    # ---- is there anything to do ----
-    $nics = @(Get-NetworkAdapter -VM $vm)
-    $old  = $nics | Where-Object { $_.Type -in @('e1000','e1000e') } | Select-Object -First 1
+    # ---- classify the adapter set ----
+    $nics   = @(Get-NetworkAdapter -VM $vm)
+    $legacy = @($nics | Where-Object { $_.Type -in @('e1000','e1000e') })
+    $vmx    = @($nics | Where-Object { $_.Type -eq 'Vmxnet3' })
+    $other  = @($nics | Where-Object { $_.Type -notin @('e1000','e1000e','Vmxnet3') })
 
-    if (-not $old) {
+    $halfSwapped = ($vmx.Count -ge 1 -and $legacy.Count -ge 1)
+
+    if ($nics.Count -eq 0) {
+        Write-Host "$name : NO NETWORK ADAPTER AT ALL" -ForegroundColor Red
+        Add-Log $name $pool '' 'NO-NIC' 'Zero network adapters - wreckage from an interrupted run. Fix by hand.' '' ''
+        continue
+    }
+    if ($legacy.Count -eq 0 -and $vmx.Count -eq 1 -and $nics.Count -eq 1) {
         Write-Host "$name : already vmxnet3" -ForegroundColor DarkGray
-        Add-Log $name $pool '' 'ALREADY-VMXNET3' '' '' ''
+        Add-Log $name $pool '' 'ALREADY-VMXNET3' '' '' $vmx[0].MacAddress
         continue
     }
-    if ($nics.Count -gt 1) {
+    if ($legacy.Count -eq 0 -and $other.Count -gt 0) {
+        $types = ($nics | ForEach-Object { $_.Type }) -join ';'
+        Write-Host "$name : SKIP - unexpected adapter type(s): $types" -ForegroundColor Yellow
+        Add-Log $name $pool '' 'OTHER-NIC-TYPE' "Adapter types: $types" '' ''
+        continue
+    }
+    if ($legacy.Count -eq 0) {
+        $types = ($nics | ForEach-Object { $_.Type }) -join ';'
+        Write-Host "$name : SKIP - $($nics.Count) adapters ($types)" -ForegroundColor Yellow
+        Add-Log $name $pool '' 'SKIPPED' "$($nics.Count) adapters: $types" '' ''
+        continue
+    }
+    if ($halfSwapped -and -not $RepairHalfSwapped) {
+        Write-Host "$name : HALF-SWAPPED ($($vmx.Count) vmxnet3 + $($legacy.Count) legacy)" -ForegroundColor Red
+        Add-Log $name $pool '' 'HALF-SWAPPED' "$($vmx.Count) vmxnet3 + $($legacy.Count) legacy. Re-run with -RepairHalfSwapped." $legacy[0].MacAddress $vmx[0].MacAddress
+        continue
+    }
+    if (-not $halfSwapped -and $nics.Count -gt 1) {
         Write-Host "$name : SKIP (multi-NIC)" -ForegroundColor Yellow
-        Add-Log $name $pool '' 'SKIPPED' 'Multiple vNICs - handle manually' $old.MacAddress ''
+        Add-Log $name $pool '' 'SKIPPED' "Multiple vNICs ($($nics.Count))" $legacy[0].MacAddress ''
         continue
     }
 
-    $oldMac  = $old.MacAddress
-    $oldType = $old.Type
-    $pg      = $old.NetworkName
+    $origMac  = $legacy[0].MacAddress
+    $origType = $legacy[0].Type
+    $origPg   = $legacy[0].NetworkName
 
     if ($DryRun) {
-        $st = 'UNKNOWN'; try { $st = "$($api.Machine.Machine_Get($hz.Id).Base.BasicState)" } catch {}
-        Write-Host "=== $name  [$pool]  $oldType on '$pg'  state=$st" -ForegroundColor Cyan
-        Write-Host "    would swap to vmxnet3" -ForegroundColor Magenta
-        Add-Log $name $pool $st 'DRYRUN' "Would swap $oldType on '$pg'" $oldMac ''
+        $st = Get-HvState $hz.Id
+        $what = if ($halfSwapped) { "repair half-swapped: drop $($legacy.Count) legacy" } else { "swap $origType -> vmxnet3" }
+        Write-Host "=== $name  [$pool]  state=$st" -ForegroundColor Cyan
+        Write-Host "    would $what  (portgroup '$origPg')" -ForegroundColor Magenta
+        Add-Log $name $pool $st 'DRYRUN' "Would $what on '$origPg'" $origMac ''
         continue
     }
 
-    Write-Host "=== $name  [$pool]  $oldType on '$pg'" -ForegroundColor Cyan
+    Write-Host "=== $name  [$pool]  $origType on '$origPg'" -ForegroundColor Cyan
 
-    $maintOwned = $false     # did WE put it into maintenance
-    $swapped    = $false     # has the adapter set been changed
+    # ---- precise record of what we have actually done, for rollback ----
+    $maintOwned  = $false   # WE put it into maintenance, so WE release it
+    $addedNicId  = $null    # id of the adapter we created, if any
+    $legacyGone  = $false   # the E1000 has actually been deleted
+    $committed   = $false   # adapter set verified correct - past the point of reverting
+    $state       = 'UNKNOWN'
+    $newMac      = ''
 
     try {
-        # ---- maintenance mode FIRST, then re-read state ----
-        # Entering first closes the race where a user connects between the check
-        # and the lock. If it turns out someone was already on, we back out.
-        $preState = 'UNKNOWN'
-        try { $preState = "$($api.Machine.Machine_Get($hz.Id).Base.BasicState)" } catch {}
+        # ---- maintenance mode, and PROVE it took ----
+        # Requesting it is asynchronous and can be refused. Reading back AVAILABLE
+        # proves nothing, so poll until the broker actually says MAINTENANCE.
+        $preState = Get-HvState $hz.Id
 
-        if ($preState -ne 'MAINTENANCE') {
-            Enter-Maint $hz.Id
-            $maintOwned = $true
-            Start-Sleep -Seconds 5
+        if ($preState -eq 'MAINTENANCE') {
+            # already parked by someone else - work on it, but do not release it after
+            $state = 'MAINTENANCE'
+            Write-Host "    already in maintenance (not ours - will not release it)" -ForegroundColor DarkGray
         }
-
-        $state = 'UNKNOWN'
-        try { $state = "$($api.Machine.Machine_Get($hz.Id).Base.BasicState)" } catch {}
-
-        if ($state -notin $SafeStates) {
-            Write-Host "    SKIP - state is $state, backing out" -ForegroundColor Yellow
-            if ($maintOwned) { Exit-Maint $hz.Id }
-            Add-Log $name $pool $state 'SKIPPED' 'Session appeared or machine in transition - backed out' $oldMac ''
+        elseif ($preState -ne 'AVAILABLE') {
+            Write-Host "    SKIP - state is $preState" -ForegroundColor Yellow
+            Add-Log $name $pool $preState 'SKIPPED' 'Session present or machine in transition' $origMac ''
             continue
         }
-        Write-Host "    maintenance mode on" -ForegroundColor DarkGray
+        else {
+            Enter-Maint $hz.Id
+            $maintOwned = $true
+
+            $confirmed = $false
+            $seen      = $preState
+            $deadline  = (Get-Date).AddSeconds($MaintWaitSec)
+            do {
+                Start-Sleep -Seconds 5
+                $seen = Get-HvState $hz.Id
+                if ($seen -eq 'MAINTENANCE') { $confirmed = $true; break }
+                if ($seen -in @('CONNECTED','DISCONNECTED')) { break }   # a user beat us to it
+            } while ((Get-Date) -lt $deadline)
+
+            if (-not $confirmed) {
+                Write-Host "    SKIP - maintenance mode not confirmed (state=$seen), backing out" -ForegroundColor Yellow
+                Exit-Maint $hz.Id
+                Add-Log $name $pool $seen 'SKIPPED' "Maintenance mode never confirmed (state=$seen) - request backed out" $origMac ''
+                continue
+            }
+            $state = 'MAINTENANCE'
+            Write-Host "    maintenance mode confirmed" -ForegroundColor DarkGray
+        }
 
         $vm = Get-VM -Name $name
 
-        # ---- release the DHCP lease while we still have a NIC ----
+        # ---- release the DHCP lease while the NIC still exists ----
         if ($guestCred -and -not $NoDhcpRelease -and $vm.PowerState -eq 'PoweredOn' -and
             $vm.ExtensionData.Guest.ToolsRunningStatus -eq 'guestToolsRunning') {
             try {
@@ -316,32 +380,45 @@ foreach ($name in $targets) {
         }
         Write-Host "    powered off" -ForegroundColor DarkGray
 
-        # ---- SWAP: add first, remove second ----
-        # If the add fails, nothing has changed and the VM still has its E1000.
-        # There is never a moment where the VM has no adapter.
-        $vm = Get-VM -Name $name
-
-        $p = @{ VM = $vm; NetworkName = $pg; Type = 'Vmxnet3'; StartConnected = $true
-                Confirm = $false; ErrorAction = 'Stop' }
-        if ($PreserveMac) { $p['MacAddress'] = $oldMac }
-
-        $new = New-NetworkAdapter @p
-        $swapped = $true
-        Write-Host "    vmxnet3 added ($($new.MacAddress))" -ForegroundColor DarkGray
-
-        $old = Get-NetworkAdapter -VM $vm | Where-Object { $_.Type -in @('e1000','e1000e') } | Select-Object -First 1
-        Remove-NetworkAdapter -NetworkAdapter $old -Confirm:$false -ErrorAction Stop
-
-        # ---- verify the adapter set is exactly what we want ----
-        $after = @(Get-NetworkAdapter -VM (Get-VM -Name $name))
-        $vmx   = @($after | Where-Object Type -eq 'Vmxnet3')
-        $leg   = @($after | Where-Object { $_.Type -in @('e1000','e1000e') })
-
-        if ($vmx.Count -ne 1 -or $leg.Count -ne 0 -or $after.Count -ne 1) {
-            throw "Adapter set wrong after swap: $($after.Count) total, $($vmx.Count) vmxnet3, $($leg.Count) legacy"
+        # ---- ADD the vmxnet3 (unless one already exists from an interrupted run) ----
+        # If this throws, nothing has been changed: no adapter was added, none removed.
+        if ($halfSwapped) {
+            Write-Host "    repairing - vmxnet3 already present, only the legacy adapter to drop" -ForegroundColor Yellow
+        }
+        else {
+            $new = New-NetworkAdapter -VM (Get-VM -Name $name) -NetworkName $origPg -Type Vmxnet3 `
+                    -StartConnected:$true -Confirm:$false -ErrorAction Stop
+            $addedNicId = $new.Id      # set ONLY after the create actually succeeded
+            Write-Host "    vmxnet3 added ($($new.MacAddress))" -ForegroundColor DarkGray
         }
 
-        $newMac = $vmx[0].MacAddress
+        # ---- REMOVE the legacy adapter(s), and nothing else ----
+        foreach ($n in @(Get-NetworkAdapter -VM (Get-VM -Name $name) | Where-Object { $_.Type -in @('e1000','e1000e') })) {
+            Remove-NetworkAdapter -NetworkAdapter $n -Confirm:$false -ErrorAction Stop
+        }
+        $legacyGone = $true
+        Write-Host "    $origType removed" -ForegroundColor DarkGray
+
+        # ---- only now is the old MAC free to reuse ----
+        # It could not have been set at creation time: the E1000 still held it and
+        # vCenter would have rejected the duplicate.
+        if ($PreserveMac) {
+            $t = @(Get-NetworkAdapter -VM (Get-VM -Name $name) | Where-Object Type -eq 'Vmxnet3')[0]
+            Set-NetworkAdapter -NetworkAdapter $t -MacAddress $origMac -Confirm:$false -ErrorAction Stop | Out-Null
+            Write-Host "    mac preserved ($origMac)" -ForegroundColor DarkGray
+        }
+
+        # ---- verify ----
+        $after = @(Get-NetworkAdapter -VM (Get-VM -Name $name))
+        $vmxA  = @($after | Where-Object Type -eq 'Vmxnet3')
+        $legA  = @($after | Where-Object { $_.Type -in @('e1000','e1000e') })
+
+        if ($after.Count -ne 1 -or $vmxA.Count -ne 1 -or $legA.Count -ne 0) {
+            throw "Adapter set wrong after swap: $($after.Count) total, $($vmxA.Count) vmxnet3, $($legA.Count) legacy"
+        }
+
+        $newMac    = $vmxA[0].MacAddress
+        $committed = $true      # config is correct. From here, failures are reported, not reverted.
 
         # ---- power on ----
         Start-VM -VM (Get-VM -Name $name) -Confirm:$false -ErrorAction Stop | Out-Null
@@ -351,7 +428,7 @@ foreach ($name in $targets) {
 
         if ($g -ne 'guestToolsRunning') {
             Write-Host "    HELD - powered on but Tools never started" -ForegroundColor Red
-            Add-Log $name $pool $state 'HELD' 'Tools did not start after power on - check the console' $oldMac $newMac
+            Add-Log $name $pool $state 'HELD' 'Tools did not start after power on - check the console' $origMac $newMac
             continue
         }
 
@@ -370,72 +447,91 @@ foreach ($name in $targets) {
             catch { $clean = "CLEANUP-FAILED $($_.Exception.Message -replace "`r?`n",' ')" }
         }
 
-        # ---- independent reachability check (does not need guest creds) ----
-        # This is what actually proves the firewall profile came back right.
+        # ---- independent reachability check - no guest creds needed ----
         $reach = $false
         if ($ip) {
             for ($t = 0; $t -lt 6 -and -not $reach; $t++) {
                 Start-Sleep -Seconds 10
-                $reach = (Test-NetConnection -ComputerName $ip -Port $VerifyPort -InformationLevel Quiet -WarningAction SilentlyContinue)
+                $reach = Test-NetConnection -ComputerName $ip -Port $VerifyPort -InformationLevel Quiet -WarningAction SilentlyContinue
             }
         }
         Write-Host "    port $VerifyPort reachable: $reach" -ForegroundColor DarkGray
 
-        # ---- gate: only a clean, reachable machine goes back into the pool ----
-        $goodClean = ($clean -like 'OK*')
-        if (-not $goodClean -or -not $reach) {
-            Write-Host "    HELD IN MAINTENANCE - not verified" -ForegroundColor Red
-            Add-Log $name $pool $state 'HELD' "ip=$ip reachable=$reach cleanup=$clean" $oldMac $newMac
+        if ($clean -notlike 'OK*' -or -not $reach) {
+            Write-Host "    HELD - not verified" -ForegroundColor Red
+            Add-Log $name $pool $state 'HELD' "ip=$ip reachable=$reach cleanup=$clean" $origMac $newMac
             continue
         }
 
-        # ---- back into service ----
-        try {
-            Exit-Maint $hz.Id
-            Add-Log $name $pool $state 'CONVERTED' "ip=$ip $clean" $oldMac $newMac
-            Write-Host "    CONVERTED" -ForegroundColor Green
+        # ---- back into service, but only if we were the ones who locked it ----
+        if ($maintOwned) {
+            try {
+                Exit-Maint $hz.Id
+                Write-Host "    CONVERTED" -ForegroundColor Green
+                Add-Log $name $pool $state 'CONVERTED' "ip=$ip $clean" $origMac $newMac
+            }
+            catch {
+                Write-Host "    CONVERTED but could not leave maintenance - release it manually" -ForegroundColor Yellow
+                Add-Log $name $pool $state 'HELD' "Converted OK (ip=$ip) but ExitMaintenanceMode failed: $($_.Exception.Message -replace "`r?`n",' ')" $origMac $newMac
+            }
         }
-        catch {
-            # The desktop is fine, we just could not release the lock.
-            Add-Log $name $pool $state 'HELD' "Converted OK (ip=$ip) but ExitMaintenanceMode failed: $($_.Exception.Message -replace "`r?`n",' ')" $oldMac $newMac
-            Write-Host "    CONVERTED but still in maintenance - release it manually" -ForegroundColor Yellow
+        else {
+            Write-Host "    CONVERTED - left in maintenance (it was already there when we found it)" -ForegroundColor Green
+            Add-Log $name $pool $state 'CONVERTED' "ip=$ip $clean (was already in maintenance - not released)" $origMac $newMac
         }
     }
     catch {
         $err = ($_.Exception.Message -replace "`r?`n",' ')
         Write-Host "    ERROR: $err" -ForegroundColor Red
 
-        # ---- rollback: get the machine back to a working E1000 and power it on ----
-        if ($swapped) {
-            Write-Host "    rolling back to $oldType ..." -ForegroundColor Yellow
+        # ---- rollback ----
+        # Undo exactly what we did and nothing else. Never a blanket adapter purge.
+        # Restore the E1000 FIRST, then withdraw the vmxnet3 - so the VM is never
+        # left without an adapter even if the second step fails.
+        if ($committed) {
+            # config was already verified correct - power-on or Tools failed. Reverting
+            # a good config achieves nothing. Report and leave it in maintenance.
+            Add-Log $name $pool $state 'FAILED' "Config correct but post-swap step failed: $err" $origMac $newMac
+        }
+        elseif ($legacyGone -or $addedNicId) {
+            Write-Host "    rolling back ..." -ForegroundColor Yellow
             try {
                 $vm = Get-VM -Name $name
-                if ($vm.PowerState -eq 'PoweredOn') { Stop-VM -VM $vm -Confirm:$false -ErrorAction Stop | Out-Null; Start-Sleep -Seconds 5 }
+                if ($vm.PowerState -eq 'PoweredOn') {
+                    Stop-VM -VM $vm -Confirm:$false -ErrorAction Stop | Out-Null
+                    Start-Sleep -Seconds 5
+                }
 
-                # strip whatever is there
-                Get-NetworkAdapter -VM (Get-VM -Name $name) | Remove-NetworkAdapter -Confirm:$false -ErrorAction Stop
+                # 1. restore the original adapter if we deleted it
+                if ($legacyGone) {
+                    New-NetworkAdapter -VM (Get-VM -Name $name) -NetworkName $origPg -Type $origType `
+                        -MacAddress $origMac -StartConnected:$true -Confirm:$false -ErrorAction Stop | Out-Null
+                    Write-Host "    original $origType restored" -ForegroundColor Yellow
+                }
 
-                # restore the original, MAC and all
-                New-NetworkAdapter -VM (Get-VM -Name $name) -NetworkName $pg -Type $oldType `
-                    -MacAddress $oldMac -StartConnected:$true -Confirm:$false -ErrorAction Stop | Out-Null
+                # 2. withdraw only the adapter WE created, by id
+                if ($addedNicId) {
+                    $mine = Get-NetworkAdapter -VM (Get-VM -Name $name) | Where-Object { $_.Id -eq $addedNicId }
+                    if ($mine) { Remove-NetworkAdapter -NetworkAdapter $mine -Confirm:$false -ErrorAction Stop }
+                }
 
                 Start-VM -VM (Get-VM -Name $name) -Confirm:$false -ErrorAction Stop | Out-Null
 
-                Write-Host "    ROLLED BACK - original $oldType restored, powered on" -ForegroundColor Yellow
-                Add-Log $name $pool $state 'ROLLED-BACK' "Swap failed and was reversed: $err" $oldMac ''
-                # left in maintenance deliberately - you want eyes on it before a user gets it
-                continue
+                Write-Host "    ROLLED BACK - powered on" -ForegroundColor Yellow
+                Add-Log $name $pool $state 'ROLLED-BACK' "Swap failed and was reversed: $err" $origMac ''
+                # left in maintenance on purpose - eyes on it before a user gets it
             }
             catch {
                 $rb = ($_.Exception.Message -replace "`r?`n",' ')
-                Write-Host "    ROLLBACK FAILED - MACHINE NEEDS MANUAL ATTENTION" -ForegroundColor Red
-                Add-Log $name $pool $state 'FAILED' "Swap failed: $err | ROLLBACK ALSO FAILED: $rb" $oldMac ''
-                continue
+                Write-Host "    ROLLBACK FAILED - NEEDS MANUAL ATTENTION" -ForegroundColor Red
+                Add-Log $name $pool $state 'FAILED' "Swap failed: $err | ROLLBACK ALSO FAILED: $rb" $origMac ''
             }
         }
-
-        Add-Log $name $pool $state 'FAILED' $err $oldMac ''
-        # not exiting maintenance mode - a machine we do not understand stays out of the broker
+        else {
+            # nothing was changed
+            Add-Log $name $pool $state 'FAILED' $err $origMac ''
+        }
+        # maintenance mode deliberately not released on any failure path
     }
 }
 
@@ -446,11 +542,21 @@ Write-Host ""
 Write-Host "Log: $LogCsv" -ForegroundColor Green
 
 if (Test-Path $LogCsv) {
-    $stuck = Import-Csv $LogCsv | Where-Object { $_.Status -in @('FAILED','HELD','ROLLED-BACK') }
+    $rows = Import-Csv $LogCsv
+
+    $stuck = $rows | Where-Object { $_.Status -in @('FAILED','HELD','ROLLED-BACK') }
     if ($stuck) {
         Write-Host ""
-        Write-Host "STILL IN MAINTENANCE MODE - deal with these before users log in:" -ForegroundColor Red
+        Write-Host "IN MAINTENANCE MODE - clear these before users log in:" -ForegroundColor Red
         $stuck | ForEach-Object { Write-Host ("  {0,-20} {1,-14} {2}" -f $_.Machine, $_.Status, $_.Detail) }
+    }
+
+    $broken = $rows | Where-Object { $_.Status -in @('NO-NIC','HALF-SWAPPED') }
+    if ($broken) {
+        Write-Host ""
+        Write-Host "BAD STATE FROM A PREVIOUS RUN:" -ForegroundColor Red
+        $broken | ForEach-Object { Write-Host ("  {0,-20} {1,-14} {2}" -f $_.Machine, $_.Status, $_.Detail) }
+        Write-Host "  HALF-SWAPPED can be finished off with -RepairHalfSwapped" -ForegroundColor Yellow
     }
 }
 
