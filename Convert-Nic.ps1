@@ -12,10 +12,11 @@
 
     WHY THERE IS NO ROLLBACK
     The VMXNET3 is added BEFORE the E1000 is removed. If the add fails, nothing
-    changed. If the remove fails, the VM has two adapters and still boots and
-    works - it is logged as BOTH-NICS and you clean it up later. There is no
-    sequence that leaves a VM without a network adapter, so there is nothing to
-    roll back from.
+    changed. If the remove fails, the VM should have two adapters. The script
+    attempts to power it on, leaves it in maintenance mode and logs BOTH-NICS
+    when power-on is confirmed. Its health is not assumed and it must be checked
+    and tidied up manually. There is no intended sequence that leaves a VM
+    without a network adapter, so automatic rollback is not required.
 
     WHY THERE IS NO GUEST SCRIPT
     A desktop whose NIC did not come up properly does not reach AVAILABLE in
@@ -195,15 +196,31 @@ try {
             }
             catch {
                 $rmErr = $_.Exception.Message -replace "`r?`n",' '
-                Start-VM -VM (Get-VM $name) -Confirm:$false -EA SilentlyContinue | Out-Null
-                if (WaitPower $name 'PoweredOn' $PowerWaitSec) {
-                    Write-Host "    BOTH-NICS - VM powered on with both adapters. Left in maintenance." -F Yellow
-                    Log $name 'BOTH-NICS' "E1000 removal failed: $rmErr | VM powered on but health not verified"
-                } else {
-                    Write-Host "    FAILED - E1000 removal failed and the VM did not power on" -F Red
-                    Log $name 'FAILED' "E1000 removal failed: $rmErr | VM did not power back on"
+
+                # Do not assume the failure left both adapters - the remove task can
+                # throw (timeout, dropped session) after actually completing. Read
+                # what is really there and classify on that.
+                $now    = @(Get-NetworkAdapter -VM (Get-VM $name))
+                $legNow = @($now | Where-Object { $_.Type -in 'e1000','e1000e' })
+                $vmxNow = @($now | Where-Object { $_.Type -eq 'Vmxnet3' })
+
+                if ($legNow.Count -eq 0 -and $vmxNow.Count -eq 1 -and $now.Count -eq 1) {
+                    # the removal actually succeeded despite the error - fall through
+                    # to the normal verify/power-on/health path
+                    Write-Host "    remove threw but the e1000 is gone - continuing" -F Yellow
                 }
-                continue    # left in maintenance either way
+                else {
+                    Start-VM -VM (Get-VM $name) -Confirm:$false -EA SilentlyContinue | Out-Null
+                    $types = ($now | % Type) -join ';'
+                    if (WaitPower $name 'PoweredOn' $PowerWaitSec) {
+                        Write-Host "    BOTH-NICS - VM powered on with: $types. Left in maintenance." -F Yellow
+                        Log $name 'BOTH-NICS' "E1000 removal failed: $rmErr | Adapters now: $types | Powered on, health not verified"
+                    } else {
+                        Write-Host "    FAILED - E1000 removal failed and the VM did not power on" -F Red
+                        Log $name 'FAILED' "E1000 removal failed: $rmErr | Adapters now: $types | VM did not power back on"
+                    }
+                    continue    # left in maintenance either way
+                }
             }
             Write-Host "    e1000 removed" -F DarkGray
 
