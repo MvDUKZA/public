@@ -27,7 +27,7 @@
     CONVERTED        swapped, booted, Horizon says AVAILABLE, back in the pool
     HELD             swapped but Horizon never said AVAILABLE - confirmed back in maintenance
     FAILED-NOT-HELD  unhealthy AND could not be put back in maintenance - STILL BOOKABLE, fix now
-    BOTH-NICS        add worked, remove did not - VM is up and working, tidy up by hand
+    BOTH-NICS        add worked, remove did not - VM powered on but health not verified; left in maintenance
     FAILED           see Detail - LEFT IN MAINTENANCE
     SKIPPED          in use, or not a single-E1000 VM
     ALREADY          already a single VMXNET3
@@ -197,10 +197,10 @@ try {
                 $rmErr = $_.Exception.Message -replace "`r?`n",' '
                 Start-VM -VM (Get-VM $name) -Confirm:$false -EA SilentlyContinue | Out-Null
                 if (WaitPower $name 'PoweredOn' $PowerWaitSec) {
-                    Write-Host "    BOTH-NICS - vmxnet3 added, e1000 would not go. VM is up." -F Yellow
-                    Log $name 'BOTH-NICS' "E1000 removal failed: $rmErr"
+                    Write-Host "    BOTH-NICS - VM powered on with both adapters. Left in maintenance." -F Yellow
+                    Log $name 'BOTH-NICS' "E1000 removal failed: $rmErr | VM powered on but health not verified"
                 } else {
-                    Write-Host "    FAILED - e1000 removal failed AND the VM did not power on" -F Red
+                    Write-Host "    FAILED - E1000 removal failed and the VM did not power on" -F Red
                     Log $name 'FAILED' "E1000 removal failed: $rmErr | VM did not power back on"
                 }
                 continue    # left in maintenance either way
@@ -249,8 +249,25 @@ try {
         catch {
             $e = $_.Exception.Message -replace "`r?`n",' '
             Write-Host "    FAILED: $e" -F Red
-            Log $name 'FAILED' $e
-            # deliberately left in maintenance
+
+            # FAILED must mean "confirmed parked". Verify - and if it is not in
+            # maintenance, try to put it there and verify again. Only if that
+            # also fails is it FAILED-NOT-HELD: broken and still bookable.
+            $cur = HvState $id
+            if ($cur -ne 'MAINTENANCE') {
+                try {
+                    $api.Machine.Machine_EnterMaintenanceMode($id)
+                    $end = (Get-Date).AddSeconds($MaintWaitSec)
+                    do { Start-Sleep 5; $cur = HvState $id } until ($cur -eq 'MAINTENANCE' -or (Get-Date) -gt $end)
+                } catch { }
+            }
+
+            if ($cur -eq 'MAINTENANCE') {
+                Log $name 'FAILED' "$e | Confirmed in maintenance"
+            } else {
+                Write-Host "    FAILED-NOT-HELD - failed AND STILL BOOKABLE (state=$cur). Fix now." -F Red
+                Log $name 'FAILED-NOT-HELD' "$e | Could not confirm maintenance (state=$cur). THIS DESKTOP IS STILL IN THE POOL."
+            }
         }
     }
 
